@@ -1,0 +1,587 @@
+"""DWARF debug info interface for crash analysis.
+
+Provides the DwarfInfo class for symbol resolution, disassembly,
+source line mapping, and parameter/local variable extraction from
+ELF binaries with DWARF debug info.
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import cxxfilt
+from capstone import CS_ARCH_ARM64, CS_ARCH_X86, CS_MODE_ARM, CS_MODE_64, Cs
+from elftools.elf.elffile import ELFFile
+from elftools.dwarf.die import DIE
+from elftools.dwarf.compileunit import CompileUnit
+from elftools.dwarf.locationlists import LocationParser
+
+from .models import AddressInfo, VarInfo, clean_path
+
+
+# =============================================================================
+# DWARF register name tables
+# =============================================================================
+
+_ARM64_REGS: dict[int, str] = {i: f'X{i}' for i in range(31)}
+_ARM64_REGS[29] = 'FP'
+_ARM64_REGS[30] = 'LR'
+_ARM64_REGS[31] = 'SP'
+
+_X86_64_REGS: dict[int, str] = {
+    0: 'RAX', 1: 'RDX', 2: 'RCX', 3: 'RBX', 4: 'RSI', 5: 'RDI',
+    6: 'RBP', 7: 'RSP', 8: 'R8', 9: 'R9', 10: 'R10', 11: 'R11',
+    12: 'R12', 13: 'R13', 14: 'R14', 15: 'R15',
+}
+
+RE_ARM_MAPPING = re.compile(r'^\$[xdt](\.\d+)?$')
+
+
+# =============================================================================
+# DWARF helpers
+# =============================================================================
+
+def _resolve_die(die: DIE) -> DIE:
+    """Follow abstract_origin/specification chains to the canonical DIE."""
+    seen: set[int] = set()
+    while die.offset not in seen:
+        seen.add(die.offset)
+        if 'DW_AT_abstract_origin' in die.attributes:
+            die = die.get_DIE_from_attribute('DW_AT_abstract_origin')
+        elif 'DW_AT_specification' in die.attributes:
+            die = die.get_DIE_from_attribute('DW_AT_specification')
+        else:
+            break
+    return die
+
+
+def _die_name(die: DIE) -> str:
+    """Get the name of a DIE, following reference chains if needed."""
+    resolved = _resolve_die(die)
+    attr = resolved.attributes.get('DW_AT_name')
+    return attr.value.decode() if attr else ''
+
+
+def _die_contains_addr(die: DIE, addr: int) -> bool:
+    """Check if a DIE's address range contains addr."""
+    low_attr = die.attributes.get('DW_AT_low_pc')
+    if not low_attr:
+        return False
+    low = low_attr.value
+    high_attr = die.attributes.get('DW_AT_high_pc')
+    if not high_attr:
+        return False
+    high = high_attr.value
+    if high_attr.form.startswith('DW_FORM_data'):
+        high = low + high
+    return low <= addr < high
+
+
+def _resolve_type(die: DIE | None, depth: int = 0) -> str:
+    """Resolve a type DIE to a human-readable name."""
+    if depth > 10 or die is None:
+        return '?'
+    tag = die.tag
+    name = die.attributes.get('DW_AT_name')
+
+    if tag in ('DW_TAG_base_type', 'DW_TAG_structure_type',
+               'DW_TAG_class_type', 'DW_TAG_enumeration_type',
+               'DW_TAG_union_type', 'DW_TAG_typedef'):
+        return name.value.decode() if name else tag.split('_')[-1]
+
+    if tag == 'DW_TAG_pointer_type':
+        if 'DW_AT_type' in die.attributes:
+            inner = _resolve_type(
+                die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+            return f'{inner}*'
+        return 'void*'
+
+    if tag == 'DW_TAG_const_type':
+        if 'DW_AT_type' in die.attributes:
+            inner = _resolve_type(
+                die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+            return f'const {inner}'
+        return 'const void'
+
+    if tag == 'DW_TAG_reference_type':
+        if 'DW_AT_type' in die.attributes:
+            inner = _resolve_type(
+                die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+            return f'{inner}&'
+        return 'void&'
+
+    if tag == 'DW_TAG_volatile_type':
+        if 'DW_AT_type' in die.attributes:
+            inner = _resolve_type(
+                die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+            return f'volatile {inner}'
+        return 'volatile void'
+
+    if tag == 'DW_TAG_array_type':
+        if 'DW_AT_type' in die.attributes:
+            inner = _resolve_type(
+                die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+            return f'{inner}[]'
+        return '?[]'
+
+    # Follow DW_AT_type for other tags (restrict, etc.)
+    if 'DW_AT_type' in die.attributes:
+        return _resolve_type(
+            die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+    return '?'
+
+
+def _decode_sleb128(data: list[int] | bytes, start: int = 0) -> int:
+    """Decode a SLEB128 value from bytes."""
+    result = 0
+    shift = 0
+    for b in data[start:]:
+        result |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            if b & 0x40:
+                result -= 1 << shift
+            break
+    return result
+
+
+def _decode_location(loc_expr: list[int] | bytes, reg_table: dict[int, str],
+                     ) -> tuple[str, str | None]:
+    """Decode a DWARF location expression to (description, register_name)."""
+    if not loc_expr:
+        return 'optimized out', None
+    op = loc_expr[0]
+
+    # DW_OP_reg0..DW_OP_reg31 (0x50..0x6F)
+    if 0x50 <= op <= 0x6F:
+        regnum = op - 0x50
+        regname = reg_table.get(regnum, f'r{regnum}')
+        return regname, regname
+
+    # DW_OP_breg0..DW_OP_breg31 (0x70..0x8F) -- register + offset
+    if 0x70 <= op <= 0x8F:
+        regnum = op - 0x70
+        regname = reg_table.get(regnum, f'r{regnum}')
+        offset = _decode_sleb128(loc_expr, 1)
+        if offset:
+            return f'[{regname}{offset:+d}]', None
+        return f'[{regname}]', None
+
+    # DW_OP_fbreg (0x91) -- frame base + offset
+    if op == 0x91:
+        offset = _decode_sleb128(loc_expr, 1)
+        return f'[FP{offset:+d}]', None
+
+    # DW_OP_addr (0x03) -- absolute address
+    if op == 0x03 and len(loc_expr) >= 9:
+        addr = int.from_bytes(bytes(loc_expr[1:9]), 'little')
+        return f'0x{addr:X}', None
+
+    return f'expr[{" ".join(f"{b:02X}" for b in loc_expr)}]', None
+
+
+# =============================================================================
+# DwarfInfo class
+# =============================================================================
+
+class DwarfInfo:
+    """High-level DWARF interface for crash analysis."""
+
+    def __init__(self, elf_path: Path) -> None:
+        self._path = elf_path
+        self._file = elf_path.open('rb')
+        self._elf = ELFFile(self._file)
+        self._dwarf = self._elf.get_dwarf_info() if self._elf.has_dwarf_info() else None
+        self._aranges = self._dwarf.get_aranges() if self._dwarf else None
+        self._loc_parser = (LocationParser(self._dwarf.location_lists())
+                            if self._dwarf else None)
+
+        # Detect architecture for register names and disassembly
+        arch = self._elf.get_machine_arch()
+        if arch == 'AArch64':
+            self._reg_table = _ARM64_REGS
+            self._cs_arch = CS_ARCH_ARM64
+            self._cs_mode = CS_MODE_ARM
+        elif arch in ('x64', 'x86'):
+            self._reg_table = _X86_64_REGS
+            self._cs_arch = CS_ARCH_X86
+            self._cs_mode = CS_MODE_64
+        else:
+            self._reg_table = _ARM64_REGS
+            self._cs_arch = CS_ARCH_ARM64
+            self._cs_mode = CS_MODE_ARM
+
+        # Cache: CU offset -> parsed CU
+        self._cu_cache: dict[int, CompileUnit] = {}
+
+        # Capstone disassembler (cached)
+        self._cs = Cs(self._cs_arch, self._cs_mode)
+
+        # Cache .text section for disassembly
+        text_sec = self._elf.get_section_by_name('.text')
+        if text_sec:
+            self._text_data: bytes = text_sec.data()
+            self._text_addr: int = text_sec['sh_addr']
+        else:
+            self._text_data = b''
+            self._text_addr = 0
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __enter__(self) -> DwarfInfo:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    # -----------------------------------------------------------------
+    # Symbol table (replaces nm -nC)
+    # -----------------------------------------------------------------
+
+    def get_symbols(self) -> list[tuple[int, str, bool]]:
+        """Read .symtab and return [(addr, demangled_name, is_function), ...].
+        Sorted by address, ARM mapping symbols filtered out."""
+        symtab = self._elf.get_section_by_name('.symtab')
+        if not symtab:
+            return []
+
+        raw: list[tuple[int, str, bool]] = []
+        mangled_names: list[str] = []
+        for sym in symtab.iter_symbols():
+            addr = sym.entry.st_value
+            if addr == 0:
+                continue
+            name = sym.name
+            if RE_ARM_MAPPING.match(name):
+                continue
+            is_func = sym.entry.st_info.type in ('STT_FUNC', 'STT_GNU_IFUNC')
+            raw.append((addr, name, is_func))
+            mangled_names.append(name)
+
+        # Batch demangle via cxxfilt
+        demangled = self._demangle_batch(mangled_names)
+
+        result: list[tuple[int, str, bool]] = []
+        for (addr, _name, is_func), dem_name in zip(raw, demangled):
+            result.append((addr, dem_name, is_func))
+
+        result.sort(key=lambda x: x[0])
+        return result
+
+    @staticmethod
+    def _demangle_batch(names: list[str]) -> list[str]:
+        """Demangle C++ names via cxxfilt."""
+        if not names:
+            return []
+        return [cxxfilt.demangle(n) for n in names]
+
+    # -----------------------------------------------------------------
+    # Address resolution (replaces addr2line -a -f -C -i)
+    # -----------------------------------------------------------------
+
+    def resolve_address(self, addr: int) -> AddressInfo | None:
+        """Resolve an address to function, file:line, and inlines."""
+        cu = self._get_cu_for_addr(addr)
+        if not cu:
+            return None
+
+        info = AddressInfo()
+
+        # File:line from line program
+        info.source_loc = self._addr_to_line(cu, addr)
+
+        # Function name + inlines from DIE tree
+        self._resolve_function(cu, addr, info)
+
+        return info if info.function or info.source_loc else None
+
+    def resolve_addresses(self, addrs: list[int],
+                          ) -> dict[int, AddressInfo]:
+        """Batch resolve multiple addresses."""
+        result: dict[int, AddressInfo] = {}
+        for addr in dict.fromkeys(addrs):  # dedup preserving order
+            info = self.resolve_address(addr)
+            if info:
+                result[addr] = info
+        return result
+
+    # -----------------------------------------------------------------
+    # Disassembly (replaces objdump)
+    # -----------------------------------------------------------------
+
+    def disassemble_around(self, addr: int, context: int = 24,
+                           ) -> list[tuple[int, str, str]]:
+        """Disassemble instructions around addr using capstone.
+        Returns [(addr, mnemonic, op_str), ...]."""
+        if not self._text_data:
+            return []
+
+        start = max(self._text_addr, addr - context)
+        # Align to 4-byte boundary for ARM64
+        if self._cs_arch == CS_ARCH_ARM64:
+            start = start & ~3
+        end = addr + context
+
+        offset = start - self._text_addr
+        end_offset = end - self._text_addr
+        if offset < 0 or offset >= len(self._text_data):
+            return []
+        end_offset = min(end_offset, len(self._text_data))
+        code = self._text_data[offset:end_offset]
+
+        result: list[tuple[int, str, str]] = []
+        for insn in self._cs.disasm(code, start):
+            result.append((insn.address, insn.mnemonic, insn.op_str))
+        return result
+
+    def is_call_before(self, addr: int) -> bool:
+        """Check if there's a call/bl/blr instruction in the 8 bytes
+        immediately before addr."""
+        check_start = addr - 8
+        if check_start < self._text_addr:
+            return False
+        offset = check_start - self._text_addr
+        end_offset = addr - self._text_addr
+        if offset < 0 or end_offset > len(self._text_data):
+            return False
+        code = self._text_data[offset:end_offset]
+
+        insns = list(self._cs.disasm(code, check_start))
+        if not insns:
+            return False
+        last = insns[-1]
+        return last.mnemonic in ('call', 'bl', 'blr', 'blx')
+
+    def source_lines_for_addrs(self, addrs: list[int]) -> dict[int, str]:
+        """Batch-resolve instruction addresses to cleaned source locations.
+        Single pass through the line program for efficiency."""
+        if not addrs:
+            return {}
+        # All addrs should be in the same CU (disassembly window)
+        cu = self._get_cu_for_addr(addrs[0])
+        if not cu:
+            return {}
+        lp = self._dwarf.line_program_for_CU(cu)
+        if not lp:
+            return {}
+
+        addr_set = set(addrs)
+        result: dict[int, str] = {}
+        prev = None
+        for entry in lp.get_entries():
+            state = entry.state
+            if state is None:
+                continue
+            if state.end_sequence:
+                prev = None
+                continue
+            if prev:
+                # Check which query addresses fall in [prev.address, state.address)
+                for a in list(addr_set):
+                    if prev.address <= a < state.address:
+                        raw = self._format_file_line(lp, prev.file, prev.line)
+                        if raw:
+                            result[a] = clean_path(raw)
+                        addr_set.discard(a)
+                if not addr_set:
+                    break
+            prev = state
+        return result
+
+    def _format_file_line(self, lp: object, file_idx: int, line: int) -> str:
+        """Format a file:line string from line program data."""
+        file_entry = lp['file_entry'][file_idx - 1]
+        fname = (file_entry.name.decode()
+                 if isinstance(file_entry.name, bytes) else file_entry.name)
+        dir_idx = file_entry.dir_index
+        dirs = lp['include_directory']
+        if dir_idx > 0 and dir_idx <= len(dirs):
+            d = dirs[dir_idx - 1]
+            d = d.decode() if isinstance(d, bytes) else d
+            fname = f'{d}/{fname}'
+        return f'{fname}:{line}'
+
+    # -----------------------------------------------------------------
+    # Parameter and local variable extraction
+    # -----------------------------------------------------------------
+
+    def get_params(self, addr: int) -> list[VarInfo]:
+        """Get function parameters at the given address."""
+        func_die = self._find_function_die(addr)
+        if not func_die:
+            return []
+        return self._extract_vars(func_die, 'DW_TAG_formal_parameter', addr)
+
+    def get_locals(self, addr: int) -> list[VarInfo]:
+        """Get local variables at the given address."""
+        func_die = self._find_function_die(addr)
+        if not func_die:
+            return []
+        return self._extract_vars(func_die, 'DW_TAG_variable', addr)
+
+    # -----------------------------------------------------------------
+    # Internal: CU lookup (cached)
+    # -----------------------------------------------------------------
+
+    def _get_cu_for_addr(self, addr: int) -> CompileUnit | None:
+        """Find the CU containing addr via .debug_aranges."""
+        if not self._aranges:
+            return None
+        cu_offset = self._aranges.cu_offset_at_addr(addr)
+        if cu_offset is None:
+            return None
+        if cu_offset not in self._cu_cache:
+            self._cu_cache[cu_offset] = self._dwarf._parse_CU_at_offset(cu_offset)
+        return self._cu_cache[cu_offset]
+
+    # -----------------------------------------------------------------
+    # Internal: line program resolution
+    # -----------------------------------------------------------------
+
+    def _addr_to_line(self, cu: CompileUnit, addr: int) -> str:
+        """Resolve addr to "dir/file:line" using the CU's line program."""
+        lp = self._dwarf.line_program_for_CU(cu)
+        if not lp:
+            return ''
+
+        prev = None
+        for entry in lp.get_entries():
+            state = entry.state
+            if state is None:
+                continue
+            if state.end_sequence:
+                prev = None
+                continue
+            if prev and prev.address <= addr < state.address:
+                return self._format_file_line(lp, prev.file, prev.line)
+            prev = state
+        return ''
+
+    # -----------------------------------------------------------------
+    # Internal: function + inline resolution
+    # -----------------------------------------------------------------
+
+    def _resolve_function(self, cu: CompileUnit, addr: int,
+                          info: AddressInfo) -> None:
+        """Find function name and inlined call chain for addr."""
+        for die in cu.iter_DIEs():
+            if die.tag == 'DW_TAG_subprogram' and _die_contains_addr(die, addr):
+                info.function = _die_name(die)
+                # Look for inlined subroutines within this function
+                self._find_inlines(die, addr, info)
+                return
+
+    def _find_inlines(self, parent: DIE, addr: int,
+                      info: AddressInfo) -> None:
+        """Find DW_TAG_inlined_subroutine DIEs containing addr."""
+        for child in parent.iter_children():
+            if child.tag == 'DW_TAG_inlined_subroutine':
+                if _die_contains_addr(child, addr):
+                    name = _die_name(child)
+                    # Get call site location
+                    call_file = child.attributes.get('DW_AT_call_file')
+                    call_line = child.attributes.get('DW_AT_call_line')
+                    loc = ''
+                    if call_file and call_line:
+                        cu = child.cu
+                        lp = self._dwarf.line_program_for_CU(cu)
+                        if lp:
+                            fe = lp['file_entry'][call_file.value - 1]
+                            fname = (fe.name.decode()
+                                     if isinstance(fe.name, bytes) else fe.name)
+                            loc = f'{fname}:{call_line.value}'
+                    info.inlines.append((name, loc))
+                    # Recurse for nested inlines
+                    self._find_inlines(child, addr, info)
+
+    # -----------------------------------------------------------------
+    # Internal: function DIE lookup
+    # -----------------------------------------------------------------
+
+    def _find_function_die(self, addr: int) -> DIE | None:
+        """Find the DW_TAG_subprogram DIE containing addr."""
+        cu = self._get_cu_for_addr(addr)
+        if not cu:
+            return None
+        for die in cu.iter_DIEs():
+            if die.tag == 'DW_TAG_subprogram' and _die_contains_addr(die, addr):
+                return die
+        return None
+
+    # -----------------------------------------------------------------
+    # Internal: variable extraction (shared by params + locals)
+    # -----------------------------------------------------------------
+
+    def _extract_vars(self, func_die: DIE, tag: str,
+                      crash_pc: int) -> list[VarInfo]:
+        """Extract variables (params or locals) from a function DIE."""
+        cu = func_die.cu
+        results: list[VarInfo] = []
+
+        for child in func_die.iter_children():
+            if child.tag != tag:
+                continue
+
+            resolved = _resolve_die(child)
+            name = resolved.attributes.get('DW_AT_name')
+            var = VarInfo(name=name.value.decode() if name else '???')
+
+            # Type
+            if 'DW_AT_type' in resolved.attributes:
+                type_die = resolved.get_DIE_from_attribute('DW_AT_type')
+                var.type_name = _resolve_type(type_die)
+            else:
+                var.type_name = '?'
+
+            # Location
+            loc_attr = child.attributes.get('DW_AT_location')
+            if loc_attr and self._loc_parser:
+                try:
+                    loc_data = self._loc_parser.parse_from_attribute(
+                        loc_attr, cu['version'], func_die)
+                    if isinstance(loc_data, list):
+                        # Location list -- find entry valid at crash_pc
+                        best = self._pick_location(loc_data, crash_pc, func_die)
+                        if best:
+                            var.location, var.reg_name = _decode_location(
+                                best, self._reg_table)
+                        else:
+                            var.location = 'optimized out'
+                    else:
+                        var.location, var.reg_name = _decode_location(
+                            loc_data.loc_expr, self._reg_table)
+                except Exception as e:
+                    var.location = f'error: {e}'
+            else:
+                var.location = 'optimized out'
+
+            results.append(var)
+
+        return results
+
+    @staticmethod
+    def _pick_location(loc_list: list[object], crash_pc: int,
+                       func_die: DIE) -> list[int] | None:
+        """Pick the location list entry valid at crash_pc."""
+        base = 0
+        low_pc = func_die.attributes.get('DW_AT_low_pc')
+        if low_pc:
+            base = low_pc.value
+        pc_offset = crash_pc - base
+
+        for entry in loc_list:
+            if not hasattr(entry, 'loc_expr'):
+                continue
+            begin = getattr(entry, 'begin_offset',
+                            getattr(entry, 'entry_offset', 0))
+            end = getattr(entry, 'end_offset',
+                          getattr(entry, 'entry_end', 0))
+            if begin <= pc_offset < end:
+                return entry.loc_expr
+
+        # Fallback: return the first entry with a location
+        for entry in loc_list:
+            if hasattr(entry, 'loc_expr') and entry.loc_expr:
+                return entry.loc_expr
+        return None

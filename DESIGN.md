@@ -2,7 +2,7 @@
 
 ## Overview
 
-An interactive post-mortem crash debugger for Dell UEFI RSOD (Red Screen
+An interactive post-mortem crash debugger for UEFI RSOD (Red Screen
 of Death) dumps.  Provides a GDB-like inspection experience through a web
 UI that runs locally as a desktop application.
 
@@ -62,7 +62,7 @@ in a navigable interface instead of a flat text file.
 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
-| Backend | Flask 3.x | Lightweight, same as stenote, proven pattern |
+| Backend | Flask 3.x | Lightweight, proven pattern for local tool UIs |
 | Frontend | React 19 + TypeScript | SPA for responsive frame-switching |
 | Styling | Tailwind CSS | Rapid UI development, dark mode |
 | Build | Vite | Fast dev server with HMR, proxy to Flask |
@@ -106,9 +106,9 @@ analysis that a text file can't:
 ```
 ╔══════════════════════════════════════════════════════════╗
 ║  RSOD: Synchronous Exception — Data Abort (same EL)     ║
-║  PC: 0x62FC  fPromptTestError  EPSA/UI/ePrompt.cpp:294  ║
-║  ESR: 0x96000047  Translation fault L3  FAR: 0x0 (NULL) ║
-║  Image: af4305.efi.so  ARM64                             ║
+║  PC: 0x62FC  fHandleError  src/Platform/ErrorHandler.cpp:294  ║
+║  ESR: 0x96000047  Translation fault L3  FAR: 0x0 (NULL)      ║
+║  Image: firmware.efi.so  ARM64                                ║
 ╚══════════════════════════════════════════════════════════╝
 ```
 
@@ -118,12 +118,12 @@ Clickable frame list.  Selected frame highlighted.  Shows symbol name,
 module, and source location.  Call-verified frames marked with a check.
 
 ```
-  ▶ #0  cBeepCode::cBeepCode    BeepCode.cpp:145  [psa.efi]
-    #1  cDellTitleBar::Draw     DellTitle.cpp:221 [psa.efi]
-         ↳ (inlined)           DellTitle.cpp:528
-    #2  fPromptTestError        ePrompt.cpp:294   [psa.efi]
-    #3  fPsaGetInput            ePrompt.cpp:576   [DxeCore.efi]
-    #4  fRunTestsInBranch       eTest.cpp:858     [Shell.efi]
+  ▶ #0  cAlertHandler::cAlertHandler  AlertHandler.cpp:145  [app.efi]
+    #1  cTitleBar::Draw              TitleBar.cpp:221     [app.efi]
+         ↳ (inlined)                TitleBar.cpp:528
+    #2  fHandleError                 ErrorHandler.cpp:294 [app.efi]
+    #3  fGetUserInput                ErrorHandler.cpp:576 [DxeCore.efi]
+    #4  fRunTestSequence             TestRunner.cpp:858   [Shell.efi]
 ```
 
 ### Detail Panel (center, changes with selected frame)
@@ -135,26 +135,26 @@ Four tabs: **Params** | **Locals** | **Disassembly** | **Source**
   Name            Type                  Location   Value
   ─────────────── ───────────────────── ────────── ──────────────────
   this            const cExec*          X19        0x782D2538B0
-  cc              ADDF_EC               X22        0x18 (24)
+  cc              EFI_STATUS            X22        0x18 (24)
   pErrCodes       char*                 X2         0x7DFFE390
   pErrMsg         char*                 X20        0x7DFFE2CC
-  type            ADDF_PT               X4         0x01 (1)
+  type            UINT8                 X4         0x01 (1)
 ```
 
 **Locals tab:**
 ```
   Name            Type                  Location   Value
   ─────────────── ───────────────────── ────────── ──────────────────
-  retState        ADDF_EC               X22        0x18 (24)
+  retState        EFI_STATUS            X22        0x18 (24)
   response        int                   [FP-4]     —
 ```
 
 **Disassembly tab:**
 ```
-  ePrompt.cpp:292
+  ErrorHandler.cpp:292
     62e0: mov    w0, #1
     62e4: str    w0, [x19, #0x1cc]
-  ePrompt.cpp:294
+  ErrorHandler.cpp:294
     62f0: adrp   x0, #0x11f000
     62f4: ldr    x0, [x0, #0xf88]
     62f8: ldr    x0, [x0, #0x58]
@@ -166,9 +166,9 @@ Four tabs: **Params** | **Locals** | **Disassembly** | **Source**
 ```
   290:
   291:     // If abort was not requested, prompt the user
-  292:     if (rc != ADDF_OK) {
-  293:         fStatusMsg(PSA_CC_ERROR, "Test failed: %s", msg);
-► 294:         return fPromptUser(severity, msg, detail);
+  292:     if (rc != EFI_SUCCESS) {
+  293:         ReportError(severity, "Operation failed: %s", msg);
+► 294:         return PromptUser(severity, msg, detail);
   295:     }
   296:     return rc;
   297: }
@@ -187,7 +187,7 @@ a tooltip with the symbol name.
   X3   0x7DFFE2CC
   ...
   FP   0x7DFFE2A0
-  LR   0x782B12B098  → IpmiTool.efi +0x1098
+  LR   0x782B12B098  → Module.efi +0x1098
   SP   0x7DFFE2A0
   PC   0x00000001    [INVALID]
   ESR  0x8A000000    PC Alignment Fault
@@ -213,9 +213,9 @@ resolved:
 Or type a symbol name to search:
 
 ```
-  > fPromptTestError
-  0x6120  cExec::fPromptTestError(ADDF_EC, char*, char*, ADDF_PT)
-          EPSA/UI/ePrompt.cpp:294
+  > fHandleError
+  0x6120  cExec::fHandleError(EFI_STATUS, char*, char*, UINT8)
+          src/Platform/ErrorHandler.cpp:294
 ```
 
 ## API Endpoints
@@ -354,7 +354,7 @@ rsod-decode/
 2. POST /api/session
    ↓
 3. Backend:
-   a. detect_format() → dell_x86 / dell_arm64 / edk2_x64
+   a. detect_format() → uefi_x86 / uefi_arm64 / edk2_x64
    b. load_symbols() → SymbolTable + DwarfInfo (for ELF)
    c. extract_crash_info() → CrashInfo
    d. resolve addresses → line_info per module
@@ -384,7 +384,7 @@ rsod-decode/
 
 ## Native Window Strategy
 
-Following stenote's three-tier approach:
+Three-tier approach for maximum compatibility:
 
 1. **pywebview** — `pip install pywebview` (optional dependency)
    - Creates native OS window: macOS WebKit, Windows Edge WebView2, Linux WebKitGTK
@@ -468,7 +468,7 @@ CREATE TABLE session_files (
 - `decode_x86`, `decode_arm64`, frame building → `backend/decoder.py`
 - ESR decode tables → `backend/esr.py`
 - `CrashInfo`, `FrameInfo`, `VarInfo`, etc. → `backend/models.py`
-- Path cleanup `_clean_path` → `backend/decoder.py`
+- Path cleanup `clean_path` → `backend/models.py`
 
 ### Build new:
 
@@ -510,8 +510,8 @@ distribution.
 The CLI tool continues to work standalone:
 
 ```
-python rsod-decode.py putty.txt psa.efi.map       # text output
-python rsod-debug.py putty.txt psa.efi.map         # opens web UI
+python rsod-decode.py putty.txt app.efi.map        # text output
+python rsod-debug.py putty.txt app.efi.map          # opens web UI
 python rsod-debug.py                               # opens UI, upload via browser
 ```
 

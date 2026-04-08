@@ -1,0 +1,4 @@
+flask>=3.0
+pyelftools>=0.30
+capstone>=5.0
+cxxfilt>=0.3
