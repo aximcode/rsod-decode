@@ -11,6 +11,7 @@ This module handles:
 from __future__ import annotations
 
 import re
+import struct
 import subprocess as _subprocess
 import sys
 from dataclasses import dataclass, field
@@ -45,7 +46,7 @@ RE_EDK2_RIP = re.compile(r'^(RIP\s+-\s+)([0-9A-Fa-f]+)(.*)')
 RE_EDK2_REG = re.compile(r'([A-Z0-9]+)\s+-\s+([0-9A-Fa-f]{16})')
 RE_EDK2_IMAGEBASE = re.compile(r'ImageBase=([0-9A-Fa-f]+)', re.IGNORECASE)
 RE_ARM64_REG = re.compile(
-    r'(X\d+|FP|LR|SP|ELR|SPSR|FPSR|FAR|PC|ESR)=([0-9A-Fa-f]+)')
+    r'(X\d+|FP|LR|SP|ELR|SPSR|FPSR|FAR|PC|ESR)=(?:0x)?([0-9A-Fa-f]+)')
 RE_PC_LINE = re.compile(r'^-->\s*PC\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
 RE_ARM64_FRAME = re.compile(
     r'^(s\d+)\s+([0-9A-Fa-f]+)\s+(\S+\.efi)\s+\+([0-9A-Fa-f]+)')
@@ -701,6 +702,85 @@ def _collect_x86_addrs(
 
 
 # =============================================================================
+# Stack dump parser and FP chain walker (ARM64)
+# =============================================================================
+
+RE_STACK_DUMP_LINE = re.compile(
+    r'^\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]{16})\s')
+
+
+def parse_stack_dump(lines: list[str]) -> tuple[int, bytes]:
+    """Parse hex stack dump lines into a contiguous memory buffer.
+
+    Returns (base_address, memory_bytes). Gaps between addresses are
+    filled with zeros.
+    """
+    entries: list[tuple[int, int]] = []
+    in_dump = False
+    for line in lines:
+        if 'Stack Dump' in line:
+            in_dump = True
+            continue
+        if not in_dump:
+            continue
+        m = RE_STACK_DUMP_LINE.match(line)
+        if m:
+            addr = int(m.group(1), 16)
+            val = int(m.group(2), 16)
+            entries.append((addr, val))
+
+    if not entries:
+        return 0, b''
+
+    entries.sort(key=lambda x: x[0])
+    base = entries[0][0]
+    end = entries[-1][0] + 8
+    buf = bytearray(end - base)
+    for addr, val in entries:
+        struct.pack_into('<Q', buf, addr - base, val)
+    return base, bytes(buf)
+
+
+def walk_fp_chain(
+    fp: int, lr: int, stack_memory: bytes, stack_base: int,
+    max_frames: int = 32,
+) -> list[tuple[int, int]]:
+    """Walk the ARM64 frame pointer chain through raw stack memory.
+
+    Args:
+        fp: Initial frame pointer (FP/X29 from crash registers).
+        lr: Initial link register (LR/X30 from crash registers).
+        stack_memory: Contiguous stack memory buffer.
+        stack_base: Virtual address of stack_memory[0].
+        max_frames: Maximum frames to unwind.
+
+    Returns:
+        List of (return_address, frame_pointer) tuples representing
+        the real call chain. The first entry is the crash LR.
+    """
+    stack_end = stack_base + len(stack_memory)
+    frames: list[tuple[int, int]] = []
+
+    # First frame: LR is the return address (where the caller called the
+    # crashing function from)
+    if lr:
+        frames.append((lr, fp))
+
+    for _ in range(max_frames):
+        if fp == 0 or fp < stack_base or fp + 16 > stack_end:
+            break
+        off = fp - stack_base
+        saved_fp = struct.unpack_from('<Q', stack_memory, off)[0]
+        saved_lr = struct.unpack_from('<Q', stack_memory, off + 8)[0]
+        if saved_lr == 0:
+            break
+        frames.append((saved_lr, saved_fp))
+        fp = saved_fp
+
+    return frames
+
+
+# =============================================================================
 # Analysis result
 # =============================================================================
 
@@ -808,22 +888,59 @@ def analyze_rsod(
         annotated, resolved, frames = decode_x86(
             lines, table, base_delta, flat_info)
 
+    # FP chain unwinding: when raw stack memory is available, walk the
+    # FP chain to get real call frames. Each frame's return address tells
+    # us where the CALLER called THIS function from.
+    fp_unwound = False
+    if fmt == 'uefi_arm64':
+        stack_base, stack_mem = parse_stack_dump(lines)
+        if stack_mem:
+            fp = crash_info.registers.get('FP', 0)
+            lr = crash_info.registers.get('LR', 0)
+            if fp and lr:
+                chain = walk_fp_chain(fp, lr, stack_mem, stack_base)
+                if chain:
+                    fp_unwound = True
+                    log(f"FP chain: {len(chain)} frames unwound from stack dump")
+
     # Call-site verification via capstone (ELF sources only)
     call_verified: dict[int, bool] = {}
     if source.dwarf and frames:
         call_verified = verify_call_sites(
             source.dwarf, [f.address for f in frames])
 
-    # Compute call_addr and re-resolve source for non-crash frames.
-    # Return addresses point to the instruction AFTER the call; subtracting
-    # one instruction gives the call site's source line.
+    # Compute call_addr for each frame.
+    # For ARM64 with FP-unwound chain: each frame's return address is where
+    # the caller will resume — subtract 4 to get the bl instruction (call site).
+    # The call site shows where THIS frame called the NEXT one down.
     insn_size = 4 if fmt == 'uefi_arm64' else 1
-    for f in frames:
-        if f.index == 0:
-            f.is_crash_frame = True
-            f.call_addr = f.address
-        else:
-            f.call_addr = f.address - insn_size
+
+    if fp_unwound and fmt == 'uefi_arm64':
+        # Map FP chain return addresses to frames using the sNN offsets.
+        # chain[i] = (return_addr, fp) — this is the LR saved by frame i,
+        # meaning frame i+1 (the caller) called frame i at return_addr - 4.
+        # We want: frame N's source shows where N called N-1.
+        # So frame N's call_site = chain[N-1].return_addr - 4
+        #    (because chain[N-1]'s LR is where frame N called frame N-1)
+        for f in frames:
+            if f.index == 0:
+                f.is_crash_frame = True
+                f.call_addr = f.address  # crash location
+            elif f.index - 1 < len(chain):
+                # chain[f.index-1] has the LR for frame f.index-1,
+                # which is where frame f.index called frame f.index-1
+                f.call_addr = chain[f.index - 1][0] - insn_size
+                f.is_crash_frame = False
+            else:
+                f.call_addr = f.address - insn_size
+                f.is_crash_frame = False
+    else:
+        for f in frames:
+            if f.index == 0:
+                f.is_crash_frame = True
+                f.call_addr = f.address
+            else:
+                f.call_addr = f.address - insn_size
 
     # Re-resolve source_loc at call_addr for non-crash frames
     if source.dwarf and frames:
