@@ -14,25 +14,13 @@ from capstone import CS_ARCH_ARM64, CS_ARCH_X86, CS_MODE_ARM, CS_MODE_64, Cs
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.die import DIE
 from elftools.dwarf.compileunit import CompileUnit
+from elftools.dwarf.descriptions import (
+    describe_form_class, describe_reg_name, set_global_machine_arch,
+)
+from elftools.dwarf.dwarf_expr import DWARFExprParser
 from elftools.dwarf.locationlists import LocationParser
 
 from .models import AddressInfo, VarInfo, clean_path
-
-
-# =============================================================================
-# DWARF register name tables
-# =============================================================================
-
-_ARM64_REGS: dict[int, str] = {i: f'X{i}' for i in range(31)}
-_ARM64_REGS[29] = 'FP'
-_ARM64_REGS[30] = 'LR'
-_ARM64_REGS[31] = 'SP'
-
-_X86_64_REGS: dict[int, str] = {
-    0: 'RAX', 1: 'RDX', 2: 'RCX', 3: 'RBX', 4: 'RSI', 5: 'RDI',
-    6: 'RBP', 7: 'RSP', 8: 'R8', 9: 'R9', 10: 'R10', 11: 'R11',
-    12: 'R12', 13: 'R13', 14: 'R14', 15: 'R15',
-}
 
 RE_ARM_MAPPING = re.compile(r'^\$[xdt](\.\d+)?$')
 
@@ -72,7 +60,8 @@ def _die_contains_addr(die: DIE, addr: int) -> bool:
     if not high_attr:
         return False
     high = high_attr.value
-    if high_attr.form.startswith('DW_FORM_data'):
+    # DWARF v4+: high_pc can be an offset (constant) rather than an address
+    if describe_form_class(high_attr.form) == 'constant':
         high = low + high
     return low <= addr < high
 
@@ -131,53 +120,55 @@ def _resolve_type(die: DIE | None, depth: int = 0) -> str:
     return '?'
 
 
-def _decode_sleb128(data: list[int] | bytes, start: int = 0) -> int:
-    """Decode a SLEB128 value from bytes."""
-    result = 0
-    shift = 0
-    for b in data[start:]:
-        result |= (b & 0x7F) << shift
-        shift += 7
-        if not (b & 0x80):
-            if b & 0x40:
-                result -= 1 << shift
-            break
-    return result
-
-
-def _decode_location(loc_expr: list[int] | bytes, reg_table: dict[int, str],
+def _decode_location(loc_expr: list[int] | bytes,
+                     expr_parser: DWARFExprParser,
                      ) -> tuple[str, str | None]:
-    """Decode a DWARF location expression to (description, register_name)."""
+    """Decode a DWARF location expression to (description, register_name).
+
+    Uses pyelftools' DWARFExprParser for parsing and describe_reg_name
+    for register names, instead of hand-coded opcode tables.
+    """
     if not loc_expr:
         return 'optimized out', None
-    op = loc_expr[0]
 
-    # DW_OP_reg0..DW_OP_reg31 (0x50..0x6F)
-    if 0x50 <= op <= 0x6F:
-        regnum = op - 0x50
-        regname = reg_table.get(regnum, f'r{regnum}')
+    try:
+        parsed = expr_parser.parse_expr(bytes(loc_expr))
+    except Exception:
+        return f'expr[{" ".join(f"{b:02X}" for b in loc_expr)}]', None
+
+    if not parsed:
+        return 'optimized out', None
+
+    op = parsed[0]
+
+    # DW_OP_regN — variable lives in a register
+    if op.op_name.startswith('DW_OP_reg') and not op.op_name.startswith('DW_OP_regx'):
+        regnum = int(op.op_name[len('DW_OP_reg'):])
+        regname = describe_reg_name(regnum).upper()
         return regname, regname
 
-    # DW_OP_breg0..DW_OP_breg31 (0x70..0x8F) -- register + offset
-    if 0x70 <= op <= 0x8F:
-        regnum = op - 0x70
-        regname = reg_table.get(regnum, f'r{regnum}')
-        offset = _decode_sleb128(loc_expr, 1)
+    # DW_OP_bregN — register + offset (indirect)
+    if op.op_name.startswith('DW_OP_breg') and not op.op_name.startswith('DW_OP_bregx'):
+        regnum = int(op.op_name[len('DW_OP_breg'):])
+        regname = describe_reg_name(regnum).upper()
+        offset = op.args[0] if op.args else 0
         if offset:
             return f'[{regname}{offset:+d}]', None
         return f'[{regname}]', None
 
-    # DW_OP_fbreg (0x91) -- frame base + offset
-    if op == 0x91:
-        offset = _decode_sleb128(loc_expr, 1)
+    # DW_OP_fbreg — frame base + offset
+    if op.op_name == 'DW_OP_fbreg':
+        offset = op.args[0] if op.args else 0
         return f'[FP{offset:+d}]', None
 
-    # DW_OP_addr (0x03) -- absolute address
-    if op == 0x03 and len(loc_expr) >= 9:
-        addr = int.from_bytes(bytes(loc_expr[1:9]), 'little')
+    # DW_OP_addr — absolute address
+    if op.op_name == 'DW_OP_addr':
+        addr = op.args[0] if op.args else 0
         return f'0x{addr:X}', None
 
-    return f'expr[{" ".join(f"{b:02X}" for b in loc_expr)}]', None
+    # Fallback: use pyelftools' describe for complex expressions
+    from elftools.dwarf.descriptions import describe_DWARF_expr
+    return describe_DWARF_expr(bytes(loc_expr), expr_parser.structs), None
 
 
 # =============================================================================
@@ -207,20 +198,23 @@ class DwarfInfo:
         # Detect architecture for register names and disassembly
         arch = self._elf.get_machine_arch()
         if arch == 'AArch64':
-            self._reg_table = _ARM64_REGS
             self._cs_arch = CS_ARCH_ARM64
             self._cs_mode = CS_MODE_ARM
+            set_global_machine_arch('AArch64')
         elif arch in ('x64', 'x86'):
-            self._reg_table = _X86_64_REGS
             self._cs_arch = CS_ARCH_X86
             self._cs_mode = CS_MODE_64
+            set_global_machine_arch('x64')
         else:
-            self._reg_table = _ARM64_REGS
             self._cs_arch = CS_ARCH_ARM64
             self._cs_mode = CS_MODE_ARM
+            set_global_machine_arch('AArch64')
 
-        # Cache: CU offset -> parsed CU
-        self._cu_cache: dict[int, CompileUnit] = {}
+        # DWARF expression parser (for location decoding)
+        if self._dwarf:
+            self._expr_parser = DWARFExprParser(self._dwarf.structs)
+        else:
+            self._expr_parser = None
 
         # Capstone disassembler (cached)
         self._cs = Cs(self._cs_arch, self._cs_mode)
@@ -525,9 +519,7 @@ class DwarfInfo:
         cu_offset = self._aranges.cu_offset_at_addr(addr)
         if cu_offset is None:
             return None
-        if cu_offset not in self._cu_cache:
-            self._cu_cache[cu_offset] = self._dwarf._parse_CU_at_offset(cu_offset)
-        return self._cu_cache[cu_offset]
+        return self._dwarf.get_CU_at(cu_offset)
 
     # -----------------------------------------------------------------
     # Internal: line program resolution
@@ -646,14 +638,14 @@ class DwarfInfo:
                     if isinstance(loc_data, list):
                         # Location list -- find entry valid at crash_pc
                         best = self._pick_location(loc_data, crash_pc, func_die)
-                        if best:
+                        if best and self._expr_parser:
                             var.location, var.reg_name = _decode_location(
-                                best, self._reg_table)
+                                best, self._expr_parser)
                         else:
                             var.location = 'optimized out'
-                    else:
+                    elif self._expr_parser:
                         var.location, var.reg_name = _decode_location(
-                            loc_data.loc_expr, self._reg_table)
+                            loc_data.loc_expr, self._expr_parser)
                 except Exception as e:
                     var.location = f'error: {e}'
             else:
