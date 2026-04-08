@@ -1,8 +1,8 @@
-# rsod-decode.py — RSOD Stack Dump Decoder
+# rsod-decode.py — UEFI RSOD Stack Dump Decoder
 
 Resolves raw addresses in UEFI RSOD (Red Screen of Death) stack dumps to
-function names, source files, and line numbers.  Replaces the Windows-only
-`epsaMap.bat` + `processRSOD.pl` workflow.
+function names, source files, and line numbers.  Works with any UEFI
+application crash on x86-64 or ARM64.
 
 ## Quick Start
 
@@ -12,65 +12,48 @@ python3 rsod-decode.py <rsod-log> <symbol-file> [-o output] [-v] [--base HEX]
 
 **x86-64 example** (MSVC `.map` file):
 ```
-python3 rsod-decode.py putty.txt pf4303.efi.map
+python3 rsod-decode.py putty.txt app.efi.map
 ```
 
 **ARM64 example** (GCC `.so` file with debug symbols):
 ```
-python3 rsod-decode.py rsod.txt af4305.efi.so
+python3 rsod-decode.py rsod.txt app.efi.so
 ```
 
 **ARM64 verbose** (adds disassembly, source context, parameters):
 ```
-python3 rsod-decode.py rsod.txt af4305.efi.so -v
+python3 rsod-decode.py rsod.txt app.efi.so -v
+```
+
+**With git-pinned source** (reads source at a specific tag or commit):
+```
+python3 rsod-decode.py rsod.txt app.efi.so -v --tag v1.0.3
+python3 rsod-decode.py rsod.txt app.efi.so -v --commit 6f3b70ec
 ```
 
 Output is written to `<log>_decode.txt` by default (override with `-o`).
 
-## Getting Symbol Files
+## Symbol Files
 
-Symbol files are released to the NAS with every Jenkins build:
+The tool accepts two types of symbol files:
 
-```
-\\AUSPWDSAPP03.aus.amer.dell.com\CPGDiag$\Releases\EPSA\<VERSION>\TEST\map\
-```
+### MSVC linker map files (x86-64)
 
-For example, release 4305A03:
+Produced by the MSVC linker with `/MAP` flag.  Contains function names
+and object files but no source line numbers.
 
-```
-\\AUSPWDSAPP03.aus.amer.dell.com\CPGDiag$\Releases\EPSA\4305A03\TEST\map\
-```
+### GCC ELF shared objects (ARM64)
 
-### x86-64 builds (4303 branch)
+The `.so` file produced before `objcopy` strips it to a `.efi`.  Contains
+full DWARF debug symbols, enabling function names, source file:line
+resolution, inline expansion, parameter names, and local variables.
 
-Use the `.map` file.  The map file contains function names and object files
-but no source line numbers.
-
-| File | Description |
-|------|-------------|
-| `pf4303.efi.map` | DD_SERVER (PowerEdge server, full ESG) |
-| `Nautilus4303.efi.map` | Nautilus factory |
-| `psaDeft4303.efi.map` | DEFT (Dell EFI Functional Test) |
-| `dbg_pf4303.efi.map` | Debug build |
-
-### ARM64 builds (4305 branch)
-
-Use the `.so` file.  The `.so` is the pre-stripped ELF shared object with
-full DWARF debug symbols, enabling function names AND source file:line
-resolution.
-
-| File | Description |
-|------|-------------|
-| `af4305.efi.so` | ARM64 full ESG (PowerEdge ARM servers) |
-| `pf4305.efi.so` | x86-64 build (also available as `.map`) |
-| `pf4305.efi.map` | x86-64 MSVC linker map |
-
-Note: The ARM64 `.efi` on the NAS is **stripped** (no symbols).  Always use
-the `.so` for decoding.
+Note: The `.efi` produced by `objcopy` is typically **stripped** — always
+use the `.so` (or unstripped `.efi`) for decoding.
 
 ## Capturing an RSOD
 
-Connect to the server's iDRAC via SSH, then use the serial console:
+Connect to the server's BMC/iDRAC via SSH, then use the serial console:
 
 ```
 racadm>> console com2
@@ -78,9 +61,6 @@ racadm>> console com2
 
 When the RSOD appears, copy the full text from PuTTY (or save the PuTTY
 session log).  The capture should include the register dump and stack dump.
-
-See `Document\developer.txt` section "Crash dumps for RSOD or YSOD" for
-detailed instructions.
 
 ## Output Structure
 
@@ -92,11 +72,13 @@ locals, disassembly, and source context.
 
 ```
 --- Crash Summary ---
-Exception: Synchronous exceptions, Syndrome:PC alignment fault
-Crash PC:  0x1 [not in image]
-Image:     af4305.efi (base 0x0)
-ESR:       0x8A000000 -- EC=0x22 PC Alignment Fault, IL=1, ISS=0x0000000
-FAR:       0x0000000000000001 -- NULL pointer dereference
+Exception: Synchronous exceptions, Syndrome:Data abort
+Crash PC:  0x78330E42B0 [not in image]
+Image:     app (base 0x0)
+Source:    6f3b70ecc (Release build v1.0.3)
+ESR:       0x96000007 -- EC=0x25 Data Abort (same EL), IL=1, ISS=0x0000007
+           Translation fault L3
+FAR:       0x0000000000000000 -- NULL pointer dereference
 ```
 
 For ARM64, the ESR register is decoded to show the exception class (Data
@@ -106,7 +88,7 @@ the fault type (translation fault, permission fault, etc.).
 ### Annotated RSOD (always shown)
 
 The original RSOD text with symbol annotations appended to each resolvable
-address.  Same format as the v1 tool.
+address.
 
 ### Clean Backtrace (always shown)
 
@@ -115,10 +97,10 @@ inline expansion (ARM64 with DWARF):
 
 ```
 --- Backtrace ---
-#0   0x1098 in cBeepCode::cBeepCode(unsigned short) at EPSA/UI/BeepCode.cpp:145 [psa.efi]
-#1   0x321C in cDellTitleBar::Draw() at EPSA/Libs/PegLib/pthing.hpp:221 [psa.efi]
-      (inlined) cDellTitleBar::Draw() at EPSA/UI/DellTitle.cpp:528
-#4   0x62FC in cExec::fPromptTestError(...) at EPSA/UI/ePrompt.cpp:294 [psa.efi]
+#0   0x1098 in MyClass::MyMethod(int) at src/module.cpp:145 [app.efi]
+#1   0x321C in DrawFrame() at src/ui/draw.hpp:221 [app.efi]
+      (inlined) DrawFrame() at src/ui/draw.cpp:528
+#4   0x62FC in HandleError(ErrorCode, char*, char*) at src/error.cpp:294 [app.efi]
 ```
 
 ### Parameters — verbose only (`-v`)
@@ -127,12 +109,11 @@ Shows real parameter names and types from DWARF debug info, with
 PC-accurate register/stack location tracking:
 
 ```
---- Parameters (frame #0: fPromptTestError) ---
-  this            (const cExec*        ) X19 = 0x000000782D2538B0
-  cc              (ADDF_EC             ) X22 = 0x0000000000000018  (24)
-  pErrCodes       (char*               ) X2 = 0x000000787DFFE390
-  pErrMsg         (char*               ) X20 = 0x000000787DFFE2CC
-  type            (ADDF_PT             ) X4 = 0x0000000000000001  (1)
+--- Parameters (frame #0: HandleError) ---
+  this            (const MyClass*      ) X19 = 0x000000782D2538B0
+  code            (ErrorCode           ) X22 = 0x0000000000000018  (24)
+  msg             (char*               ) X2 = 0x000000787DFFE390
+  detail          (char*               ) X20 = 0x000000787DFFE2CC
 ```
 
 Note: locations are PC-accurate — parameters may have moved from their
@@ -144,8 +125,8 @@ stack slots by the time of the crash.
 Shows local variables with register values when available:
 
 ```
---- Locals (frame #0: fPromptTestError) ---
-  retState        (ADDF_EC             ) X22
+--- Locals (frame #0: HandleError) ---
+  retState        (int                 ) X22
   response        (int                 ) [FP-4]
 ```
 
@@ -156,30 +137,31 @@ Disassembly via capstone (no external tools needed):
 
 ```
 --- Disassembly (0x1098) ---
-  EPSA/build/Bin/BeepCode.cpp:98
+  src/module.cpp:98
     1080: adrp  x2, #0x137000
     1084: ldr  w2, [x2, #0x30c]
     1088: cbz  w2, #0x114c
-  EPSA/build/Bin/BeepCode.cpp:145
+  src/module.cpp:145
   > 1098: mov  w16, #3
     109c: mov  x13, #0x3540
 ```
 
 ### Source Context — verbose only (`-v`)
 
-Source lines around the crash point (if source tree is accessible):
+Source lines around the crash point (if source tree is accessible or
+`--tag`/`--commit` is provided):
 
 ```
---- Source (EPSA/UI/ePrompt.cpp) ---
-     292:     if (rc != ADDF_OK) {
-     293:         fStatusMsg(PSA_CC_ERROR, "Test failed: %s", msg);
-  >  294:         return fPromptUser(severity, msg, detail);
+--- Source (src/error.cpp @ 6f3b70ecc) ---
+     292:     if (rc != OK) {
+     293:         LogError("Failed: %s", msg);
+  >  294:         return PromptUser(severity, msg, detail);
      295:     }
      296:     return rc;
 ```
 
-Use `--source-root` to specify the local source tree.  Defaults to
-auto-detection from the script's location in the repo.
+Use `--source-root` to specify the local source tree, or `--tag`/`--commit`
+to read source from a specific git revision.
 
 ## Options
 
@@ -190,29 +172,44 @@ auto-detection from the script's location in the repo.
 | `-s FILE` | Additional symbol file for multi-module traces (repeatable) |
 | `--base HEX` | Override image base address (hex, e.g. `5948A000`) |
 | `--source-root PATH` | Local source tree root for source context |
+| `--tag TAG` | Git tag for source context (reads source at that revision) |
+| `--commit HASH` | Git commit hash for source context |
 
 ### Multi-module traces (`-s`)
 
-ARM64 RSODs trace through multiple modules (psa.efi, DxeCore.efi,
+ARM64 RSODs trace through multiple modules (app.efi, DxeCore.efi,
 Shell.efi).  Provide additional symbol files to resolve frames from
 other modules:
 
 ```
-python3 rsod-decode.py rsod.txt af4305.efi.so -s DxeCore.debug -s Shell.debug
+python3 rsod-decode.py rsod.txt app.efi.so -s DxeCore.debug -s Shell.debug
 ```
 
 Module names are matched from the `sNN ADDR module.efi +OFFSET` lines.
 
-### Non-default image base (MASER)
+### Non-default image base
 
-When EPSA is loaded by the MASER at a different address than the preferred
-base (0x180000000 for x86), use `--base`:
+When a UEFI application is loaded at a different address than the preferred
+base (e.g., 0x180000000 for x86), use `--base`:
 
 ```
-python3 rsod-decode.py putty.txt pf4303.efi.map --base 5948A000
+python3 rsod-decode.py putty.txt app.efi.map --base 5948A000
 ```
 
 The tool automatically detects EDK2-format ImageBase lines when present.
+
+### Git-pinned source context (`--tag` / `--commit`)
+
+By default, source context reads from the working tree.  Use `--tag` or
+`--commit` to read source at a specific git revision — useful when the
+working tree doesn't match the build that produced the crash:
+
+```
+python3 rsod-decode.py rsod.txt app.efi.so -v --tag v1.0.3
+python3 rsod-decode.py rsod.txt app.efi.so -v --commit abc1234
+```
+
+The resolved commit is shown in the crash summary and source headers.
 
 ### Call-site verification (ARM64 ELF only)
 
@@ -226,34 +223,33 @@ The tool auto-detects the format:
 
 | Format | Detected by | Architecture |
 |--------|-------------|-------------|
-| Dell BIOS x86 | `AX=`, `-->RIP` | x86-64 |
-| Dell BIOS ARM64 | `X0=`, `-->PC`, `s00..sNN` | ARM64 |
+| UEFI BIOS x86 | `AX=`, `-->RIP` | x86-64 |
+| UEFI BIOS ARM64 | `X0=`, `-->PC`, `s00..sNN` | ARM64 |
 | EDK2 x64 | `!!!! X64 Exception`, `RIP  -` | x86-64 |
 
 ## Requirements
 
-- Python 3.10+
-- Python packages (install via pip):
+Python 3.10+ with pip packages listed in `requirements.txt`:
 
 ```
 pip install -r requirements.txt
 ```
 
-Required packages:
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `pyelftools` | >= 0.30 | ELF symbol tables and DWARF debug info |
+| `capstone` | >= 5.0 | ARM64 and x86-64 disassembly |
+| `cxxfilt` | >= 0.3 | C++ name demangling |
 
-| Package | Purpose |
-|---------|---------|
-| `pyelftools` | ELF/DWARF parsing (symbols, source lines, inlines, params) |
-| `capstone` | Disassembly (ARM64 and x86-64, verbose mode) |
-| `cxxfilt` | C++ name demangling |
+No external command-line tools (nm, addr2line, objdump) are needed.
 
-No external binutils tools (nm, addr2line, objdump) are needed.
+Optional for `--tag`/`--commit`: `git` must be in PATH.
 
 ## Symbol File Formats
 
-| Source | Format | Functions | Source lines | Inlines | Parameters | Locals |
-|--------|--------|-----------|-------------|---------|-----------|--------|
-| MSVC `.map` | Text | Yes | No | No | No | No |
-| GCC `.so`/`.efi` | ELF+DWARF | Yes (demangled) | Yes | Yes | Real names + types | Yes |
+| Source | Format | Functions | Source lines | Inlines | Param names | Locals | Object files |
+|--------|--------|-----------|-------------|---------|------------|--------|-------------|
+| MSVC `.map` | Text | Yes | No | No | No | No | Yes |
+| GCC `.so`/`.efi` | ELF+DWARF | Yes (demangled) | Yes | Yes | Real DWARF names | Yes | No |
 
 The tool auto-detects the format by checking for ELF magic bytes.
