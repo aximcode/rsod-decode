@@ -920,7 +920,9 @@ def extract_crash_info(
     return info
 
 
-def format_crash_summary(info: CrashInfo) -> list[str]:
+def format_crash_summary(
+    info: CrashInfo, git_ref: GitRef | None = None,
+) -> list[str]:
     """Format the --- Crash Summary --- block."""
     lines = ['--- Crash Summary ---']
     if info.exception_desc:
@@ -931,6 +933,8 @@ def format_crash_summary(info: CrashInfo) -> list[str]:
     if info.image_name:
         base = f" (base 0x{info.image_base:X})" if info.image_base else ''
         lines.append(f"Image:     {info.image_name}{base}")
+    if git_ref:
+        lines.append(f"Source:    {git_ref.label()}")
     if info.esr is not None:
         lines.extend(format_esr(info.esr, info.far))
     return lines
@@ -1039,8 +1043,10 @@ def format_disassembly(
 
 def format_source_context(
     source_loc: str, source_root: Path, context: int = 3,
+    git_ref: GitRef | None = None, repo_root: Path | None = None,
 ) -> list[str]:
-    """Show source lines around the target, marking it with >."""
+    """Show source lines around the target, marking it with >.
+    If git_ref is provided, reads source at that commit via git show."""
     if ':' not in source_loc:
         return []
     file_part, line_part = source_loc.rsplit(':', 1)
@@ -1049,30 +1055,46 @@ def format_source_context(
     except ValueError:
         return []
 
-    src_path = source_root / file_part
-    if not src_path.exists():
-        # Fallback: search narrowed subtree for the filename
-        filename = Path(file_part).name
-        for subtree in ('EPSA', 'ADDF'):
-            candidate_dir = source_root / subtree
-            if candidate_dir.is_dir():
-                matches = list(candidate_dir.rglob(filename))
-                if len(matches) == 1:
-                    src_path = matches[0]
-                    file_part = str(src_path.relative_to(source_root))
-                    break
+    src_lines: list[str] | None = None
+    display_path = file_part
+
+    if git_ref and repo_root:
+        # Read from git at the specified commit
+        src_lines = _read_source_from_git(git_ref, file_part, repo_root)
+        if not src_lines:
+            # Try filename-only search via git ls-tree
+            filename = Path(file_part).name
+            src_lines = _read_source_from_git(git_ref, filename, repo_root)
+        if src_lines:
+            display_path = f"{file_part} @ {git_ref.short}"
+    else:
+        # Read from working tree
+        src_path = source_root / file_part
         if not src_path.exists():
+            filename = Path(file_part).name
+            for subtree in ('EPSA', 'ADDF'):
+                candidate_dir = source_root / subtree
+                if candidate_dir.is_dir():
+                    matches = list(candidate_dir.rglob(filename))
+                    if len(matches) == 1:
+                        src_path = matches[0]
+                        display_path = str(src_path.relative_to(source_root))
+                        break
+            if not src_path.exists():
+                return []
+        try:
+            src_lines = src_path.read_text(
+                encoding='utf-8', errors='replace').splitlines()
+        except OSError:
             return []
 
-    try:
-        src_lines = src_path.read_text(encoding='utf-8', errors='replace').splitlines()
-    except OSError:
+    if not src_lines:
         return []
 
     start = max(0, target_line - context - 1)
     end = min(len(src_lines), target_line + context)
 
-    out = [f'--- Source ({file_part}) ---']
+    out = [f'--- Source ({display_path}) ---']
     for i in range(start, end):
         lineno = i + 1
         marker = '>' if lineno == target_line else ' '
@@ -1390,6 +1412,95 @@ def _log(msg: str) -> None:
 
 
 # =============================================================================
+# Git source resolution
+# =============================================================================
+
+import subprocess as _subprocess
+
+
+@dataclass
+class GitRef:
+    """Resolved git reference for source context."""
+    commit: str        # full commit hash
+    short: str         # short hash
+    summary: str       # commit subject line
+    ref_name: str      # original --tag or --commit value
+
+    def label(self) -> str:
+        return f"{self.short} ({self.summary})"
+
+
+def _resolve_git_ref(ref: str, repo_root: Path) -> GitRef | None:
+    """Validate a git tag or commit hash and return its info."""
+    try:
+        r = _subprocess.run(
+            ['git', '-C', str(repo_root), 'log', '--format=%H%n%h%n%s',
+             '-1', ref],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        lines = r.stdout.strip().splitlines()
+        if len(lines) < 3:
+            return None
+        return GitRef(
+            commit=lines[0], short=lines[1],
+            summary=lines[2], ref_name=ref)
+    except (FileNotFoundError, _subprocess.TimeoutExpired):
+        return None
+
+
+def _read_source_from_git(
+    git_ref: GitRef, file_path: str, repo_root: Path,
+) -> list[str] | None:
+    """Read source file at a specific git commit."""
+    # Try the path directly with common prefixes
+    for prefix in ('source/src/', ''):
+        git_path = f"{prefix}{file_path}"
+        lines = _git_show(git_ref.commit, git_path, repo_root)
+        if lines is not None:
+            return lines
+
+    # Fallback: search by filename in EPSA/ and ADDF/ subtrees
+    filename = Path(file_path).name
+    for subtree in ('source/src/EPSA', 'source/src/ADDF'):
+        found = _git_find_file(git_ref.commit, filename, subtree, repo_root)
+        if found:
+            return _git_show(git_ref.commit, found, repo_root)
+
+    return None
+
+
+def _git_show(
+    commit: str, path: str, repo_root: Path,
+) -> list[str] | None:
+    """Run git show commit:path, return lines or None."""
+    try:
+        r = _subprocess.run(
+            ['git', '-C', str(repo_root), 'show', f'{commit}:{path}'],
+            capture_output=True, text=True, timeout=10)
+        return r.stdout.splitlines() if r.returncode == 0 else None
+    except (FileNotFoundError, _subprocess.TimeoutExpired):
+        return None
+
+
+def _git_find_file(
+    commit: str, filename: str, subtree: str, repo_root: Path,
+) -> str | None:
+    """Find a file by name in a subtree at a specific commit."""
+    try:
+        r = _subprocess.run(
+            ['git', '-C', str(repo_root), 'ls-tree', '-r', '--name-only',
+             commit, subtree],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        matches = [p for p in r.stdout.splitlines() if p.endswith(f'/{filename}')]
+        return matches[0] if len(matches) == 1 else None
+    except (FileNotFoundError, _subprocess.TimeoutExpired):
+        return None
+
+
+# =============================================================================
 # Main decode orchestrator
 # =============================================================================
 
@@ -1416,6 +1527,7 @@ def decode_rsod(
     log_path: Path, sym_path: Path, out_path: Path,
     base_override: int | None, verbose: bool,
     extra_sym_paths: list[Path], source_root: Path | None,
+    git_ref: GitRef | None = None, repo_root: Path | None = None,
 ) -> None:
     """Read RSOD log + symbol file, write annotated + enhanced output."""
     source = load_symbols(sym_path)
@@ -1507,7 +1619,7 @@ def decode_rsod(
 
     # Assemble output
     result: list[str] = []
-    result.extend(format_crash_summary(crash_info))
+    result.extend(format_crash_summary(crash_info, git_ref))
     result.append('')
     result.extend(annotated)
     result.append('')
@@ -1539,8 +1651,10 @@ def decode_rsod(
                     result.append('')
                     result.extend(disasm)
 
-        if source_root and f0.source_loc:
-            src = format_source_context(f0.source_loc, source_root)
+        if (source_root or git_ref) and f0.source_loc:
+            src = format_source_context(
+                f0.source_loc, source_root or Path('.'),
+                git_ref=git_ref, repo_root=repo_root)
             if src:
                 result.append('')
                 result.extend(src)
@@ -1597,6 +1711,10 @@ def main() -> None:
                         help='Override image base address (hex)')
     parser.add_argument('--source-root', type=Path, default=None,
                         help='Local source tree root for source context')
+    parser.add_argument('--tag', type=str, default=None,
+                        help='Git tag for source context (e.g. 4305.3)')
+    parser.add_argument('--commit', type=str, default=None,
+                        help='Git commit hash for source context')
     args = parser.parse_args()
 
     if not args.rsod_log.exists():
@@ -1625,9 +1743,39 @@ def main() -> None:
         if candidate.is_dir():
             source_root = candidate
 
+    # Resolve git ref (tag or commit) for source context
+    git_ref: GitRef | None = None
+    repo_root: Path | None = None
+    ref_str = args.tag or args.commit
+    if ref_str:
+        # Find the repo root (walk up from source_root or script location)
+        for candidate_root in (source_root, Path(__file__).resolve().parents[4]):
+            if candidate_root and (candidate_root / '.git').exists():
+                repo_root = candidate_root
+                break
+            # Check parent — source/src/ → source/ → repo root
+            for p in (candidate_root,) if candidate_root else ():
+                for parent in p.parents:
+                    if (parent / '.git').exists():
+                        repo_root = parent
+                        break
+                if repo_root:
+                    break
+            if repo_root:
+                break
+
+        if repo_root:
+            git_ref = _resolve_git_ref(ref_str, repo_root)
+            if git_ref:
+                _log(f"Source: {git_ref.label()}")
+            else:
+                _log(f"Warning: git ref '{ref_str}' not found in {repo_root}")
+        else:
+            _log("Warning: git repo not found, --tag/--commit ignored")
+
     decode_rsod(args.rsod_log, args.symbol_file, out_path,
                 base_override, args.verbose, args.sym,
-                source_root)
+                source_root, git_ref, repo_root)
 
 
 if __name__ == '__main__':
