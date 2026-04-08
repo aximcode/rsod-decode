@@ -5,13 +5,14 @@ RSOD Decode Tool
 Resolves raw addresses in UEFI RSOD (Red Screen of Death) stack dumps to
 function names, source locations, and more using symbol files.
 
-Supports x86-64 (MSVC .map) and ARM64 (GCC ELF via pyelftools/capstone).
+Works with any UEFI application crash — supports x86-64 (MSVC .map) and
+ARM64 (GCC ELF via pyelftools/capstone).
 
 Usage:
   rsod-decode.py <rsod-log> <symbol-file> [-o output] [-v] [--base HEX]
-  rsod-decode.py rsod.txt psa.efi.map
-  rsod-decode.py rsod.txt af4305.efi.so -v
-  rsod-decode.py rsod.txt af4305.efi.so -s DxeCore.debug -s Shell.debug
+  rsod-decode.py rsod.txt app.efi.map
+  rsod-decode.py rsod.txt app.efi.so -v
+  rsod-decode.py rsod.txt app.efi.so -s DxeCore.debug -s Shell.debug
 """
 from __future__ import annotations
 
@@ -789,16 +790,23 @@ def load_symbols(path: Path) -> SymbolSource:
 # Path cleanup
 # =============================================================================
 
-RE_SRC_PATH = re.compile(r'.*[/\\]source[/\\]src[/\\](.*)')
-
-
 def _clean_path(raw: str) -> str:
-    """Clean cross-compile DWARF paths to readable relative form."""
+    """Clean DWARF paths to readable relative form.
+
+    Strips discriminator suffixes, build-directory prefixes, and
+    Windows drive letter artifacts from cross-compile paths.
+    """
     raw = re.sub(r'\s*\(discriminator \d+\)', '', raw)
-    m = RE_SRC_PATH.search(raw)
-    if m:
-        return m.group(1).replace('\\', '/')
-    return re.sub(r'^.*build/Bin/[A-Z]:[/\\]', '', raw).replace('\\', '/')
+    # Strip everything up to the last recognized source root marker
+    # Common patterns: .../source/src/..., .../src/..., .../Build/...
+    for marker in (r'source[/\\]src[/\\]', r'src[/\\]', r'Build[/\\]'):
+        m = re.search(rf'.*[/\\]{marker}(.*)', raw)
+        if m:
+            return m.group(1).replace('\\', '/')
+    # Strip build directory + drive letter artifacts
+    cleaned = re.sub(r'^.*[/\\]build[/\\][^/\\]+[/\\]([A-Z]:[/\\])?', '', raw,
+                     flags=re.IGNORECASE)
+    return cleaned.replace('\\', '/')
 
 
 # =============================================================================
@@ -853,8 +861,8 @@ def format_esr(esr: int, far: int | None) -> list[str]:
 # Crash summary extraction
 # =============================================================================
 
-RE_DELL_X86_TYPE = re.compile(r'^Type:\s*(.+?)\s*Source:', re.IGNORECASE)
-RE_DELL_ARM64_TYPE = re.compile(r'^Type:\s*(.+)', re.IGNORECASE)
+RE_UEFI_X86_TYPE = re.compile(r'^Type:\s*(.+?)\s*Source:', re.IGNORECASE)
+RE_UEFI_ARM64_TYPE = re.compile(r'^Type:\s*(.+)', re.IGNORECASE)
 RE_EDK2_TYPE = re.compile(
     r'X64 Exception Type\s*-\s*([0-9a-fA-F]+)\(([^)]+)\)', re.IGNORECASE)
 
@@ -867,8 +875,8 @@ def extract_crash_info(
     regs: dict[str, int] = {}
 
     # Choose patterns based on format
-    if fmt == 'dell_arm64':
-        type_pats = [RE_DELL_ARM64_TYPE]
+    if fmt == 'uefi_arm64':
+        type_pats = [RE_UEFI_ARM64_TYPE]
         pc_pats = [RE_PC_LINE]
         reg_pats = [RE_ARM64_REG]
     elif fmt == 'edk2_x64':
@@ -876,9 +884,9 @@ def extract_crash_info(
         pc_pats = [RE_EDK2_RIP]
         reg_pats = [RE_EDK2_REG]
     else:
-        type_pats = [RE_DELL_X86_TYPE]
+        type_pats = [RE_UEFI_X86_TYPE]
         pc_pats = [RE_RIP_LINE]
-        reg_pats = [RE_DELL_X86_REG]
+        reg_pats = [RE_UEFI_X86_REG]
 
     for line in lines:
         # Exception description
@@ -1072,14 +1080,14 @@ def format_source_context(
         src_path = source_root / file_part
         if not src_path.exists():
             filename = Path(file_part).name
-            for subtree in ('EPSA', 'ADDF'):
-                candidate_dir = source_root / subtree
-                if candidate_dir.is_dir():
-                    matches = list(candidate_dir.rglob(filename))
-                    if len(matches) == 1:
-                        src_path = matches[0]
-                        display_path = str(src_path.relative_to(source_root))
-                        break
+            for candidate_dir in sorted(source_root.iterdir()):
+                if not candidate_dir.is_dir() or candidate_dir.name.startswith('.'):
+                    continue
+                matches = list(candidate_dir.rglob(filename))
+                if len(matches) == 1:
+                    src_path = matches[0]
+                    display_path = str(src_path.relative_to(source_root))
+                    break
             if not src_path.exists():
                 return []
         try:
@@ -1158,7 +1166,7 @@ def _lookup_and_annotate(
 RE_STACK_LINE = re.compile(
     r'^(\s+[0-9A-Fa-f]+\s+)([0-9A-Fa-f]{16})(\s+.*)$')
 RE_RIP_LINE = re.compile(r'^-->\s*RIP\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
-RE_DELL_X86_REG = re.compile(r'([A-Z0-9]{2})=([0-9A-Fa-f]{16})')
+RE_UEFI_X86_REG = re.compile(r'([A-Z0-9]{2})=([0-9A-Fa-f]{16})')
 RE_EDK2_RIP = re.compile(r'^(RIP\s+-\s+)([0-9A-Fa-f]+)(.*)')
 RE_EDK2_REG = re.compile(r'([A-Z0-9]+)\s+-\s+([0-9A-Fa-f]{16})')
 RE_EDK2_IMAGEBASE = re.compile(r'ImageBase=([0-9A-Fa-f]+)', re.IGNORECASE)
@@ -1176,16 +1184,16 @@ RE_ARM64_FRAME = re.compile(
 def detect_format(lines: list[str]) -> str:
     for line in lines:
         if RE_PC_LINE.match(line) or RE_ARM64_FRAME.match(line):
-            return 'dell_arm64'
+            return 'uefi_arm64'
         if line.startswith('--> PC') or line.startswith('-->PC'):
-            return 'dell_arm64'
+            return 'uefi_arm64'
         if RE_ARM64_REG.search(line) and 'X0=' in line:
-            return 'dell_arm64'
+            return 'uefi_arm64'
         if '!!!! X64 Exception' in line or RE_EDK2_RIP.match(line):
             return 'edk2_x64'
         if RE_RIP_LINE.match(line):
-            return 'dell_x86'
-    return 'dell_x86'
+            return 'uefi_x86'
+    return 'uefi_x86'
 
 
 # =============================================================================
@@ -1243,7 +1251,7 @@ def _extract_addr_from_line(
 
 
 # =============================================================================
-# Decode: Dell x86 + EDK2 x64
+# Decode: UEFI x86 + EDK2 x64
 # =============================================================================
 
 # (pattern, capture group for the address)
@@ -1266,7 +1274,7 @@ def decode_x86(
     frame_idx = 0
 
     for line in lines:
-        has_regs = (RE_DELL_X86_REG.search(line) is not None
+        has_regs = (RE_UEFI_X86_REG.search(line) is not None
                     or RE_EDK2_REG.search(line) is not None)
         if has_regs and not in_stack:
             in_registers = True
@@ -1283,7 +1291,7 @@ def decode_x86(
 
         if in_registers and not in_stack:
             out.append(_annotate_regs(
-                line, [RE_DELL_X86_REG, RE_EDK2_REG], table, base_delta))
+                line, [RE_UEFI_X86_REG, RE_EDK2_REG], table, base_delta))
             continue
 
         # -->RIP or EDK2 RIP
@@ -1321,7 +1329,7 @@ def decode_x86(
 
 
 # =============================================================================
-# Decode: Dell ARM64
+# Decode: UEFI ARM64
 # =============================================================================
 
 def decode_arm64(
@@ -1460,12 +1468,11 @@ def _read_source_from_git(
         if lines is not None:
             return lines
 
-    # Fallback: search by filename in EPSA/ and ADDF/ subtrees
+    # Fallback: search entire repo for the filename
     filename = Path(file_path).name
-    for subtree in ('source/src/EPSA', 'source/src/ADDF'):
-        found = _git_find_file(git_ref.commit, filename, subtree, repo_root)
-        if found:
-            return _git_show(git_ref.commit, found, repo_root)
+    found = _git_find_file(git_ref.commit, filename, '', repo_root)
+    if found:
+        return _git_show(git_ref.commit, found, repo_root)
 
     return None
 
@@ -1562,7 +1569,7 @@ def decode_rsod(
     default_key = source.name.lower()
     line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]] = {}
 
-    if fmt == 'dell_arm64':
+    if fmt == 'uefi_arm64':
         # Group addresses by module
         module_addrs: dict[str, list[int]] = {}
         for line in lines:
@@ -1601,7 +1608,7 @@ def decode_rsod(
     crash_info.image_name = source.name
 
     # Decode (annotated lines + frames)
-    if fmt == 'dell_arm64':
+    if fmt == 'uefi_arm64':
         annotated, resolved, frames = decode_arm64(
             lines, table, base_delta, line_info_by_module,
             extra_sources, default_key)
@@ -1712,7 +1719,7 @@ def main() -> None:
     parser.add_argument('--source-root', type=Path, default=None,
                         help='Local source tree root for source context')
     parser.add_argument('--tag', type=str, default=None,
-                        help='Git tag for source context (e.g. 4305.3)')
+                        help='Git tag for source context (e.g. v1.0.3)')
     parser.add_argument('--commit', type=str, default=None,
                         help='Git commit hash for source context')
     args = parser.parse_args()
