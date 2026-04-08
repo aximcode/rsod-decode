@@ -70,7 +70,7 @@ class SymbolSource:
     dwarf: DwarfInfo | None = None
 
     def has_debug_info(self) -> bool:
-        return self.elf_path is not None
+        return self.dwarf is not None
 
 @dataclass
 class FrameInfo:
@@ -313,6 +313,9 @@ class DwarfInfo:
         # Cache: CU offset -> parsed CU
         self._cu_cache: dict[int, CompileUnit] = {}
 
+        # Capstone disassembler (cached)
+        self._cs = Cs(self._cs_arch, self._cs_mode)
+
         # Cache .text section for disassembly
         text_sec = self._elf.get_section_by_name('.text')
         if text_sec:
@@ -426,9 +429,8 @@ class DwarfInfo:
         end_offset = min(end_offset, len(self._text_data))
         code = self._text_data[offset:end_offset]
 
-        md = Cs(self._cs_arch, self._cs_mode)
         result: list[tuple[int, str, str]] = []
-        for insn in md.disasm(code, start):
+        for insn in self._cs.disasm(code, start):
             result.append((insn.address, insn.mnemonic, insn.op_str))
         return result
 
@@ -444,20 +446,60 @@ class DwarfInfo:
             return False
         code = self._text_data[offset:end_offset]
 
-        md = Cs(self._cs_arch, self._cs_mode)
-        insns = list(md.disasm(code, check_start))
+        insns = list(self._cs.disasm(code, check_start))
         if not insns:
             return False
         last = insns[-1]
         return last.mnemonic in ('call', 'bl', 'blr', 'blx')
 
-    def source_line_for_addr(self, addr: int) -> str:
-        """Return cleaned source location string for an instruction address."""
-        cu = self._get_cu_for_addr(addr)
+    def source_lines_for_addrs(self, addrs: list[int]) -> dict[int, str]:
+        """Batch-resolve instruction addresses to cleaned source locations.
+        Single pass through the line program for efficiency."""
+        if not addrs:
+            return {}
+        # All addrs should be in the same CU (disassembly window)
+        cu = self._get_cu_for_addr(addrs[0])
         if not cu:
-            return ''
-        raw = self._addr_to_line(cu, addr)
-        return _clean_path(raw) if raw else ''
+            return {}
+        lp = self._dwarf.line_program_for_CU(cu)
+        if not lp:
+            return {}
+
+        addr_set = set(addrs)
+        result: dict[int, str] = {}
+        prev = None
+        for entry in lp.get_entries():
+            state = entry.state
+            if state is None:
+                continue
+            if state.end_sequence:
+                prev = None
+                continue
+            if prev:
+                # Check which query addresses fall in [prev.address, state.address)
+                for a in list(addr_set):
+                    if prev.address <= a < state.address:
+                        raw = self._format_file_line(lp, prev.file, prev.line)
+                        if raw:
+                            result[a] = _clean_path(raw)
+                        addr_set.discard(a)
+                if not addr_set:
+                    break
+            prev = state
+        return result
+
+    def _format_file_line(self, lp: object, file_idx: int, line: int) -> str:
+        """Format a file:line string from line program data."""
+        file_entry = lp['file_entry'][file_idx - 1]
+        fname = (file_entry.name.decode()
+                 if isinstance(file_entry.name, bytes) else file_entry.name)
+        dir_idx = file_entry.dir_index
+        dirs = lp['include_directory']
+        if dir_idx > 0 and dir_idx <= len(dirs):
+            d = dirs[dir_idx - 1]
+            d = d.decode() if isinstance(d, bytes) else d
+            fname = f'{d}/{fname}'
+        return f'{fname}:{line}'
 
     # -----------------------------------------------------------------
     # Parameter and local variable extraction
@@ -497,7 +539,7 @@ class DwarfInfo:
     # -----------------------------------------------------------------
 
     def _addr_to_line(self, cu: CompileUnit, addr: int) -> str:
-        """Resolve addr to "file:line" using the CU's line program."""
+        """Resolve addr to "dir/file:line" using the CU's line program."""
         lp = self._dwarf.line_program_for_CU(cu)
         if not lp:
             return ''
@@ -511,11 +553,7 @@ class DwarfInfo:
                 prev = None
                 continue
             if prev and prev.address <= addr < state.address:
-                file_entry = lp['file_entry'][prev.file - 1]
-                fname = (file_entry.name.decode()
-                         if isinstance(file_entry.name, bytes)
-                         else file_entry.name)
-                return f'{fname}:{prev.line}'
+                return self._format_file_line(lp, prev.file, prev.line)
             prev = state
         return ''
 
@@ -612,8 +650,8 @@ class DwarfInfo:
                     else:
                         var.location, var.reg_name = _decode_location(
                             loc_data.loc_expr, self._reg_table)
-                except Exception:
-                    var.location = 'error'
+                except Exception as e:
+                    var.location = f'error: {e}'
             else:
                 var.location = 'optimized out'
 
@@ -719,8 +757,11 @@ def load_symbols(path: Path) -> SymbolSource:
 
     if is_elf(path):
         elf_path = path
-        dwarf_info = DwarfInfo(path)
-        raw = dwarf_info.get_symbols()
+        try:
+            dwarf_info = DwarfInfo(path)
+            raw = dwarf_info.get_symbols()
+        except Exception as e:
+            sys.exit(f"Error: failed to read ELF {path}: {e}")
         table = SymbolTable()
         _build_table(table, [MapSymbol(a, n, '', f) for a, n, f in raw])
         src = 'ELF+DWARF'
@@ -925,41 +966,16 @@ def format_backtrace(
 # Parameter extraction (verbose, frame #0)
 # =============================================================================
 
-ARM64_PARAM_REGS = ['X0', 'X1', 'X2', 'X3', 'X4', 'X5', 'X6', 'X7']
-X86_PARAM_REGS = ['DI', 'SI', 'DX', 'CX', 'R8', 'R9']
-
-
-def format_params(
-    dwarf_info: DwarfInfo, crash_pc: int, registers: dict[str, int],
-    frame: FrameInfo,
+def _format_vars(
+    vars_: list[VarInfo], registers: dict[str, int],
+    frame: FrameInfo, label: str,
 ) -> list[str]:
-    """Format parameters using real DWARF names and PC-accurate locations."""
-    params = dwarf_info.get_params(crash_pc)
-    if not params:
+    """Format a list of VarInfo (params or locals) with register values."""
+    if not vars_:
         return []
     func_name = frame.symbol.name.split('(')[0].rsplit('::', 1)[-1] if frame.symbol else '???'
-    lines = [f'--- Parameters (frame #{frame.index}: {func_name}) ---']
-    for p in params:
-        val_str = ''
-        if p.reg_name and p.reg_name in registers:
-            val = registers[p.reg_name]
-            dec = f"  ({val})" if val < 0x10000 else ''
-            val_str = f' = 0x{val:016X}{dec}'
-        lines.append(f"  {p.name:<15s} ({p.type_name:<20s}) {p.location}{val_str}")
-    return lines
-
-
-def format_locals(
-    dwarf_info: DwarfInfo, crash_pc: int, registers: dict[str, int],
-    frame: FrameInfo,
-) -> list[str]:
-    """Format local variables using DWARF info."""
-    locals_ = dwarf_info.get_locals(crash_pc)
-    if not locals_:
-        return []
-    func_name = frame.symbol.name.split('(')[0].rsplit('::', 1)[-1] if frame.symbol else '???'
-    lines = [f'--- Locals (frame #{frame.index}: {func_name}) ---']
-    for v in locals_:
+    lines = [f'--- {label} (frame #{frame.index}: {func_name}) ---']
+    for v in vars_:
         val_str = ''
         if v.reg_name and v.reg_name in registers:
             val = registers[v.reg_name]
@@ -967,6 +983,24 @@ def format_locals(
             val_str = f' = 0x{val:016X}{dec}'
         lines.append(f"  {v.name:<15s} ({v.type_name:<20s}) {v.location}{val_str}")
     return lines
+
+
+def format_params(
+    dwarf_info: DwarfInfo, crash_pc: int, registers: dict[str, int],
+    frame: FrameInfo,
+) -> list[str]:
+    """Format parameters using real DWARF names and PC-accurate locations."""
+    return _format_vars(
+        dwarf_info.get_params(crash_pc), registers, frame, 'Parameters')
+
+
+def format_locals(
+    dwarf_info: DwarfInfo, crash_pc: int, registers: dict[str, int],
+    frame: FrameInfo,
+) -> list[str]:
+    """Format local variables using DWARF info."""
+    return _format_vars(
+        dwarf_info.get_locals(crash_pc), registers, frame, 'Locals')
 
 
 # =============================================================================
@@ -981,11 +1015,13 @@ def format_disassembly(
     if not insns:
         return []
 
+    # Batch-resolve source lines for all instruction addresses
+    src_map = dwarf.source_lines_for_addrs([a for a, _, _ in insns])
+
     lines = [f'--- Disassembly (0x{address:X}) ---']
     prev_src: str = ''
     for iaddr, mnemonic, op_str in insns:
-        # Source line annotation
-        src = dwarf.source_line_for_addr(iaddr)
+        src = src_map.get(iaddr, '')
         if src and src != prev_src:
             lines.append(f'  {src}')
             prev_src = src
@@ -1023,6 +1059,7 @@ def format_source_context(
                 matches = list(candidate_dir.rglob(filename))
                 if len(matches) == 1:
                     src_path = matches[0]
+                    file_part = str(src_path.relative_to(source_root))
                     break
         if not src_path.exists():
             return []
@@ -1300,7 +1337,6 @@ def decode_arm64(
         # sNN frame lines
         fm = RE_ARM64_FRAME.match(line)
         if fm:
-            abs_addr = int(fm.group(2), 16)
             module = fm.group(3)
             offset_in_module = int(fm.group(4), 16)
 
@@ -1380,7 +1416,6 @@ def decode_rsod(
     log_path: Path, sym_path: Path, out_path: Path,
     base_override: int | None, verbose: bool,
     extra_sym_paths: list[Path], source_root: Path | None,
-    efi_path: Path | None,
 ) -> None:
     """Read RSOD log + symbol file, write annotated + enhanced output."""
     source = load_symbols(sym_path)
@@ -1442,7 +1477,7 @@ def decode_rsod(
                     _log(f"resolve [{mod_key}]: "
                          f"{len(info)}/{len(addrs)} resolved")
     elif source.has_debug_info() and source.dwarf:
-        addrs = _collect_addrs(lines, fmt, table, base_delta)
+        addrs = _collect_x86_addrs(lines, table, base_delta)
         if addrs:
             info = _resolve_addresses_dwarf(source.dwarf, addrs)
             if info:
@@ -1464,17 +1499,11 @@ def decode_rsod(
         annotated, resolved, frames = decode_x86(
             lines, table, base_delta, flat_info)
 
-    # Call-site verification via capstone (ELF only)
+    # Call-site verification via capstone (ELF sources only)
     call_verified: dict[int, bool] = {}
-    if efi_path and fmt in ('dell_x86', 'edk2_x64') and frames:
-        if is_elf(efi_path):
-            efi_dwarf = DwarfInfo(efi_path)
-            call_verified = verify_call_sites(
-                efi_dwarf, [f.address for f in frames])
-            efi_dwarf.close()
-        elif source.dwarf:
-            call_verified = verify_call_sites(
-                source.dwarf, [f.address for f in frames])
+    if source.dwarf and frames:
+        call_verified = verify_call_sites(
+            source.dwarf, [f.address for f in frames])
 
     # Assemble output
     result: list[str] = []
@@ -1521,38 +1550,29 @@ def decode_rsod(
     _log(f"Output: {out_path}")
 
 
-def _collect_addrs(
-    lines: list[str], fmt: str, table: SymbolTable, base_delta: int,
+def _collect_x86_addrs(
+    lines: list[str], table: SymbolTable, base_delta: int,
 ) -> list[int]:
-    """Collect addresses needing resolution."""
+    """Collect resolvable addresses from x86/EDK2 RSOD lines."""
     addrs: list[int] = []
-    if fmt == 'dell_arm64':
-        for line in lines:
-            fm = RE_ARM64_FRAME.match(line)
-            if fm:
-                addrs.append(int(fm.group(4), 16))
-            pc = RE_PC_LINE.match(line)
-            if pc:
-                addrs.append(int(pc.group(1), 16))
-    else:
-        in_stack = False
-        for line in lines:
-            if line.strip().startswith('Stack Dump'):
-                in_stack = True
-                continue
-            for pat in (RE_RIP_LINE, RE_EDK2_RIP):
-                m = pat.match(line)
-                if m:
-                    addr = int(m.group(1 if pat == RE_RIP_LINE else 2), 16)
-                    adj = addr - base_delta
-                    if table.lookup(adj):
-                        addrs.append(adj)
-            if in_stack:
-                sm = RE_STACK_LINE.match(line)
-                if sm:
-                    adj = int(sm.group(2), 16) - base_delta
-                    if table.lookup(adj):
-                        addrs.append(adj)
+    in_stack = False
+    for line in lines:
+        if line.strip().startswith('Stack Dump'):
+            in_stack = True
+            continue
+        for pat in (RE_RIP_LINE, RE_EDK2_RIP):
+            m = pat.match(line)
+            if m:
+                addr = int(m.group(1 if pat == RE_RIP_LINE else 2), 16)
+                adj = addr - base_delta
+                if table.lookup(adj):
+                    addrs.append(adj)
+        if in_stack:
+            sm = RE_STACK_LINE.match(line)
+            if sm:
+                adj = int(sm.group(2), 16) - base_delta
+                if table.lookup(adj):
+                    addrs.append(adj)
     return addrs
 
 
@@ -1577,16 +1597,15 @@ def main() -> None:
                         help='Override image base address (hex)')
     parser.add_argument('--source-root', type=Path, default=None,
                         help='Local source tree root for source context')
-    parser.add_argument('--efi', type=Path, default=None,
-                        help='x86 EFI binary for call-site verification')
     args = parser.parse_args()
 
     if not args.rsod_log.exists():
         sys.exit(f"Error: RSOD log not found: {args.rsod_log}")
     if not args.symbol_file.exists():
         sys.exit(f"Error: symbol file not found: {args.symbol_file}")
-    if args.efi and not args.efi.exists():
-        sys.exit(f"Error: EFI binary not found: {args.efi}")
+    for s in args.sym:
+        if not s.exists():
+            sys.exit(f"Error: extra symbol file not found: {s}")
 
     out_path = args.output or args.rsod_log.with_name(
         f"{args.rsod_log.stem}_decode{args.rsod_log.suffix}")
@@ -1608,7 +1627,7 @@ def main() -> None:
 
     decode_rsod(args.rsod_log, args.symbol_file, out_path,
                 base_override, args.verbose, args.sym,
-                source_root, args.efi)
+                source_root)
 
 
 if __name__ == '__main__':

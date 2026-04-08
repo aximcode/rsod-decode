@@ -85,7 +85,8 @@ detailed instructions.
 ## Output Structure
 
 The output has three sections: crash summary, annotated RSOD, and backtrace.
-Verbose mode (`-v`) adds three more sections for frame #0.
+Verbose mode (`-v`) adds four more sections for frame #0: parameters,
+locals, disassembly, and source context.
 
 ### Crash Summary (always shown)
 
@@ -122,34 +123,46 @@ inline expansion (ARM64 with DWARF):
 
 ### Parameters — verbose only (`-v`)
 
-Maps register values to function parameters for frame #0 using DWARF debug
-info.  Shows real parameter names and types from the source code, with
-PC-accurate location tracking (register, stack offset, or optimized out):
+Shows real parameter names and types from DWARF debug info, with
+PC-accurate register/stack location tracking:
 
 ```
 --- Parameters (frame #0: fPromptTestError) ---
-  this            (cExec*              ) X0 = 0x000000782D2538B0
-  arg1            (ADDF_EC             ) X1 = 0x0000000000000018  (24)
-  arg2            (char*               ) X2 = 0x000000787DFFE390
-  arg3            (char*               ) X3 = 0x000000787DFFE2CC
-  arg4            (ADDF_PT             ) X4 = 0x0000000000000001  (1)
+  this            (const cExec*        ) X19 = 0x000000782D2538B0
+  cc              (ADDF_EC             ) X22 = 0x0000000000000018  (24)
+  pErrCodes       (char*               ) X2 = 0x000000787DFFE390
+  pErrMsg         (char*               ) X20 = 0x000000787DFFE2CC
+  type            (ADDF_PT             ) X4 = 0x0000000000000001  (1)
 ```
 
-Note: register values are only accurate for frame #0 (crash time).
+Note: locations are PC-accurate — parameters may have moved from their
+entry-point registers (X0-X7) to callee-saved registers (X19-X28) or
+stack slots by the time of the crash.
+
+### Locals — verbose only (`-v`)
+
+Shows local variables with register values when available:
+
+```
+--- Locals (frame #0: fPromptTestError) ---
+  retState        (ADDF_EC             ) X22
+  response        (int                 ) [FP-4]
+```
 
 ### Disassembly — verbose only (`-v`)
 
 Instructions around the crash address with source line annotations.
-Disassembly provided by capstone (supports both ARM64 and x86-64 natively):
+Disassembly via capstone (no external tools needed):
 
 ```
---- Disassembly (0x62FC) ---
-  EPSA/UI/ePrompt.cpp:294
-    62f0: adrp  x0, 11f000
-    62f4: ldr   x0, [x0, #3976]
-    62f8: ldr   x0, [x0, #88]
-  > 62fc: cbnz  x0, 6244
-    6300: cbz   w1, 6214
+--- Disassembly (0x1098) ---
+  EPSA/build/Bin/BeepCode.cpp:98
+    1080: adrp  x2, #0x137000
+    1084: ldr  w2, [x2, #0x30c]
+    1088: cbz  w2, #0x114c
+  EPSA/build/Bin/BeepCode.cpp:145
+  > 1098: mov  w16, #3
+    109c: mov  x13, #0x3540
 ```
 
 ### Source Context — verbose only (`-v`)
@@ -177,7 +190,6 @@ auto-detection from the script's location in the repo.
 | `-s FILE` | Additional symbol file for multi-module traces (repeatable) |
 | `--base HEX` | Override image base address (hex, e.g. `5948A000`) |
 | `--source-root PATH` | Local source tree root for source context |
-| `--efi PATH` | x86 EFI binary for call-site verification |
 
 ### Multi-module traces (`-s`)
 
@@ -202,14 +214,11 @@ python3 rsod-decode.py putty.txt pf4303.efi.map --base 5948A000
 
 The tool automatically detects EDK2-format ImageBase lines when present.
 
-### x86 call-site verification (`--efi`)
+### Call-site verification (ARM64 ELF only)
 
-For x86 raw stack dumps, distinguish real return addresses from stale
-stack data by checking for a preceding `call` instruction in the binary:
-
-```
-python3 rsod-decode.py putty.txt pf4303.efi.map --efi pf4303.efi
-```
+For ELF symbol files, the tool uses capstone to check if each return
+address has a preceding `call`/`bl` instruction, marking frames as
+`[verified]` or `[stale?]` in the backtrace.
 
 ## Supported RSOD Formats
 
