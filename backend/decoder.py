@@ -814,6 +814,30 @@ def analyze_rsod(
         call_verified = verify_call_sites(
             source.dwarf, [f.address for f in frames])
 
+    # Compute call_addr and re-resolve source for non-crash frames.
+    # Return addresses point to the instruction AFTER the call; subtracting
+    # one instruction gives the call site's source line.
+    insn_size = 4 if fmt == 'uefi_arm64' else 1
+    for f in frames:
+        if f.index == 0:
+            f.is_crash_frame = True
+            f.call_addr = f.address
+        else:
+            f.call_addr = f.address - insn_size
+
+    # Re-resolve source_loc at call_addr for non-crash frames
+    if source.dwarf and frames:
+        call_addrs = [f.call_addr for f in frames if not f.is_crash_frame]
+        if call_addrs:
+            call_info = _resolve_addresses_dwarf(source.dwarf, call_addrs)
+            for f in frames:
+                if f.is_crash_frame:
+                    continue
+                entry = call_info.get(f.call_addr)
+                if entry:
+                    f.source_loc = entry[0][1]  # (func, file:line)
+                    f.inlines = entry[1:] if len(entry) > 1 else []
+
     return AnalysisResult(
         crash_info=crash_info,
         frames=frames,

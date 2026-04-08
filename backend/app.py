@@ -64,6 +64,8 @@ def _frame_to_dict(f: FrameInfo) -> dict:
     return {
         'index': f.index,
         'address': f.address,
+        'call_addr': f.call_addr,
+        'is_crash_frame': f.is_crash_frame,
         'module': f.module,
         'symbol': f.symbol.name if f.symbol else None,
         'sym_offset': f.sym_offset,
@@ -270,11 +272,13 @@ def create_app(repo_root: Path | None = None,
         frame = session.result.frames[frame_index]
         dwarf = _get_dwarf_for_frame(
             frame, session.source, session.extra_sources)
-        if not dwarf or not frame.address:
+        # Use call_addr for disassembly center and target highlight
+        target_addr = frame.call_addr or frame.address
+        if not dwarf or not target_addr:
             return jsonify(instructions=[])
 
         context = min(request.args.get('context', 24, type=int), 200)
-        insns = dwarf.disassemble_around(frame.address, context)
+        insns = dwarf.disassemble_around(target_addr, context)
         src_map = dwarf.source_lines_for_addrs([a for a, _, _ in insns])
 
         instructions = []
@@ -283,7 +287,7 @@ def create_app(repo_root: Path | None = None,
                 'address': addr,
                 'mnemonic': mnemonic,
                 'op_str': op_str,
-                'is_target': addr == frame.address,
+                'is_target': addr == target_addr,
                 'source_line': src_map.get(addr, ''),
             })
         return jsonify(instructions=instructions)

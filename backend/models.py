@@ -70,6 +70,8 @@ class FrameInfo:
     sym_offset: int = 0
     source_loc: str = ''
     inlines: list[tuple[str, str]] = field(default_factory=list)
+    is_crash_frame: bool = False  # True for the crash PC frame (don't adjust)
+    call_addr: int = 0  # address - instruction_size for call-site resolution
 
 
 @dataclass
