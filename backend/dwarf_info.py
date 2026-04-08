@@ -427,7 +427,6 @@ class DwarfInfo:
         Single pass through the line program for efficiency."""
         if not addrs:
             return {}
-        # All addrs should be in the same CU (disassembly window)
         cu = self._get_cu_for_addr(addrs[0])
         if not cu:
             return {}
@@ -437,25 +436,27 @@ class DwarfInfo:
 
         addr_set = set(addrs)
         result: dict[int, str] = {}
-        prev = None
+        prevstate = None
+
         for entry in lp.get_entries():
             state = entry.state
             if state is None:
                 continue
-            if state.end_sequence:
-                prev = None
-                continue
-            if prev:
-                # Check which query addresses fall in [prev.address, state.address)
+            if prevstate:
                 for a in list(addr_set):
-                    if prev.address <= a < state.address:
-                        raw = self._format_file_line(lp, prev.file, prev.line, cu)
+                    if prevstate.address <= a < state.address:
+                        raw = self._format_file_line(
+                            lp, prevstate.file, prevstate.line, cu)
                         if raw:
                             result[a] = clean_path(raw)
                         addr_set.discard(a)
                 if not addr_set:
-                    break
-            prev = state
+                    return result
+            if state.end_sequence:
+                prevstate = None
+            else:
+                prevstate = state
+
         return result
 
     def _format_file_line(self, lp: object, file_idx: int, line: int,
@@ -470,28 +471,21 @@ class DwarfInfo:
         instead — comp_dir paths are often build-directory copies that
         don't exist in the source tree.
         """
-        file_entry = lp['file_entry'][file_idx - 1]
+        # DWARF5 uses 0-based file/dir indices; DWARF4 and earlier use 1-based
+        v5 = cu is not None and cu['version'] >= 5
+        file_table_idx = file_idx if v5 else file_idx - 1
+        if file_table_idx < 0 or file_table_idx >= len(lp['file_entry']):
+            return ''
+        file_entry = lp['file_entry'][file_table_idx]
         fname = (file_entry.name.decode()
                  if isinstance(file_entry.name, bytes) else file_entry.name)
         dir_idx = file_entry.dir_index
         dirs = lp['include_directory']
 
-        # If file is in comp_dir (dir 1) and this CU has DW_AT_name,
-        # check if DW_AT_name provides a better path for this file
-        if cu and dir_idx == 1:
-            cu_name = cu.get_top_DIE().attributes.get('DW_AT_name')
-            if cu_name:
-                cu_path = cu_name.value.decode().replace('\\', '/')
-                cu_basename = cu_path.rsplit('/', 1)[-1]
-                if fname.lower() == cu_basename.lower():
-                    # Use the CU's real path instead of comp_dir + filename
-                    full = cu_path
-                    if self._dwarf_prefix and full.startswith(self._dwarf_prefix):
-                        full = full[len(self._dwarf_prefix):]
-                    return f'{full}:{line}'
-
-        if dir_idx > 0 and dir_idx <= len(dirs):
-            d = dirs[dir_idx - 1]
+        # Resolve directory: DWARF5 dirs[dir_idx], DWARF4 dirs[dir_idx - 1]
+        dir_table_idx = dir_idx if v5 else dir_idx - 1
+        if 0 <= dir_table_idx < len(dirs):
+            d = dirs[dir_table_idx]
             d = d.decode() if isinstance(d, bytes) else d
             fname = f'{d}/{fname}'
 
@@ -540,22 +534,28 @@ class DwarfInfo:
     # -----------------------------------------------------------------
 
     def _addr_to_line(self, cu: CompileUnit, addr: int) -> str:
-        """Resolve addr to "dir/file:line" using the CU's line program."""
+        """Resolve addr to "dir/file:line" using the CU's line program.
+
+        Follows the pyelftools dwarf_decode_address.py example pattern:
+        walk state entries, track prevstate, match when addr falls in
+        [prevstate.address, state.address).
+        """
         lp = self._dwarf.line_program_for_CU(cu)
         if not lp:
             return ''
 
-        prev = None
+        prevstate = None
         for entry in lp.get_entries():
             state = entry.state
             if state is None:
                 continue
+            if prevstate and prevstate.address <= addr < state.address:
+                return self._format_file_line(
+                    lp, prevstate.file, prevstate.line, cu)
             if state.end_sequence:
-                prev = None
-                continue
-            if prev and prev.address <= addr < state.address:
-                return self._format_file_line(lp, prev.file, prev.line, cu)
-            prev = state
+                prevstate = None
+            else:
+                prevstate = state
         return ''
 
     # -----------------------------------------------------------------
@@ -587,10 +587,13 @@ class DwarfInfo:
                         cu = child.cu
                         lp = self._dwarf.line_program_for_CU(cu)
                         if lp:
-                            fe = lp['file_entry'][call_file.value - 1]
-                            fname = (fe.name.decode()
-                                     if isinstance(fe.name, bytes) else fe.name)
-                            loc = f'{fname}:{call_line.value}'
+                            # DWARF5: 0-based file index; DWARF4: 1-based
+                            fi = call_file.value if cu['version'] >= 5 else call_file.value - 1
+                            if 0 <= fi < len(lp['file_entry']):
+                                fe = lp['file_entry'][fi]
+                                fname = (fe.name.decode()
+                                         if isinstance(fe.name, bytes) else fe.name)
+                                loc = f'{fname}:{call_line.value}'
                     info.inlines.append((name, loc))
                     # Recurse for nested inlines
                     self._find_inlines(child, addr, info)
