@@ -3,6 +3,7 @@ import { UploadForm } from './components/UploadForm'
 import { CrashBanner } from './components/CrashBanner'
 import { BacktracePanel } from './components/BacktracePanel'
 import { DetailPanel } from './components/DetailPanel'
+import { RegisterPanel } from './components/RegisterPanel'
 
 export function App() {
   const { state, upload, selectFrame, reset } = useSession()
@@ -28,10 +29,15 @@ export function App() {
           onSelect={selectFrame}
         />
         <DetailPanel
+          sessionId={state.sessionId}
           frame={state.frameDetail}
           loading={state.frameLoading}
           error={state.frameError}
           isCrashFrame={state.selectedFrame === 0}
+        />
+        <RegisterPanel
+          registers={state.data.registers}
+          format={state.data.format}
         />
       </div>
     </div>

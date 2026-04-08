@@ -1,6 +1,9 @@
-import type { FrameDetail, VarInfo } from '../types'
+import { useEffect, useRef, useState } from 'react'
+import * as api from '../api'
+import type { FrameDetail, Instruction, SourceLine, VarInfo } from '../types'
 
 interface Props {
+  sessionId: string
   frame: FrameDetail | null
   loading: boolean
   error?: string | null
@@ -16,13 +19,57 @@ function formatValue(value: number | null): string {
   return hex
 }
 
-function filterParams(params: VarInfo[]): VarInfo[] {
-  return params.filter(p => p.name !== '???')
+function filterVars(vars: VarInfo[]): VarInfo[] {
+  return vars.filter(v => v.name !== '???')
 }
 
-const TABS = ['Params', 'Locals', 'Disassembly', 'Source'] as const
+type TabId = 'Params' | 'Locals' | 'Disassembly' | 'Source'
+const TABS: TabId[] = ['Params', 'Locals', 'Disassembly', 'Source']
 
-export function DetailPanel({ frame, loading, error, isCrashFrame }: Props) {
+export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: Props) {
+  const [activeTab, setActiveTab] = useState<TabId>('Params')
+  const [disasm, setDisasm] = useState<Instruction[] | null>(null)
+  const [disasmLoading, setDisasmLoading] = useState(false)
+  const [source, setSource] = useState<{ file: string; target_line: number; lines: SourceLine[] } | null>(null)
+  const [sourceLoading, setSourceLoading] = useState(false)
+  const prevFrameIndex = useRef<number | null>(null)
+
+  // Reset tab data when frame changes
+  useEffect(() => {
+    if (frame && frame.index !== prevFrameIndex.current) {
+      prevFrameIndex.current = frame.index
+      setDisasm(null)
+      setSource(null)
+      setActiveTab('Params')
+    }
+  }, [frame])
+
+  // Fetch disasm when tab selected
+  useEffect(() => {
+    if (activeTab !== 'Disassembly' || !frame || disasm !== null || disasmLoading) return
+    setDisasmLoading(true)
+    api.getDisasm(sessionId, frame.index).then(r => {
+      setDisasm(r.instructions)
+      setDisasmLoading(false)
+    }).catch(() => {
+      setDisasm([])
+      setDisasmLoading(false)
+    })
+  }, [activeTab, frame, sessionId, disasm, disasmLoading])
+
+  // Fetch source when tab selected
+  useEffect(() => {
+    if (activeTab !== 'Source' || !frame || source !== null || sourceLoading) return
+    setSourceLoading(true)
+    api.getSource(sessionId, frame.index).then(r => {
+      setSource(r)
+      setSourceLoading(false)
+    }).catch(() => {
+      setSource({ file: '', target_line: 0, lines: [] })
+      setSourceLoading(false)
+    })
+  }, [activeTab, frame, sessionId, source, sourceLoading])
+
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center text-zinc-500">
@@ -48,8 +95,6 @@ export function DetailPanel({ frame, loading, error, isCrashFrame }: Props) {
     )
   }
 
-  const params = filterParams(frame.params)
-
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Frame header */}
@@ -64,18 +109,15 @@ export function DetailPanel({ frame, loading, error, isCrashFrame }: Props) {
       {/* Tabs */}
       <div className="flex border-b border-zinc-800 text-sm">
         {TABS.map(tab => {
-          const active = tab === 'Params'
-          const disabled = tab !== 'Params'
+          const active = tab === activeTab
           return (
             <button
               key={tab}
-              disabled={disabled}
+              onClick={() => setActiveTab(tab)}
               className={`px-4 py-2 transition-colors ${
                 active
                   ? 'text-blue-300 border-b-2 border-blue-400 bg-zinc-800/30'
-                  : disabled
-                    ? 'text-zinc-700 cursor-not-allowed'
-                    : 'text-zinc-400 hover:text-zinc-200'
+                  : 'text-zinc-400 hover:text-zinc-200'
               }`}
             >
               {tab}
@@ -84,40 +126,129 @@ export function DetailPanel({ frame, loading, error, isCrashFrame }: Props) {
         })}
       </div>
 
-      {/* Params content */}
+      {/* Tab content */}
       <div className="flex-1 overflow-auto p-4">
-        {params.length === 0 ? (
-          <div className="text-zinc-600 text-sm">No parameters available for this frame</div>
-        ) : (
-          <>
-            {!isCrashFrame && (
-              <div className="text-xs text-zinc-600 mb-3 italic">
-                Register values are from the crash point, not this frame's call site
-              </div>
-            )}
-            <table className="w-full text-sm font-mono">
-              <thead>
-                <tr className="text-left text-xs text-zinc-500 uppercase tracking-wider">
-                  <th className="pb-2 pr-4">Name</th>
-                  <th className="pb-2 pr-4">Type</th>
-                  <th className="pb-2 pr-4">Location</th>
-                  <th className="pb-2">Value</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-zinc-800/50">
-                {params.map((p, i) => (
-                  <tr key={i} className="hover:bg-zinc-800/30">
-                    <td className="py-1.5 pr-4 text-yellow-300">{p.name}</td>
-                    <td className="py-1.5 pr-4 text-zinc-400">{p.type}</td>
-                    <td className="py-1.5 pr-4 text-zinc-500">{p.location}</td>
-                    <td className={`py-1.5 ${isCrashFrame ? 'text-zinc-200' : 'text-zinc-500'}`}>{formatValue(p.value)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </>
-        )}
+        {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" />}
+        {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" />}
+        {activeTab === 'Disassembly' && <DisassemblyView instructions={disasm} loading={disasmLoading} />}
+        {activeTab === 'Source' && <SourceView source={source} loading={sourceLoading} />}
       </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Shared variable table (Params + Locals)
+// ---------------------------------------------------------------------------
+
+function VarsTable({ vars, isCrashFrame, label }: { vars: VarInfo[]; isCrashFrame: boolean; label: string }) {
+  if (vars.length === 0) {
+    return <div className="text-zinc-600 text-sm">No {label} available for this frame</div>
+  }
+  return (
+    <>
+      {!isCrashFrame && (
+        <div className="text-xs text-zinc-600 mb-3 italic">
+          Register values are from the crash point, not this frame's call site
+        </div>
+      )}
+      <table className="w-full text-sm font-mono">
+        <thead>
+          <tr className="text-left text-xs text-zinc-500 uppercase tracking-wider">
+            <th className="pb-2 pr-4">Name</th>
+            <th className="pb-2 pr-4">Type</th>
+            <th className="pb-2 pr-4">Location</th>
+            <th className="pb-2">Value</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-zinc-800/50">
+          {vars.map((v, i) => (
+            <tr key={i} className="hover:bg-zinc-800/30">
+              <td className="py-1.5 pr-4 text-yellow-300">{v.name}</td>
+              <td className="py-1.5 pr-4 text-zinc-400">{v.type}</td>
+              <td className="py-1.5 pr-4 text-zinc-500">{v.location}</td>
+              <td className={`py-1.5 ${isCrashFrame ? 'text-zinc-200' : 'text-zinc-500'}`}>{formatValue(v.value)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Disassembly view
+// ---------------------------------------------------------------------------
+
+function DisassemblyView({ instructions, loading }: { instructions: Instruction[] | null; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="text-zinc-500 text-sm flex items-center gap-2">
+        <span className="animate-spin inline-block w-4 h-4 border-2 border-zinc-600 border-t-zinc-300 rounded-full" />
+        Loading disassembly...
+      </div>
+    )
+  }
+  if (!instructions || instructions.length === 0) {
+    return <div className="text-zinc-600 text-sm">No disassembly available for this frame</div>
+  }
+
+  let prevSource = ''
+  return (
+    <div className="font-mono text-sm space-y-0">
+      {instructions.map(insn => {
+        const showSource = insn.source_line && insn.source_line !== prevSource
+        if (insn.source_line) prevSource = insn.source_line
+        return (
+          <div key={insn.address}>
+            {showSource && (
+              <div className="text-zinc-500 mt-3 mb-0.5 text-xs">{insn.source_line}</div>
+            )}
+            <div className={`flex gap-3 py-px px-2 rounded ${insn.is_target ? 'bg-red-950/60 text-red-200' : 'text-zinc-300'}`}>
+              <span className={`w-4 shrink-0 ${insn.is_target ? 'text-red-400' : ''}`}>{insn.is_target ? '\u25B6' : ''}</span>
+              <span className="text-zinc-500 w-16 shrink-0 text-right">{insn.address.toString(16)}:</span>
+              <span className={`w-16 shrink-0 ${insn.is_target ? 'text-red-300 font-bold' : 'text-blue-300'}`}>{insn.mnemonic}</span>
+              <span className="text-zinc-300">{insn.op_str}</span>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Source view
+// ---------------------------------------------------------------------------
+
+function SourceView({ source, loading }: { source: { file: string; target_line: number; lines: SourceLine[] } | null; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="text-zinc-500 text-sm flex items-center gap-2">
+        <span className="animate-spin inline-block w-4 h-4 border-2 border-zinc-600 border-t-zinc-300 rounded-full" />
+        Loading source...
+      </div>
+    )
+  }
+  if (!source || source.lines.length === 0) {
+    return <div className="text-zinc-600 text-sm">No source available for this frame</div>
+  }
+
+  return (
+    <div className="font-mono text-sm">
+      {source.file && (
+        <div className="text-zinc-500 text-xs mb-2">{source.file}</div>
+      )}
+      {source.lines.map(line => (
+        <div
+          key={line.number}
+          className={`flex py-px px-2 rounded ${line.is_target ? 'bg-yellow-950/40 text-yellow-200' : 'text-zinc-300'}`}
+        >
+          <span className={`w-4 shrink-0 ${line.is_target ? 'text-yellow-400' : ''}`}>{line.is_target ? '\u25B6' : ''}</span>
+          <span className="text-zinc-600 w-12 shrink-0 text-right mr-3">{line.number}</span>
+          <span className="whitespace-pre">{line.text}</span>
+        </div>
+      ))}
     </div>
   )
 }
