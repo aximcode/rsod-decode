@@ -50,6 +50,9 @@ def main() -> None:
                         help='Git tag for source context (e.g. v1.0.3)')
     parser.add_argument('--commit', type=str, default=None,
                         help='Git commit hash for source context')
+    parser.add_argument('--dwarf-prefix', type=str, default=None,
+                        help='Path prefix to strip from DWARF source paths '
+                             '(auto-detected if not specified)')
     args = parser.parse_args()
 
     if not args.rsod_log.exists():
@@ -70,35 +73,22 @@ def main() -> None:
         except ValueError:
             sys.exit(f"Error: invalid base address: {args.base}")
 
-    # Default source root: infer from script location
-    # Script is at scripts/rsod-decode/rsod-decode.py, so parents[3] = source/src/
+    # Find repo root (walk up from script location looking for .git)
+    repo_root: Path | None = None
+    for parent in Path(__file__).resolve().parents:
+        if (parent / '.git').exists():
+            repo_root = parent
+            break
+
+    # Default source root: repo root or inferred from script location
     source_root = args.source_root
     if source_root is None:
-        candidate = Path(__file__).resolve().parents[3]
-        if candidate.is_dir():
-            source_root = candidate
+        source_root = repo_root or Path(__file__).resolve().parents[3]
 
     # Resolve git ref (tag or commit) for source context
     git_ref: GitRef | None = None
-    repo_root: Path | None = None
     ref_str = args.tag or args.commit
     if ref_str:
-        # Find the repo root (walk up from source_root or script location)
-        for candidate_root in (source_root, Path(__file__).resolve().parents[4]):
-            if candidate_root and (candidate_root / '.git').exists():
-                repo_root = candidate_root
-                break
-            # Check parent — source/src/ → source/ → repo root
-            for p in (candidate_root,) if candidate_root else ():
-                for parent in p.parents:
-                    if (parent / '.git').exists():
-                        repo_root = parent
-                        break
-                if repo_root:
-                    break
-            if repo_root:
-                break
-
         if repo_root:
             git_ref = resolve_git_ref(ref_str, repo_root)
             if git_ref:
@@ -111,7 +101,8 @@ def main() -> None:
     try:
         decode_rsod(args.rsod_log, args.symbol_file, out_path,
                     base_override, args.verbose, args.sym,
-                    source_root, git_ref, repo_root)
+                    source_root, git_ref, repo_root,
+                    dwarf_prefix=args.dwarf_prefix)
     except SymbolLoadError as e:
         sys.exit(f"Error: {e}")
 

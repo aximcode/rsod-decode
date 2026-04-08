@@ -129,19 +129,131 @@ class GitRef:
 # =============================================================================
 
 def clean_path(raw: str) -> str:
-    """Clean DWARF paths to readable relative form.
+    """Clean a DWARF source path for display.
 
-    Strips discriminator suffixes, build-directory prefixes, and
-    Windows drive letter artifacts from cross-compile paths.
+    Strips discriminator suffixes and normalizes separators.
+    The heavy lifting (prefix stripping) is done by DwarfInfo using
+    the detected or configured dwarf_prefix.
     """
     raw = re.sub(r'\s*\(discriminator \d+\)', '', raw)
-    # Strip everything up to the last recognized source root marker
-    # Common patterns: .../source/src/..., .../src/..., .../Build/...
-    for marker in (r'source[/\\]src[/\\]', r'src[/\\]', r'Build[/\\]'):
-        m = re.search(rf'.*[/\\]{marker}(.*)', raw)
-        if m:
-            return m.group(1).replace('\\', '/')
-    # Strip build directory + drive letter artifacts
-    cleaned = re.sub(r'^.*[/\\]build[/\\][^/\\]+[/\\]([A-Z]:[/\\])?', '', raw,
-                     flags=re.IGNORECASE)
-    return cleaned.replace('\\', '/')
+    return raw.replace('\\', '/')
+
+
+# =============================================================================
+# Source file resolution
+# =============================================================================
+
+# Cache: (repo_root, lowercase_filename) → list[Path]
+_file_index: dict[tuple[str, str], list[Path]] = {}
+_file_index_root: str = ''
+
+
+def _build_file_index(repo_root: Path) -> None:
+    """Build an index of all source files under repo_root (once)."""
+    global _file_index, _file_index_root
+    root_str = str(repo_root)
+    if _file_index_root == root_str:
+        return
+    _file_index = {}
+    _file_index_root = root_str
+    skip = {'.git', '__pycache__', 'node_modules', 'archive'}
+    for p in repo_root.rglob('*'):
+        if p.is_file() and not any(part.lower() in skip for part in p.parts):
+            key = (root_str, p.name.lower())
+            _file_index.setdefault(key, []).append(p)
+
+
+def find_source_file(
+    repo_root: Path, dwarf_path: str, target_line: int,
+) -> Path | None:
+    """Resolve a DWARF source path to a file in the repo.
+
+    Strategies (in order):
+    1. Direct path match (exact)
+    2. Case-insensitive direct match (Windows→Linux cross-compile)
+    3. Filename search with line-count validation (build-reorganized files)
+       - If ambiguous, pick the match with the most path components in common
+
+    Args:
+        repo_root: Root of the repository / source tree.
+        dwarf_path: Relative path from DWARF (already prefix-stripped).
+        target_line: The line number we need — used to reject files too short.
+
+    Returns:
+        Resolved Path or None.
+    """
+    dwarf_path = dwarf_path.replace('\\', '/')
+
+    # 1. Direct match
+    candidate = repo_root / dwarf_path
+    if candidate.is_file():
+        return candidate
+
+    # 2. Case-insensitive direct match — walk the path components
+    resolved = _case_insensitive_lookup(repo_root, dwarf_path)
+    if resolved:
+        return resolved
+
+    # 3. Filename search with validation
+    _build_file_index(repo_root)
+    filename_lower = Path(dwarf_path).name.lower()
+    matches = _file_index.get((str(repo_root), filename_lower), [])
+    if not matches:
+        return None
+
+    # Filter: line count must be sufficient, skip archive/backup dirs
+    valid: list[Path] = []
+    for m in matches:
+        rel = m.relative_to(repo_root).as_posix().lower()
+        if '/archive/' in rel or rel.startswith('archive/'):
+            continue
+        try:
+            with m.open(encoding='utf-8', errors='replace') as f:
+                line_count = sum(1 for _ in f)
+            if line_count >= target_line:
+                valid.append(m)
+        except OSError:
+            continue
+
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return valid[0]
+
+    # Multiple valid matches — score by path component overlap,
+    # prefer source/src/ paths over others
+    dwarf_parts = [p.lower() for p in dwarf_path.split('/')]
+    best: Path | None = None
+    best_score = -1
+    for m in valid:
+        rel = m.relative_to(repo_root).as_posix()
+        rel_parts = [p.lower() for p in rel.split('/')]
+        score = sum(1 for p in dwarf_parts if p in rel_parts)
+        # Prefer source/src/ paths
+        if rel.lower().startswith('source/src/'):
+            score += 10
+        if score > best_score:
+            best_score = score
+            best = m
+    return best
+
+
+def _case_insensitive_lookup(root: Path, rel_path: str) -> Path | None:
+    """Walk path components case-insensitively from root."""
+    current = root
+    for part in rel_path.split('/'):
+        if not current.is_dir():
+            return None
+        part_lower = part.lower()
+        found = None
+        try:
+            for entry in current.iterdir():
+                if entry.name.lower() == part_lower:
+                    found = entry
+                    break
+        except OSError:
+            return None
+        if found is None:
+            return None
+        current = found
+    return current if current.is_file() else None

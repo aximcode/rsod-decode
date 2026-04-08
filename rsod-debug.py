@@ -53,6 +53,9 @@ def main() -> None:
                         help='Server host (default: 0.0.0.0)')
     parser.add_argument('--no-browser', action='store_true',
                         help='Do not open browser automatically')
+    parser.add_argument('--dwarf-prefix', type=str, default=None,
+                        help='Path prefix to strip from DWARF source paths '
+                             '(auto-detected if not specified)')
     args = parser.parse_args()
 
     # Validate file args
@@ -66,8 +69,15 @@ def main() -> None:
         if not s.exists():
             sys.exit(f"Error: extra symbol file not found: {s}")
 
+    # Find repo root for DWARF prefix auto-detection
+    repo_root: Path | None = None
+    for parent in Path(__file__).resolve().parents:
+        if (parent / '.git').exists():
+            repo_root = parent
+            break
+
     # Create Flask app with static file serving
-    app = create_app()
+    app = create_app(repo_root=repo_root, dwarf_prefix=args.dwarf_prefix)
     dist_dir = Path(__file__).resolve().parent / 'frontend' / 'dist'
 
     if dist_dir.is_dir():
@@ -90,14 +100,17 @@ def main() -> None:
         _log(f"Loading {args.rsod_log.name} + {args.symbol_file.name}...")
 
         try:
-            source = load_symbols(args.symbol_file)
+            source = load_symbols(args.symbol_file,
+                                  dwarf_prefix=args.dwarf_prefix,
+                                  repo_root=repo_root)
         except SymbolLoadError as e:
             sys.exit(f"Error: {e}")
 
         extra_sources = {}
         for p in args.sym:
             try:
-                s = load_symbols(p)
+                s = load_symbols(p, dwarf_prefix=args.dwarf_prefix,
+                                 repo_root=repo_root)
             except SymbolLoadError as e:
                 sys.exit(f"Error: {e}")
             extra_sources[p.stem.lower()] = s

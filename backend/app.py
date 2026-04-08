@@ -14,7 +14,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from werkzeug.utils import secure_filename
 
-from .models import CrashInfo, FrameInfo, SymbolSource, VarInfo, clean_path
+from .models import CrashInfo, FrameInfo, SymbolSource, VarInfo, clean_path, find_source_file
 from .decoder import AnalysisResult, analyze_rsod
 from .dwarf_info import DwarfInfo
 from .symbols import SymbolLoadError, load_symbols
@@ -112,10 +112,13 @@ def _get_dwarf_for_frame(
 # Flask app factory
 # =============================================================================
 
-def create_app() -> Flask:
+def create_app(repo_root: Path | None = None,
+               dwarf_prefix: str | None = None) -> Flask:
     """Create and configure the Flask application."""
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+    app.config['REPO_ROOT'] = repo_root
+    app.config['DWARF_PREFIX'] = dwarf_prefix
 
     # -----------------------------------------------------------------
     # POST /api/session — upload RSOD + symbols, create session
@@ -151,7 +154,9 @@ def create_app() -> Flask:
 
         # Load symbols
         try:
-            source = load_symbols(sym_path)
+            source = load_symbols(sym_path,
+                                  dwarf_prefix=app.config['DWARF_PREFIX'],
+                                  repo_root=app.config['REPO_ROOT'])
         except SymbolLoadError as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return jsonify(error=str(e)), 400
@@ -159,7 +164,9 @@ def create_app() -> Flask:
         extra_sources: dict[str, SymbolSource] = {}
         for p in extra_paths:
             try:
-                s = load_symbols(p)
+                s = load_symbols(p,
+                                 dwarf_prefix=app.config['DWARF_PREFIX'],
+                                 repo_root=app.config['REPO_ROOT'])
             except SymbolLoadError as e:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 return jsonify(error=str(e)), 400
@@ -304,22 +311,12 @@ def create_app() -> Flask:
 
         context = min(request.args.get('context', 5, type=int), 50)
 
-        # Try to read source from the source root inferred from script location
-        source_root = Path(__file__).resolve().parents[4]
-        src_path = source_root / file_part
-        if not src_path.exists():
-            # Search for the filename
-            filename = Path(file_part).name
-            for candidate_dir in sorted(source_root.iterdir()):
-                if not candidate_dir.is_dir() or candidate_dir.name.startswith('.'):
-                    continue
-                matches = list(candidate_dir.rglob(filename))
-                if len(matches) == 1:
-                    src_path = matches[0]
-                    file_part = str(src_path.relative_to(source_root))
-                    break
-            if not src_path.exists():
-                return jsonify(file=file_part, target_line=target_line, lines=[])
+        # Direct path lookup, with case-insensitive fallback
+        root = app.config['REPO_ROOT'] or Path(__file__).resolve().parents[4]
+        src_path = find_source_file(root, file_part, target_line)
+        if not src_path:
+            return jsonify(file=file_part, target_line=target_line, lines=[])
+        file_part = str(src_path.relative_to(root))
 
         try:
             all_lines = src_path.read_text(

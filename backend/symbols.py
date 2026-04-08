@@ -78,13 +78,17 @@ def is_elf(path: Path) -> bool:
         return False
 
 
-def load_symbols(path: Path, log: object = None) -> SymbolSource:
+def load_symbols(path: Path, log: object = None,
+                 dwarf_prefix: str | None = None,
+                 repo_root: Path | None = None) -> SymbolSource:
     """Auto-detect symbol file format and load.
 
     Args:
         path: Path to the symbol file (.map or ELF).
         log: Optional callable(str) for status messages.
              Defaults to printing to stderr.
+        dwarf_prefix: Optional prefix to strip from DWARF paths.
+        repo_root: Optional repo root for auto-detecting dwarf_prefix.
     """
     if log is None:
         def log(msg: str) -> None:
@@ -96,7 +100,8 @@ def load_symbols(path: Path, log: object = None) -> SymbolSource:
     if is_elf(path):
         elf_path = path
         try:
-            dwarf_info = DwarfInfo(path)
+            dwarf_info = DwarfInfo(path, dwarf_prefix=dwarf_prefix,
+                                   repo_root=repo_root)
             raw = dwarf_info.get_symbols()
         except Exception as e:
             raise SymbolLoadError(f"failed to read ELF {path}: {e}") from e
@@ -118,6 +123,8 @@ def load_symbols(path: Path, log: object = None) -> SymbolSource:
             f"0x{table.addresses[-1]:X}")
     if dwarf_info:
         log("DWARF debug info via pyelftools (native)")
+        if dwarf_info.dwarf_prefix:
+            log(f"DWARF prefix: {dwarf_info.dwarf_prefix}")
 
     return SymbolSource(table=table, elf_path=elf_path,
                         name=path.stem, dwarf=dwarf_info)

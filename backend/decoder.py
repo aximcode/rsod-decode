@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .models import (
     CrashInfo, FrameInfo, GitRef, MapSymbol, SymbolSource, SymbolTable,
-    VarInfo, clean_path,
+    VarInfo, clean_path, find_source_file,
 )
 from .dwarf_info import DwarfInfo
 from .esr import format_esr
@@ -283,27 +283,13 @@ def format_source_context(
     if git_ref and repo_root:
         # Read from git at the specified commit
         src_lines = _read_source_from_git(git_ref, file_part, repo_root)
-        if not src_lines:
-            # Try filename-only search via git ls-tree
-            filename = Path(file_part).name
-            src_lines = _read_source_from_git(git_ref, filename, repo_root)
         if src_lines:
             display_path = f"{file_part} @ {git_ref.short}"
     else:
-        # Read from working tree
+        # Direct path lookup from source root
         src_path = source_root / file_part
-        if not src_path.exists():
-            filename = Path(file_part).name
-            for candidate_dir in sorted(source_root.iterdir()):
-                if not candidate_dir.is_dir() or candidate_dir.name.startswith('.'):
-                    continue
-                matches = list(candidate_dir.rglob(filename))
-                if len(matches) == 1:
-                    src_path = matches[0]
-                    display_path = str(src_path.relative_to(source_root))
-                    break
-            if not src_path.exists():
-                return []
+        if not src_path.is_file():
+            return []
         try:
             src_lines = src_path.read_text(
                 encoding='utf-8', errors='replace').splitlines()
@@ -848,13 +834,15 @@ def decode_rsod(
     base_override: int | None, verbose: bool,
     extra_sym_paths: list[Path], source_root: Path | None,
     git_ref: GitRef | None = None, repo_root: Path | None = None,
+    dwarf_prefix: str | None = None,
 ) -> None:
     """Read RSOD log + symbol file, write annotated + enhanced output."""
-    source = load_symbols(sym_path)
+    source = load_symbols(sym_path, dwarf_prefix=dwarf_prefix,
+                          repo_root=repo_root)
 
     extra_sources: dict[str, SymbolSource] = {}
     for p in extra_sym_paths:
-        s = load_symbols(p)
+        s = load_symbols(p, dwarf_prefix=dwarf_prefix, repo_root=repo_root)
         extra_sources[p.stem.lower()] = s
 
     rsod_text = log_path.read_text(encoding='utf-8', errors='replace')

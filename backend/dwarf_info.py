@@ -187,7 +187,8 @@ def _decode_location(loc_expr: list[int] | bytes, reg_table: dict[int, str],
 class DwarfInfo:
     """High-level DWARF interface for crash analysis."""
 
-    def __init__(self, elf_path: Path) -> None:
+    def __init__(self, elf_path: Path, dwarf_prefix: str | None = None,
+                 repo_root: Path | None = None) -> None:
         self._path = elf_path
         self._file = elf_path.open('rb')
         self._elf = ELFFile(self._file)
@@ -195,6 +196,13 @@ class DwarfInfo:
         self._aranges = self._dwarf.get_aranges() if self._dwarf else None
         self._loc_parser = (LocationParser(self._dwarf.location_lists())
                             if self._dwarf else None)
+
+        # DWARF path prefix — stripped from all resolved paths to produce
+        # paths relative to the repo root. Auto-detected if not specified.
+        if dwarf_prefix is not None:
+            self._dwarf_prefix = dwarf_prefix.replace('\\', '/')
+        else:
+            self._dwarf_prefix = self._detect_dwarf_prefix(repo_root)
 
         # Detect architecture for register names and disassembly
         arch = self._elf.get_machine_arch()
@@ -225,6 +233,67 @@ class DwarfInfo:
         else:
             self._text_data = b''
             self._text_addr = 0
+
+    @property
+    def dwarf_prefix(self) -> str:
+        """The detected or configured DWARF path prefix."""
+        return self._dwarf_prefix
+
+    def _detect_dwarf_prefix(self, repo_root: Path | None) -> str:
+        """Auto-detect the DWARF path prefix from CU names.
+
+        Finds the common prefix across all DW_AT_name values, then validates
+        against repo_root if provided (tries suffixes until a file matches).
+        """
+        if not self._dwarf:
+            return ''
+
+        # Collect CU name paths
+        cu_names: list[str] = []
+        for cu in self._dwarf.iter_CUs():
+            die = cu.get_top_DIE()
+            name_attr = die.attributes.get('DW_AT_name')
+            if name_attr:
+                cu_names.append(name_attr.value.decode().replace('\\', '/'))
+
+        if not cu_names:
+            return ''
+
+        # Find common prefix (using / as separator)
+        prefix = cu_names[0]
+        for name in cu_names[1:]:
+            while prefix and not name.startswith(prefix):
+                slash = prefix.rfind('/')
+                prefix = prefix[:slash] if slash >= 0 else ''
+            if not prefix:
+                break
+
+        # Trim to last directory separator
+        if prefix and not prefix.endswith('/'):
+            slash = prefix.rfind('/')
+            prefix = prefix[:slash + 1] if slash >= 0 else ''
+
+        if not prefix:
+            return ''
+
+        # If repo_root provided, validate by checking suffixes exist on disk
+        if repo_root:
+            for name in cu_names[:20]:
+                rel = name[len(prefix):]
+                if (repo_root / rel).is_file():
+                    return prefix
+
+            # Common prefix didn't produce valid paths — try shorter prefixes
+            # by removing trailing directory components
+            parts = prefix.rstrip('/').split('/')
+            for i in range(len(parts) - 1, 0, -1):
+                candidate = '/'.join(parts[:i]) + '/'
+                for name in cu_names[:5]:
+                    rel = name[len(candidate):]
+                    if (repo_root / rel).is_file():
+                        return candidate
+
+        return prefix
 
     def close(self) -> None:
         self._file.close()
@@ -380,7 +449,7 @@ class DwarfInfo:
                 # Check which query addresses fall in [prev.address, state.address)
                 for a in list(addr_set):
                     if prev.address <= a < state.address:
-                        raw = self._format_file_line(lp, prev.file, prev.line)
+                        raw = self._format_file_line(lp, prev.file, prev.line, cu)
                         if raw:
                             result[a] = clean_path(raw)
                         addr_set.discard(a)
@@ -389,17 +458,48 @@ class DwarfInfo:
             prev = state
         return result
 
-    def _format_file_line(self, lp: object, file_idx: int, line: int) -> str:
-        """Format a file:line string from line program data."""
+    def _format_file_line(self, lp: object, file_idx: int, line: int,
+                          cu: CompileUnit | None = None) -> str:
+        """Format a file:line string from line program data.
+
+        Joins the include directory with the filename, then strips the
+        DWARF prefix to produce a repo-relative path.
+
+        When the file resolves against comp_dir (dir index 1, the build
+        CWD) and matches the CU's main source file, uses DW_AT_name
+        instead — comp_dir paths are often build-directory copies that
+        don't exist in the source tree.
+        """
         file_entry = lp['file_entry'][file_idx - 1]
         fname = (file_entry.name.decode()
                  if isinstance(file_entry.name, bytes) else file_entry.name)
         dir_idx = file_entry.dir_index
         dirs = lp['include_directory']
+
+        # If file is in comp_dir (dir 1) and this CU has DW_AT_name,
+        # check if DW_AT_name provides a better path for this file
+        if cu and dir_idx == 1:
+            cu_name = cu.get_top_DIE().attributes.get('DW_AT_name')
+            if cu_name:
+                cu_path = cu_name.value.decode().replace('\\', '/')
+                cu_basename = cu_path.rsplit('/', 1)[-1]
+                if fname.lower() == cu_basename.lower():
+                    # Use the CU's real path instead of comp_dir + filename
+                    full = cu_path
+                    if self._dwarf_prefix and full.startswith(self._dwarf_prefix):
+                        full = full[len(self._dwarf_prefix):]
+                    return f'{full}:{line}'
+
         if dir_idx > 0 and dir_idx <= len(dirs):
             d = dirs[dir_idx - 1]
             d = d.decode() if isinstance(d, bytes) else d
             fname = f'{d}/{fname}'
+
+        # Normalize separators and strip the DWARF prefix
+        fname = fname.replace('\\', '/')
+        if self._dwarf_prefix and fname.startswith(self._dwarf_prefix):
+            fname = fname[len(self._dwarf_prefix):]
+
         return f'{fname}:{line}'
 
     # -----------------------------------------------------------------
@@ -454,7 +554,7 @@ class DwarfInfo:
                 prev = None
                 continue
             if prev and prev.address <= addr < state.address:
-                return self._format_file_line(lp, prev.file, prev.line)
+                return self._format_file_line(lp, prev.file, prev.line, cu)
             prev = state
         return ''
 
