@@ -86,7 +86,10 @@ analysis that a text file can't:
   update live
 - **Save/share** analysis as a permalink or JSON export
 - **History** of analyzed RSODs stored in SQLite for recall
-- **Paste or upload** — paste RSOD text directly or upload a PuTTY log
+- **Paste, upload, or drag-and-drop** — paste RSOD text directly, use a
+  file picker, or drag files onto the upload zone
+- **Git-pinned source** — specify a tag or commit hash to view source
+  at the exact revision that produced the binary
 
 ## UI Layout
 
@@ -228,6 +231,10 @@ POST /api/session
     rsod_log: <file>           RSOD text capture
     symbol_file: <file>        .map or .so/.efi ELF
     extra_symbols[]: <files>   Optional additional ELFs
+    base: <hex>                Optional image base override
+    tag: <string>              Optional git tag for source context
+    commit: <string>           Optional git commit for source context
+    source_root: <path>        Optional local source tree root
   Response: { session_id, crash_summary, frame_count }
 
 GET /api/session/<id>
@@ -349,9 +356,10 @@ rsod-decode/
 ## Data Flow
 
 ```
-1. User uploads RSOD text + symbol file(s)
+1. User drags files onto drop zone, uses file picker, or pastes RSOD text
+   Optional: specify git tag/commit for source context, base address override
    ↓
-2. POST /api/session
+2. POST /api/session (multipart: files + optional tag/commit/base fields)
    ↓
 3. Backend:
    a. detect_format() → uefi_x86 / uefi_arm64 / edk2_x64
