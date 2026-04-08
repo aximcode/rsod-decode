@@ -31,6 +31,7 @@ export function App() {
           frame={state.frameDetail}
           loading={state.frameLoading}
           error={state.frameError}
+          isCrashFrame={state.selectedFrame === 0}
         />
       </div>
     </div>

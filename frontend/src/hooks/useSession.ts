@@ -28,6 +28,42 @@ export function useSession() {
     return () => window.removeEventListener('beforeunload', cleanup)
   }, [])
 
+  // Load an existing session by ID (for pre-loaded sessions via URL hash)
+  const loadSession = useCallback(async (sessionId: string) => {
+    setState({ status: 'uploading' })
+    try {
+      sessionIdRef.current = sessionId
+      const data = await api.getSession(sessionId)
+
+      let frameDetail: FrameDetail | null = null
+      if (data.frames.length > 0) {
+        frameDetail = await api.getFrame(sessionId, 0)
+      }
+
+      setState({
+        status: 'loaded',
+        sessionId,
+        data,
+        selectedFrame: 0,
+        frameDetail,
+        frameLoading: false,
+        frameError: null,
+      })
+    } catch (e) {
+      sessionIdRef.current = null
+      setState({ status: 'error', message: e instanceof Error ? e.message : String(e) })
+    }
+  }, [])
+
+  // Auto-load session from URL hash on mount
+  useEffect(() => {
+    const hash = window.location.hash
+    const match = hash.match(/^#session\/(.+)$/)
+    if (match?.[1]) {
+      loadSession(match[1])
+    }
+  }, [loadSession])
+
   const upload = useCallback(async (
     rsodLog: File | Blob,
     symbolFile: File,
@@ -89,6 +125,7 @@ export function useSession() {
     if (sid) {
       api.deleteSession(sid).catch(() => {})
     }
+    window.location.hash = ''
     setState({ status: 'idle' })
   }, [])
 

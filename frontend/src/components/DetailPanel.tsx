@@ -1,23 +1,28 @@
-import type { FrameDetail } from '../types'
+import type { FrameDetail, VarInfo } from '../types'
 
 interface Props {
   frame: FrameDetail | null
   loading: boolean
   error?: string | null
+  isCrashFrame: boolean
 }
 
 function formatValue(value: number | null): string {
   if (value === null) return '\u2014'
-  const hex = `0x${value.toString(16).toUpperCase().padStart(16, '0')}`
+  const hex = `0x${value.toString(16).toUpperCase()}`
   if (value < 0x10000) {
-    return `${hex}  (${value})`
+    return `${hex} (${value})`
   }
   return hex
 }
 
+function filterParams(params: VarInfo[]): VarInfo[] {
+  return params.filter(p => p.name !== '???')
+}
+
 const TABS = ['Params', 'Locals', 'Disassembly', 'Source'] as const
 
-export function DetailPanel({ frame, loading, error }: Props) {
+export function DetailPanel({ frame, loading, error, isCrashFrame }: Props) {
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center text-zinc-500">
@@ -42,6 +47,8 @@ export function DetailPanel({ frame, loading, error }: Props) {
       </div>
     )
   }
+
+  const params = filterParams(frame.params)
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
@@ -79,29 +86,36 @@ export function DetailPanel({ frame, loading, error }: Props) {
 
       {/* Params content */}
       <div className="flex-1 overflow-auto p-4">
-        {frame.params.length === 0 ? (
+        {params.length === 0 ? (
           <div className="text-zinc-600 text-sm">No parameters available for this frame</div>
         ) : (
-          <table className="w-full text-sm font-mono">
-            <thead>
-              <tr className="text-left text-xs text-zinc-500 uppercase tracking-wider">
-                <th className="pb-2 pr-4">Name</th>
-                <th className="pb-2 pr-4">Type</th>
-                <th className="pb-2 pr-4">Location</th>
-                <th className="pb-2">Value</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-zinc-800/50">
-              {frame.params.map((p, i) => (
-                <tr key={i} className="hover:bg-zinc-800/30">
-                  <td className="py-1.5 pr-4 text-yellow-300">{p.name}</td>
-                  <td className="py-1.5 pr-4 text-zinc-400">{p.type}</td>
-                  <td className="py-1.5 pr-4 text-zinc-500">{p.location}</td>
-                  <td className="py-1.5 text-zinc-200">{formatValue(p.value)}</td>
+          <>
+            {!isCrashFrame && (
+              <div className="text-xs text-zinc-600 mb-3 italic">
+                Register values are from the crash point, not this frame's call site
+              </div>
+            )}
+            <table className="w-full text-sm font-mono">
+              <thead>
+                <tr className="text-left text-xs text-zinc-500 uppercase tracking-wider">
+                  <th className="pb-2 pr-4">Name</th>
+                  <th className="pb-2 pr-4">Type</th>
+                  <th className="pb-2 pr-4">Location</th>
+                  <th className="pb-2">Value</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-zinc-800/50">
+                {params.map((p, i) => (
+                  <tr key={i} className="hover:bg-zinc-800/30">
+                    <td className="py-1.5 pr-4 text-yellow-300">{p.name}</td>
+                    <td className="py-1.5 pr-4 text-zinc-400">{p.type}</td>
+                    <td className="py-1.5 pr-4 text-zinc-500">{p.location}</td>
+                    <td className={`py-1.5 ${isCrashFrame ? 'text-zinc-200' : 'text-zinc-500'}`}>{formatValue(p.value)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
         )}
       </div>
     </div>
