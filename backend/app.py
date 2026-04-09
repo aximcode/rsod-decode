@@ -315,12 +315,15 @@ def create_app(repo_root: Path | None = None,
 
         context = min(request.args.get('context', 5, type=int), 50)
 
-        # Direct path lookup, with case-insensitive fallback
-        root = app.config['REPO_ROOT'] or Path(__file__).resolve().parents[4]
-        src_path = find_source_file(root, file_part, target_line)
+        # Direct path lookup: try absolute path first, then repo-relative
+        abs_path = Path(file_part)
+        if abs_path.is_absolute() and abs_path.is_file():
+            src_path = abs_path
+        else:
+            root = app.config['REPO_ROOT'] or Path(__file__).resolve().parents[4]
+            src_path = find_source_file(root, file_part, target_line)
         if not src_path:
             return jsonify(file=file_part, target_line=target_line, lines=[])
-        file_part = str(src_path.relative_to(root))
 
         try:
             all_lines = src_path.read_text(
