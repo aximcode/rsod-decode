@@ -1,19 +1,19 @@
-"""RSOD text parsing, format detection, and decode orchestrator.
+"""RSOD decode orchestrator and output formatters.
 
-This module handles:
-- RSOD format detection (uefi_x86, uefi_arm64, edk2_x64)
-- Crash info extraction (exception type, PC, registers, ESR)
-- Address annotation and frame building for x86 and ARM64
+This module provides:
 - Output formatting (crash summary, backtrace, params, disassembly, source)
 - Git source context resolution
-- The main analyze_rsod() / decode_rsod() orchestrator
+- The main analyze_rsod() / decode_rsod() orchestrators
+- Call-site verification
+
+Format-specific logic (detection, extraction, decode) lives in the
+``decoders`` subpackage.
 """
 from __future__ import annotations
 
-import re
-import struct
 import subprocess as _subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +24,12 @@ from .models import (
 from .dwarf_info import DwarfInfo
 from .esr import format_esr
 from .symbols import load_symbols
+from .decoders import FormatDecoder, detect_format
+from .decoders.base import (
+    parse_stack_dump,
+    resolve_addresses_dwarf,
+    walk_fp_chain,
+)
 
 
 # =============================================================================
@@ -32,115 +38,6 @@ from .symbols import load_symbols
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
-
-
-# =============================================================================
-# RSOD line patterns
-# =============================================================================
-
-RE_STACK_LINE = re.compile(
-    r'^(\s+[0-9A-Fa-f]+\s+)([0-9A-Fa-f]{16})(\s+.*)$')
-RE_RIP_LINE = re.compile(r'^-->\s*RIP\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
-RE_UEFI_X86_REG = re.compile(r'([A-Z0-9]{2})=([0-9A-Fa-f]{16})')
-RE_EDK2_RIP = re.compile(r'^(RIP\s+-\s+)([0-9A-Fa-f]+)(.*)')
-RE_EDK2_REG = re.compile(r'([A-Z0-9]+)\s+-\s+([0-9A-Fa-f]{16})')
-RE_EDK2_IMAGEBASE = re.compile(r'ImageBase=([0-9A-Fa-f]+)', re.IGNORECASE)
-RE_ARM64_REG = re.compile(
-    r'(X\d+|FP|LR|SP|ELR|SPSR|FPSR|FAR|PC|ESR)=(?:0x)?([0-9A-Fa-f]+)')
-RE_PC_LINE = re.compile(r'^-->\s*PC\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
-RE_ARM64_FRAME = re.compile(
-    r'^(s\d+)\s+([0-9A-Fa-f]+)\s+(\S+\.efi)\s+\+([0-9A-Fa-f]+)')
-
-
-# =============================================================================
-# Crash summary extraction
-# =============================================================================
-
-RE_UEFI_X86_TYPE = re.compile(r'^Type:\s*(.+?)\s*Source:', re.IGNORECASE)
-RE_UEFI_ARM64_TYPE = re.compile(r'^Type:\s*(.+)', re.IGNORECASE)
-RE_EDK2_TYPE = re.compile(
-    r'X64 Exception Type\s*-\s*([0-9a-fA-F]+)\(([^)]+)\)', re.IGNORECASE)
-
-
-def extract_crash_info(
-    lines: list[str], fmt: str, table: SymbolTable, base_delta: int,
-) -> CrashInfo:
-    """Extract crash metadata from RSOD lines."""
-    info = CrashInfo(fmt=fmt, image_base=table.preferred_base)
-    regs: dict[str, int] = {}
-
-    # Choose patterns based on format
-    if fmt == 'uefi_arm64':
-        type_pats = [RE_UEFI_ARM64_TYPE]
-        pc_pats = [RE_PC_LINE]
-        reg_pats = [RE_ARM64_REG]
-    elif fmt == 'edk2_x64':
-        type_pats = [RE_EDK2_TYPE]
-        pc_pats = [RE_EDK2_RIP]
-        reg_pats = [RE_EDK2_REG]
-    else:
-        type_pats = [RE_UEFI_X86_TYPE]
-        pc_pats = [RE_RIP_LINE]
-        reg_pats = [RE_UEFI_X86_REG]
-
-    for line in lines:
-        # Exception description
-        if not info.exception_desc:
-            for pat in type_pats:
-                m = pat.search(line)
-                if m:
-                    if pat == RE_EDK2_TYPE:
-                        info.exception_desc = f"{m.group(2)} (0x{m.group(1)})"
-                    else:
-                        info.exception_desc = m.group(1).strip()
-                    break
-
-        # Crash PC
-        for pat in pc_pats:
-            m = pat.match(line)
-            if m:
-                group_idx = 2 if pat == RE_EDK2_RIP else 1
-                info.crash_pc = int(m.group(group_idx), 16)
-
-        # Registers
-        for pat in reg_pats:
-            for reg, val in pat.findall(line):
-                regs[reg] = int(val, 16)
-
-    info.registers = regs
-    info.sp = regs.get('SP', regs.get('RSP'))
-    info.esr = regs.get('ESR')
-    info.far = regs.get('FAR')
-
-    # Resolve crash PC
-    if info.crash_pc is not None:
-        result = table.lookup(info.crash_pc - base_delta)
-        if result:
-            info.crash_symbol = result[0].name
-        else:
-            info.crash_symbol = "not in image"
-
-    return info
-
-
-# =============================================================================
-# RSOD format detection
-# =============================================================================
-
-def detect_format(lines: list[str]) -> str:
-    """Detect the RSOD format from the log lines."""
-    for line in lines:
-        if RE_PC_LINE.match(line) or RE_ARM64_FRAME.match(line):
-            return 'uefi_arm64'
-        if line.startswith('--> PC') or line.startswith('-->PC'):
-            return 'uefi_arm64'
-        if RE_ARM64_REG.search(line) and 'X0=' in line:
-            return 'uefi_arm64'
-        if '!!!! X64 Exception' in line or RE_EDK2_RIP.match(line):
-            return 'edk2_x64'
-        if RE_RIP_LINE.match(line):
-            return 'uefi_x86'
-    return 'uefi_x86'
 
 
 # =============================================================================
@@ -282,12 +179,10 @@ def format_source_context(
     display_path = file_part
 
     if git_ref and repo_root:
-        # Read from git at the specified commit
         src_lines = _read_source_from_git(git_ref, file_part, repo_root)
         if src_lines:
             display_path = f"{file_part} @ {git_ref.short}"
     else:
-        # Direct path lookup from source root
         src_path = source_root / file_part
         if not src_path.is_file():
             return []
@@ -327,255 +222,6 @@ def verify_call_sites(
 
 
 # =============================================================================
-# Annotation formatting
-# =============================================================================
-
-def format_annotation(
-    sym: MapSymbol, offset: int, source_loc: str = '',
-) -> str:
-    """Format a symbol lookup result for inline annotation."""
-    obj = f"({sym.object_file})" if sym.object_file else ''
-    loc = f"  [{source_loc}]" if source_loc else ''
-    if sym.is_function:
-        return f"<- {sym.name}{obj} + 0x{offset:03X}{loc}"
-    return f"--data-- <- {sym.name}{obj}"
-
-
-def _source_loc(
-    line_info: dict[int, list[tuple[str, str]]], addr: int,
-) -> str:
-    """Get the primary source location for an address from resolved data."""
-    entries = line_info.get(addr, [])
-    return entries[0][1] if entries else ''
-
-
-def _lookup_and_annotate(
-    addr: int, table: SymbolTable, line_info: dict[int, list[tuple[str, str]]],
-) -> str | None:
-    """Look up addr, return annotation string or None."""
-    result = table.lookup(addr)
-    if not result:
-        return None
-    sym, offset = result
-    return format_annotation(sym, offset, _source_loc(line_info, addr))
-
-
-# =============================================================================
-# Decode: shared register annotation helper
-# =============================================================================
-
-def _annotate_regs(
-    line: str, patterns: list[re.Pattern[str]],
-    table: SymbolTable, base_delta: int,
-) -> str:
-    """Annotate register values that resolve to symbols."""
-    matches: list[tuple[str, str]] = []
-    for pat in patterns:
-        matches = pat.findall(line)
-        if matches:
-            break
-    if not matches:
-        return line
-    anns: list[str] = []
-    for reg, val_hex in matches:
-        result = table.lookup(int(val_hex, 16) - base_delta)
-        if result:
-            anns.append(f"{reg}={format_annotation(*result)}")
-    return f"{line}  [{', '.join(anns)}]" if anns else line
-
-
-# =============================================================================
-# Decode: shared frame builder
-# =============================================================================
-
-def _make_frame(
-    index: int, address: int, module: str,
-    sym: MapSymbol, offset: int,
-    line_info: dict[int, list[tuple[str, str]]],
-    info_key: int,
-) -> FrameInfo:
-    """Build a FrameInfo from a resolved symbol + resolved data."""
-    entries = line_info.get(info_key, [])
-    loc = entries[0][1] if entries else ''
-    inlines = entries[1:] if len(entries) > 1 else []
-    return FrameInfo(
-        index=index, address=address, module=module,
-        symbol=sym, sym_offset=offset, source_loc=loc, inlines=inlines)
-
-
-def _extract_addr_from_line(
-    line: str, patterns: list[tuple[re.Pattern[str], int]],
-) -> int | None:
-    """Try each (pattern, group_index) pair; return first matched address."""
-    for pat, group in patterns:
-        m = pat.match(line)
-        if m:
-            return int(m.group(group), 16)
-    return None
-
-
-# =============================================================================
-# Decode: UEFI x86 + EDK2 x64
-# =============================================================================
-
-# (pattern, capture group for the address)
-_RIP_PATTERNS: list[tuple[re.Pattern[str], int]] = [
-    (RE_RIP_LINE, 1),
-    (RE_EDK2_RIP, 2),
-]
-
-
-def decode_x86(
-    lines: list[str], table: SymbolTable, base_delta: int,
-    line_info: dict[int, list[tuple[str, str]]],
-) -> tuple[list[str], int, list[FrameInfo]]:
-    """Decode x86 RSOD. Returns (annotated_lines, resolved_count, frames)."""
-    in_registers = False
-    in_stack = False
-    resolved = 0
-    out: list[str] = []
-    frames: list[FrameInfo] = []
-    frame_idx = 0
-
-    for line in lines:
-        has_regs = (RE_UEFI_X86_REG.search(line) is not None
-                    or RE_EDK2_REG.search(line) is not None)
-        if has_regs and not in_stack:
-            in_registers = True
-
-        if line.strip().startswith('Stack Dump'):
-            in_stack = True
-            in_registers = False
-            out.append(line)
-            continue
-
-        if in_registers and RE_STACK_LINE.match(line):
-            in_stack = True
-            in_registers = False
-
-        if in_registers and not in_stack:
-            out.append(_annotate_regs(
-                line, [RE_UEFI_X86_REG, RE_EDK2_REG], table, base_delta))
-            continue
-
-        # -->RIP or EDK2 RIP
-        rip_addr = _extract_addr_from_line(line, _RIP_PATTERNS)
-        if rip_addr is not None:
-            ann = _lookup_and_annotate(rip_addr - base_delta, table, line_info)
-            if ann:
-                out.append(f"{line} {ann}")
-                resolved += 1
-            else:
-                out.append(line)
-            continue
-
-        # Stack dump lines
-        sm = RE_STACK_LINE.match(line) if in_stack else None
-        if sm:
-            value = int(sm.group(2), 16)
-            adjusted = value - base_delta
-            result = table.lookup(adjusted)
-            if result:
-                sym, offset = result
-                out.append(f"{line} {format_annotation(
-                    sym, offset, _source_loc(line_info, adjusted))}")
-                resolved += 1
-                frames.append(_make_frame(
-                    frame_idx, value, '', sym, offset, line_info, adjusted))
-                frame_idx += 1
-            else:
-                out.append(line)
-            continue
-
-        out.append(line)
-
-    return out, resolved, frames
-
-
-# =============================================================================
-# Decode: UEFI ARM64
-# =============================================================================
-
-def decode_arm64(
-    lines: list[str], table: SymbolTable, base_delta: int,
-    line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]],
-    extra_sources: dict[str, SymbolSource] | None = None,
-    default_module_key: str = '',
-) -> tuple[list[str], int, list[FrameInfo]]:
-    """Decode ARM64 RSOD. Returns (annotated_lines, resolved_count, frames).
-
-    line_info_by_module maps module key -> {addr: [(func, loc), ...]}.
-    The default_module_key is for the primary symbol file.
-    """
-    resolved = 0
-    out: list[str] = []
-    frames: list[FrameInfo] = []
-    frame_idx = 0
-
-    # Flat line_info for -->PC (not module-scoped)
-    default_info = line_info_by_module.get(default_module_key, {})
-
-    for line in lines:
-        # --> PC line
-        pc_match = RE_PC_LINE.match(line)
-        if pc_match:
-            addr = int(pc_match.group(1), 16)
-            ann = _lookup_and_annotate(addr - base_delta, table, default_info)
-            if ann:
-                out.append(f"{line} {ann}")
-                resolved += 1
-            else:
-                out.append(line)
-            continue
-
-        # sNN frame lines
-        fm = RE_ARM64_FRAME.match(line)
-        if fm:
-            module = fm.group(3)
-            offset_in_module = int(fm.group(4), 16)
-
-            # Multi-module: pick the right symbol source and line info
-            mod_key = module.replace('.efi', '').lower()
-            src = (extra_sources or {}).get(mod_key)
-            use_table = src.table if src else table
-            # Try module-specific line info, fall back to primary
-            use_info = line_info_by_module.get(
-                mod_key, line_info_by_module.get(default_module_key, {}))
-
-            if use_table.preferred_base == 0:
-                lookup_addr = offset_in_module
-            else:
-                lookup_addr = use_table.preferred_base + offset_in_module
-
-            result = use_table.lookup(lookup_addr)
-            if result:
-                sym, off = result
-                loc = _source_loc(use_info, offset_in_module)
-                out.append(f"{line}  {format_annotation(sym, off, loc)}")
-                resolved += 1
-                frames.append(_make_frame(
-                    frame_idx, offset_in_module, module,
-                    sym, off, use_info, offset_in_module))
-                frame_idx += 1
-            else:
-                out.append(line)
-                frames.append(FrameInfo(
-                    index=frame_idx, address=offset_in_module, module=module))
-                frame_idx += 1
-            continue
-
-        # Register lines
-        if RE_ARM64_REG.search(line):
-            out.append(_annotate_regs(
-                line, [RE_ARM64_REG], table, base_delta))
-            continue
-
-        out.append(line)
-
-    return out, resolved, frames
-
-
-# =============================================================================
 # Git source resolution
 # =============================================================================
 
@@ -602,14 +248,12 @@ def _read_source_from_git(
     git_ref: GitRef, file_path: str, repo_root: Path,
 ) -> list[str] | None:
     """Read source file at a specific git commit."""
-    # Try the path directly with common prefixes
     for prefix in ('source/src/', ''):
         git_path = f"{prefix}{file_path}"
         lines = _git_show(git_ref.commit, git_path, repo_root)
         if lines is not None:
             return lines
 
-    # Fallback: search entire repo for the filename
     filename = Path(file_path).name
     found = _git_find_file(git_ref.commit, filename, '', repo_root)
     if found:
@@ -649,138 +293,6 @@ def _git_find_file(
 
 
 # =============================================================================
-# DWARF address resolution helper
-# =============================================================================
-
-def _resolve_addresses_dwarf(
-    dwarf_info: DwarfInfo, addresses: list[int],
-) -> dict[int, list[tuple[str, str]]]:
-    """Resolve addresses via DwarfInfo.
-    Returns {addr: [(func, file:line), ...]} for compatibility with
-    the line_info dict format used by the decoders."""
-    resolved_raw = dwarf_info.resolve_addresses(addresses)
-    result: dict[int, list[tuple[str, str]]] = {}
-    for addr, info in resolved_raw.items():
-        pairs: list[tuple[str, str]] = []
-        if info.function and info.source_loc:
-            pairs.append((info.function, clean_path(info.source_loc)))
-        for func, loc in info.inlines:
-            pairs.append((func, clean_path(loc)))
-        if pairs:
-            result[addr] = pairs
-    return result
-
-
-# =============================================================================
-# x86 address collector
-# =============================================================================
-
-def _collect_x86_addrs(
-    lines: list[str], table: SymbolTable, base_delta: int,
-) -> list[int]:
-    """Collect resolvable addresses from x86/EDK2 RSOD lines."""
-    addrs: list[int] = []
-    in_stack = False
-    for line in lines:
-        if line.strip().startswith('Stack Dump'):
-            in_stack = True
-            continue
-        for pat in (RE_RIP_LINE, RE_EDK2_RIP):
-            m = pat.match(line)
-            if m:
-                addr = int(m.group(1 if pat == RE_RIP_LINE else 2), 16)
-                adj = addr - base_delta
-                if table.lookup(adj):
-                    addrs.append(adj)
-        if in_stack:
-            sm = RE_STACK_LINE.match(line)
-            if sm:
-                adj = int(sm.group(2), 16) - base_delta
-                if table.lookup(adj):
-                    addrs.append(adj)
-    return addrs
-
-
-# =============================================================================
-# Stack dump parser and FP chain walker (ARM64)
-# =============================================================================
-
-RE_STACK_DUMP_LINE = re.compile(
-    r'^\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]{16})\s')
-
-
-def parse_stack_dump(lines: list[str]) -> tuple[int, bytes]:
-    """Parse hex stack dump lines into a contiguous memory buffer.
-
-    Returns (base_address, memory_bytes). Gaps between addresses are
-    filled with zeros.
-    """
-    entries: list[tuple[int, int]] = []
-    in_dump = False
-    for line in lines:
-        if 'Stack Dump' in line:
-            in_dump = True
-            continue
-        if not in_dump:
-            continue
-        m = RE_STACK_DUMP_LINE.match(line)
-        if m:
-            addr = int(m.group(1), 16)
-            val = int(m.group(2), 16)
-            entries.append((addr, val))
-
-    if not entries:
-        return 0, b''
-
-    entries.sort(key=lambda x: x[0])
-    base = entries[0][0]
-    end = entries[-1][0] + 8
-    buf = bytearray(end - base)
-    for addr, val in entries:
-        struct.pack_into('<Q', buf, addr - base, val)
-    return base, bytes(buf)
-
-
-def walk_fp_chain(
-    fp: int, lr: int, stack_memory: bytes, stack_base: int,
-    max_frames: int = 32,
-) -> list[tuple[int, int]]:
-    """Walk the ARM64 frame pointer chain through raw stack memory.
-
-    Args:
-        fp: Initial frame pointer (FP/X29 from crash registers).
-        lr: Initial link register (LR/X30 from crash registers).
-        stack_memory: Contiguous stack memory buffer.
-        stack_base: Virtual address of stack_memory[0].
-        max_frames: Maximum frames to unwind.
-
-    Returns:
-        List of (return_address, frame_pointer) tuples representing
-        the real call chain. The first entry is the crash LR.
-    """
-    stack_end = stack_base + len(stack_memory)
-    frames: list[tuple[int, int]] = []
-
-    # First frame: LR is the return address (where the caller called the
-    # crashing function from)
-    if lr:
-        frames.append((lr, fp))
-
-    for _ in range(max_frames):
-        if fp == 0 or fp < stack_base or fp + 16 > stack_end:
-            break
-        off = fp - stack_base
-        saved_fp = struct.unpack_from('<Q', stack_memory, off)[0]
-        saved_lr = struct.unpack_from('<Q', stack_memory, off + 8)[0]
-        if saved_lr == 0:
-            break
-        frames.append((saved_lr, saved_fp))
-        fp = saved_fp
-
-    return frames
-
-
-# =============================================================================
 # Analysis result
 # =============================================================================
 
@@ -806,7 +318,7 @@ def analyze_rsod(
     source: SymbolSource,
     extra_sources: dict[str, SymbolSource] | None = None,
     base_override: int | None = None,
-    log: object = None,
+    log: Callable[[str], None] | None = None,
 ) -> AnalysisResult:
     """Analyze an RSOD capture against symbol files.
 
@@ -819,80 +331,35 @@ def analyze_rsod(
         extra_sources = {}
 
     lines = rsod_text.splitlines()
+
+    # 1. Detect format → decoder instance
+    decoder = detect_format(lines)
+    log(f"RSOD format: {decoder.name}")
+
+    # 2. Base delta
     table = source.table
-    fmt = detect_format(lines)
-    log(f"RSOD format: {fmt}")
+    base_delta = decoder.detect_base_delta(lines, table, base_override)
+    if base_delta:
+        log(f"Base delta: {base_delta:+X}")
 
-    # Base delta
-    base_delta = 0
-    if base_override is not None:
-        base_delta = base_override - table.preferred_base
-        log(f"Base override: 0x{base_override:X} (delta: {base_delta:+X})")
-    elif fmt == 'edk2_x64':
-        for line in lines:
-            m = RE_EDK2_IMAGEBASE.search(line)
-            if m:
-                detected = int(m.group(1), 16)
-                if detected != table.preferred_base:
-                    base_delta = detected - table.preferred_base
-                    log(f"Auto-detected ImageBase: 0x{detected:X}")
-                break
+    # 3. Collect addresses + DWARF resolve (per-module)
+    line_info_by_module = decoder.collect_and_resolve(
+        lines, source, extra_sources, base_delta, log)
 
-    # Collect addresses and resolve -- per-module for ARM64
-    default_key = source.name.lower()
-    line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]] = {}
-
-    if fmt == 'uefi_arm64':
-        module_addrs: dict[str, list[int]] = {}
-        for line in lines:
-            fm = RE_ARM64_FRAME.match(line)
-            if fm:
-                mod_key = fm.group(3).replace('.efi', '').lower()
-                module_addrs.setdefault(mod_key, []).append(
-                    int(fm.group(4), 16))
-            pc = RE_PC_LINE.match(line)
-            if pc:
-                module_addrs.setdefault(default_key, []).append(
-                    int(pc.group(1), 16))
-
-        dedicated: dict[str, SymbolSource] = {
-            k: v for k, v in extra_sources.items() if v.has_debug_info()}
-        for mod_key, addrs in module_addrs.items():
-            mod_src = dedicated.get(mod_key, source)
-            if mod_src.has_debug_info() and mod_src.dwarf:
-                src_key = mod_key if mod_key in dedicated else default_key
-                info = _resolve_addresses_dwarf(mod_src.dwarf, addrs)
-                if info:
-                    line_info_by_module.setdefault(src_key, {}).update(info)
-                    log(f"resolve [{mod_key}]: "
-                        f"{len(info)}/{len(addrs)} resolved")
-    elif source.has_debug_info() and source.dwarf:
-        addrs = _collect_x86_addrs(lines, table, base_delta)
-        if addrs:
-            info = _resolve_addresses_dwarf(source.dwarf, addrs)
-            if info:
-                line_info_by_module[default_key] = info
-                log(f"resolve: {len(info)}/{len(addrs)} addresses")
-
-    # Extract crash info
-    crash_info = extract_crash_info(lines, fmt, table, base_delta)
+    # 4. Extract crash info
+    crash_info = decoder.extract_crash_info(lines, table, base_delta)
     crash_info.image_name = source.name
 
-    # Decode (annotated lines + frames)
-    if fmt == 'uefi_arm64':
-        annotated, resolved, frames = decode_arm64(
-            lines, table, base_delta, line_info_by_module,
-            extra_sources, default_key)
-    else:
-        flat_info = line_info_by_module.get(default_key, {})
-        annotated, resolved, frames = decode_x86(
-            lines, table, base_delta, flat_info)
+    # 5. Decode (annotated lines + frames)
+    default_key = source.name.lower()
+    annotated, resolved, frames = decoder.decode(
+        lines, table, base_delta, line_info_by_module,
+        extra_sources, default_key)
 
-    # FP chain unwinding: when raw stack memory is available, walk the
-    # FP chain to get real call frames. Each frame's return address tells
-    # us where the CALLER called THIS function from.
+    # 6. FP chain unwinding: ARM64 formats with raw stack dumps
     fp_unwound = False
-    if fmt == 'uefi_arm64':
+    chain: list[tuple[int, int]] = []
+    if decoder.supports_fp_chain():
         stack_base, stack_mem = parse_stack_dump(lines)
         if stack_mem:
             fp = crash_info.registers.get('FP', 0)
@@ -903,32 +370,21 @@ def analyze_rsod(
                     fp_unwound = True
                     log(f"FP chain: {len(chain)} frames unwound from stack dump")
 
-    # Call-site verification via capstone (ELF sources only)
+    # 7. Call-site verification via capstone (ELF sources only)
     call_verified: dict[int, bool] = {}
     if source.dwarf and frames:
         call_verified = verify_call_sites(
             source.dwarf, [f.address for f in frames])
 
-    # Compute call_addr for each frame.
-    # For ARM64 with FP-unwound chain: each frame's return address is where
-    # the caller will resume — subtract 4 to get the bl instruction (call site).
-    # The call site shows where THIS frame called the NEXT one down.
-    insn_size = 4 if fmt == 'uefi_arm64' else 1
+    # 8. Compute call_addr for each frame
+    insn_size = decoder.insn_size
 
-    if fp_unwound and fmt == 'uefi_arm64':
-        # Map FP chain return addresses to frames using the sNN offsets.
-        # chain[i] = (return_addr, fp) — this is the LR saved by frame i,
-        # meaning frame i+1 (the caller) called frame i at return_addr - 4.
-        # We want: frame N's source shows where N called N-1.
-        # So frame N's call_site = chain[N-1].return_addr - 4
-        #    (because chain[N-1]'s LR is where frame N called frame N-1)
+    if fp_unwound:
         for f in frames:
             if f.index == 0:
                 f.is_crash_frame = True
-                f.call_addr = f.address  # crash location
+                f.call_addr = f.address
             elif f.index - 1 < len(chain):
-                # chain[f.index-1] has the LR for frame f.index-1,
-                # which is where frame f.index called frame f.index-1
                 f.call_addr = chain[f.index - 1][0] - insn_size
                 f.is_crash_frame = False
             else:
@@ -942,17 +398,17 @@ def analyze_rsod(
             else:
                 f.call_addr = f.address - insn_size
 
-    # Re-resolve source_loc at call_addr for non-crash frames
+    # 9. Re-resolve source_loc at call_addr for non-crash frames
     if source.dwarf and frames:
         call_addrs = [f.call_addr for f in frames if not f.is_crash_frame]
         if call_addrs:
-            call_info = _resolve_addresses_dwarf(source.dwarf, call_addrs)
+            call_info = resolve_addresses_dwarf(source.dwarf, call_addrs)
             for f in frames:
                 if f.is_crash_frame:
                     continue
                 entry = call_info.get(f.call_addr)
                 if entry:
-                    f.source_loc = entry[0][1]  # (func, file:line)
+                    f.source_loc = entry[0][1]
                     f.inlines = entry[1:] if len(entry) > 1 else []
 
     return AnalysisResult(
@@ -960,7 +416,7 @@ def analyze_rsod(
         frames=frames,
         annotated_lines=annotated,
         resolved_count=resolved,
-        rsod_format=fmt,
+        rsod_format=decoder.name,
         call_verified=call_verified,
         line_info_by_module=line_info_by_module,
     )

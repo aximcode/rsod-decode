@@ -23,8 +23,6 @@ from pathlib import Path
 
 from backend.app import Session, _sessions, create_app
 from backend.decoder import analyze_rsod
-from backend.models import GitRef
-from backend.decoder import resolve_git_ref
 from backend.symbols import SymbolLoadError, load_symbols
 
 

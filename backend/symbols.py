@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from .models import MapSymbol, SymbolTable, SymbolSource
@@ -78,7 +79,7 @@ def is_elf(path: Path) -> bool:
         return False
 
 
-def load_symbols(path: Path, log: object = None,
+def load_symbols(path: Path, log: Callable[[str], None] | None = None,
                  dwarf_prefix: str | None = None,
                  repo_root: Path | None = None) -> SymbolSource:
     """Auto-detect symbol file format and load.

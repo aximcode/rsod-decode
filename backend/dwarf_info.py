@@ -182,8 +182,20 @@ class DwarfInfo:
                  repo_root: Path | None = None) -> None:
         self._path = elf_path
         self._file = elf_path.open('rb')
-        self._elf = ELFFile(self._file)
-        self._dwarf = self._elf.get_dwarf_info() if self._elf.has_dwarf_info() else None
+        try:
+            self._elf = ELFFile(self._file)
+        except Exception:
+            self._file.close()
+            raise
+        self._dwarf = None
+        if self._elf.has_dwarf_info():
+            try:
+                self._dwarf = self._elf.get_dwarf_info()
+            except Exception:
+                # Fallback: skip relocation processing (needed for EDK2 GCC
+                # .debug/.dll files that contain R_AARCH64_NONE relocations)
+                self._dwarf = self._elf.get_dwarf_info(
+                    relocate_dwarf_sections=False)
         self._aranges = self._dwarf.get_aranges() if self._dwarf else None
         self._loc_parser = (LocationParser(self._dwarf.location_lists())
                             if self._dwarf else None)
@@ -322,8 +334,8 @@ class DwarfInfo:
             raw.append((addr, name, is_func))
             mangled_names.append(name)
 
-        # Batch demangle via cxxfilt
-        demangled = self._demangle_batch(mangled_names)
+        # Demangle C++ names
+        demangled = [cxxfilt.demangle(n) for n in mangled_names]
 
         result: list[tuple[int, str, bool]] = []
         for (addr, _name, is_func), dem_name in zip(raw, demangled):
@@ -331,13 +343,6 @@ class DwarfInfo:
 
         result.sort(key=lambda x: x[0])
         return result
-
-    @staticmethod
-    def _demangle_batch(names: list[str]) -> list[str]:
-        """Demangle C++ names via cxxfilt."""
-        if not names:
-            return []
-        return [cxxfilt.demangle(n) for n in names]
 
     # -----------------------------------------------------------------
     # Address resolution (replaces addr2line -a -f -C -i)
@@ -579,13 +584,8 @@ class DwarfInfo:
                         cu = child.cu
                         lp = self._dwarf.line_program_for_CU(cu)
                         if lp:
-                            # DWARF5: 0-based file index; DWARF4: 1-based
-                            fi = call_file.value if cu['version'] >= 5 else call_file.value - 1
-                            if 0 <= fi < len(lp['file_entry']):
-                                fe = lp['file_entry'][fi]
-                                fname = (fe.name.decode()
-                                         if isinstance(fe.name, bytes) else fe.name)
-                                loc = f'{fname}:{call_line.value}'
+                            loc = self._format_file_line(
+                                lp, call_file.value, call_line.value, cu)
                     info.inlines.append((name, loc))
                     # Recurse for nested inlines
                     self._find_inlines(child, addr, info)
