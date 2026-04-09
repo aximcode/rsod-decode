@@ -379,24 +379,15 @@ def analyze_rsod(
     # 8. Compute call_addr for each frame
     insn_size = decoder.insn_size
 
-    if fp_unwound:
-        for f in frames:
-            if f.index == 0:
-                f.is_crash_frame = True
-                f.call_addr = f.address
-            elif f.index - 1 < len(chain):
-                f.call_addr = chain[f.index - 1][0] - insn_size
-                f.is_crash_frame = False
-            else:
-                f.call_addr = f.address - insn_size
-                f.is_crash_frame = False
-    else:
-        for f in frames:
-            if f.index == 0:
-                f.is_crash_frame = True
-                f.call_addr = f.address
-            else:
-                f.call_addr = f.address - insn_size
+    # call_addr = address - insn_size for non-crash frames.
+    # f.address is always the module offset, so this works regardless
+    # of whether we used FP chain unwinding or sNN/stack scanning.
+    for f in frames:
+        if f.index == 0:
+            f.is_crash_frame = True
+            f.call_addr = f.address  # crash location, don't adjust
+        else:
+            f.call_addr = f.address - insn_size
 
     # 9. Re-resolve source_loc at call_addr for non-crash frames
     if source.dwarf and frames:
