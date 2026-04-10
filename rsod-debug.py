@@ -72,6 +72,11 @@ def main() -> None:
                         choices=['auto', 'gdb', 'pyelftools'],
                         help='DWARF backend: gdb (uses GDB/MI), '
                              'pyelftools (standalone), auto (default)')
+    parser.add_argument('--symbol-path', type=Path, action='append',
+                        default=[], dest='symbol_paths',
+                        help='Directory to search for module symbol files '
+                             '(repeatable; auto-loads .so/.debug matching '
+                             'image table modules)')
     args = parser.parse_args()
 
     # Validate file args
@@ -93,7 +98,8 @@ def main() -> None:
             break
 
     # Create Flask app with static file serving
-    app = create_app(repo_root=repo_root, dwarf_prefix=args.dwarf_prefix)
+    app = create_app(repo_root=repo_root, dwarf_prefix=args.dwarf_prefix,
+                     symbol_search_paths=args.symbol_paths or None)
     dist_dir = Path(__file__).resolve().parent / 'frontend' / 'dist'
 
     if dist_dir.is_dir():
@@ -140,7 +146,8 @@ def main() -> None:
             except ValueError:
                 sys.exit(f"Error: invalid base address: {args.base}")
 
-        result = analyze_rsod(rsod_text, source, extra_sources, base_override)
+        result = analyze_rsod(rsod_text, source, extra_sources, base_override,
+                              symbol_search_paths=args.symbol_paths or None)
 
         session_id = uuid.uuid4().hex[:12]
         sess = Session(

@@ -354,6 +354,7 @@ def analyze_rsod(
     extra_sources: dict[str, SymbolSource] | None = None,
     base_override: int | None = None,
     log: Callable[[str], None] | None = None,
+    symbol_search_paths: list[Path] | None = None,
 ) -> AnalysisResult:
     """Analyze an RSOD capture against symbol files.
 
@@ -391,6 +392,33 @@ def analyze_rsod(
         lines, table, base_delta, line_info_by_module,
         extra_sources, default_key)
 
+    # 5b. Auto-discover symbol files from image table
+    if symbol_search_paths:
+        img_table = getattr(decoder, 'image_table', {})
+        for _idx, (mod_name, _base, _size) in img_table.items():
+            mk = module_key(mod_name)
+            if mk in extra_sources or mk == source.name.lower():
+                continue
+            # Search for matching .so or .debug file
+            stem = mk.replace('.efi', '').replace('.dll', '')
+            for search_dir in symbol_search_paths:
+                for ext in ('.so', '.debug', '.efi'):
+                    for candidate in search_dir.glob(f'**/{stem}*{ext}'):
+                        try:
+                            s = load_symbols(candidate,
+                                             dwarf_prefix=None,
+                                             repo_root=None)
+                            if s.has_debug_info():
+                                extra_sources[mk] = s
+                                log(f"auto-loaded symbols: {candidate.name} for {mod_name}")
+                                break
+                        except Exception:
+                            continue
+                    if mk in extra_sources:
+                        break
+                if mk in extra_sources:
+                    break
+
     # 6. FP chain unwinding: ARM64 formats with raw stack dumps
     fp_unwound = False
     chain: list[tuple[int, int]] = []
@@ -406,8 +434,8 @@ def analyze_rsod(
 
     # 6b. RBP chain unwinding: x86-64 formats with raw stack dumps
     if stack_mem and not chain and getattr(decoder, 'supports_rbp_chain', lambda: False)():
-        rbp = crash_info.registers.get('BP', 0)
-        ret = crash_info.registers.get('IP', 0)
+        rbp = crash_info.registers.get('RBP', crash_info.registers.get('BP', 0))
+        ret = crash_info.registers.get('RIP', crash_info.registers.get('IP', 0))
         if rbp and ret:
             chain = walk_rbp_chain(rbp, ret, stack_mem, stack_base)
             if chain:

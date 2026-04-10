@@ -313,12 +313,14 @@ def _registers_to_dict(regs: dict[str, int]) -> dict:
 # =============================================================================
 
 def create_app(repo_root: Path | None = None,
-               dwarf_prefix: str | None = None) -> Flask:
+               dwarf_prefix: str | None = None,
+               symbol_search_paths: list[Path] | None = None) -> Flask:
     """Create and configure the Flask application."""
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
     app.config['REPO_ROOT'] = repo_root
     app.config['DWARF_PREFIX'] = dwarf_prefix
+    app.config['SYMBOL_SEARCH_PATHS'] = symbol_search_paths
 
     # -----------------------------------------------------------------
     # POST /api/session — upload RSOD + symbols, create session
@@ -386,7 +388,8 @@ def create_app(repo_root: Path | None = None,
                 return jsonify(error=f'invalid base address: {base_str}'), 400
 
         # Analyze using the shared core
-        analysis = analyze_rsod(rsod_text, source, extra_sources, base_override)
+        analysis = analyze_rsod(rsod_text, source, extra_sources, base_override,
+                               symbol_search_paths=app.config['SYMBOL_SEARCH_PATHS'])
 
         # Store session
         session_id = uuid.uuid4().hex[:12]

@@ -25,8 +25,18 @@ from .base import (
 RE_RIP_LINE = re.compile(r'^-->\s*RIP\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
 RE_RIP_LINE_WITH_OFFSET = re.compile(
     r'^-->\s*RIP\s+([0-9A-Fa-f]+)\s+\S+\s+\+([0-9A-Fa-f]+)', re.IGNORECASE)
-RE_UEFI_X86_REG = re.compile(r'([A-Z0-9]{2})=([0-9A-Fa-f]{16})')
+RE_UEFI_X86_REG = re.compile(r'([A-Z0-9]{2,3})=([0-9A-Fa-f]{16})')
 RE_UEFI_X86_TYPE = re.compile(r'^Type:\s*(.+?)\s*Source:', re.IGNORECASE)
+
+# Dell RSOD uses short register names; map to canonical x86-64 names
+_X86_REG_NORMALIZE: dict[str, str] = {
+    'AX': 'RAX', 'BX': 'RBX', 'CX': 'RCX', 'DX': 'RDX',
+    'SI': 'RSI', 'DI': 'RDI', 'BP': 'RBP', 'SP': 'RSP',
+    'IP': 'RIP',
+    '10': 'R10', '11': 'R11', '12': 'R12',
+    '13': 'R13', '14': 'R14', '15': 'R15',
+    'R8': 'R8', 'R9': 'R9',
+}
 RE_X86_FRAME = re.compile(
     r'^\s*(s\d+)\s+([0-9A-Fa-f]+)\s+(\S+\.efi(?:\.efi)?)\s+\+([0-9A-Fa-f]+)')
 RE_X86_LBR = re.compile(
@@ -86,7 +96,8 @@ class UefiX86Decoder(FormatDecoder):
                     info.image_base = abs_addr - offset
 
             for reg, val in RE_UEFI_X86_REG.findall(line):
-                regs[reg] = int(val, 16)
+                canonical = _X86_REG_NORMALIZE.get(reg, reg)
+                regs[canonical] = int(val, 16)
 
             # LBR entries
             lbr_m = RE_X86_LBR.match(line)
@@ -100,7 +111,7 @@ class UefiX86Decoder(FormatDecoder):
 
         info.registers = regs
         info.lbr = lbr_entries
-        info.sp = regs.get('SP', regs.get('RSP'))
+        info.sp = regs.get('RSP')
 
         if info.crash_pc is not None:
             result = table.lookup(info.crash_pc - base_delta)
