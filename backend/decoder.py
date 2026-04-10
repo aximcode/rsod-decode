@@ -383,18 +383,15 @@ def analyze_rsod(
     # 6. FP chain unwinding: ARM64 formats with raw stack dumps
     fp_unwound = False
     chain: list[tuple[int, int]] = []
-    stack_base = 0
-    stack_mem = b''
-    if decoder.supports_fp_chain():
-        stack_base, stack_mem = parse_stack_dump(lines)
-        if stack_mem:
-            fp = crash_info.registers.get('FP', 0)
-            lr = crash_info.registers.get('LR', 0)
-            if fp and lr:
-                chain = walk_fp_chain(fp, lr, stack_mem, stack_base)
-                if chain:
-                    fp_unwound = True
-                    log(f"FP chain: {len(chain)} frames unwound from stack dump")
+    stack_base, stack_mem = parse_stack_dump(lines)
+    if stack_mem and decoder.supports_fp_chain():
+        fp = crash_info.registers.get('FP', 0)
+        lr = crash_info.registers.get('LR', 0)
+        if fp and lr:
+            chain = walk_fp_chain(fp, lr, stack_mem, stack_base)
+            if chain:
+                fp_unwound = True
+                log(f"FP chain: {len(chain)} frames unwound from stack dump")
 
     # 7. Call-site verification via capstone — batch per module
     call_verified: dict[int, bool] = {}
