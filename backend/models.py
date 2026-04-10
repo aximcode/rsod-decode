@@ -73,6 +73,7 @@ class FrameInfo:
     is_crash_frame: bool = False  # True for the crash PC frame (don't adjust)
     call_addr: int = 0  # address - instruction_size for call-site resolution
     frame_fp: int = 0  # this frame's actual FP value (from FP chain walk)
+    frame_cfa: int = 0  # CFA (Canonical Frame Address) from CFI rules
     frame_registers: dict[str, int] = field(default_factory=dict)
 
 

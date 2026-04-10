@@ -426,6 +426,16 @@ def analyze_rsod(
                 break
             frames[i].frame_registers = caller_regs
 
+    # 8c. Compute CFA for each frame (needed for DW_OP_fbreg variables)
+    for f in frames:
+        if f.frame_registers:
+            dwarf = dwarf_for_frame(f, source, extra_sources)
+            if dwarf:
+                unwinder = dwarf.get_cfi_unwinder()
+                if unwinder:
+                    f.frame_cfa = unwinder.compute_cfa(
+                        f.address, f.frame_registers)
+
     # 9. Re-resolve source_loc at call_addr — batch per module
     if frames:
         by_dwarf2: dict[int, tuple[DwarfInfo, list[FrameInfo]]] = {}

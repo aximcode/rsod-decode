@@ -96,6 +96,7 @@ class _FrameCtx:
     frame_fp: int
     is_crash_frame: bool
     has_unwound_regs: bool = False
+    frame_cfa: int = 0
     dwarf: DwarfInfo | None = None
     image_base: int = 0
 
@@ -125,13 +126,15 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
         location = f'{reg} (at entry)'
         if reg in ctx.registers and (ctx.is_crash_frame or ctx.has_unwound_regs):
             value = ctx.registers[reg]
-    # Indirect memory location: [REG+offset] — read from stack dump
+    # Indirect memory location: [REG+offset] or [CFA+offset]
     elif ctx.stack_mem:
         m = _RE_MEM_LOC.match(v.location)
         if m:
             reg = m.group(1)
             off = int(m.group(2)) if m.group(2) else 0
-            if reg == 'FP' and ctx.frame_fp:
+            if reg == 'CFA' and ctx.frame_cfa:
+                base = ctx.frame_cfa
+            elif reg == 'FP' and ctx.frame_fp:
                 base = ctx.frame_fp
             else:
                 base = ctx.registers.get(reg)
@@ -339,6 +342,7 @@ def create_app(repo_root: Path | None = None,
                 frame_fp=frame.frame_fp,
                 is_crash_frame=frame.is_crash_frame,
                 has_unwound_regs=has_unwound,
+                frame_cfa=frame.frame_cfa,
                 dwarf=dwarf,
                 image_base=img_base,
             )

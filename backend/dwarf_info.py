@@ -239,10 +239,10 @@ def _decode_location(loc_expr: list[int] | bytes,
             return f'[{regname}{offset:+d}]', None
         return f'[{regname}]', None
 
-    # DW_OP_fbreg — frame base + offset
+    # DW_OP_fbreg — CFA (Canonical Frame Address) + offset
     if op.op_name == 'DW_OP_fbreg':
         offset = op.args[0] if op.args else 0
-        return f'[FP{offset:+d}]', None
+        return f'[CFA{offset:+d}]', None
 
     # DW_OP_addr — absolute address
     if op.op_name == 'DW_OP_addr':
@@ -307,6 +307,29 @@ class CFIUnwinder:
         if pc < fde['initial_location'] + fde['address_range']:
             return fde
         return None
+
+    def compute_cfa(self, pc: int, registers: dict[str, int]) -> int:
+        """Compute the CFA (Canonical Frame Address) for a given PC and registers."""
+        fde = self._find_fde(pc)
+        if fde is None:
+            return 0
+        decoded = fde.get_decoded()
+        if not decoded.table:
+            return 0
+        best = decoded.table[0]
+        for row in decoded.table:
+            if row['pc'] <= pc:
+                best = row
+            else:
+                break
+        cfa_rule = best['cfa']
+        if cfa_rule.expr is not None:
+            return 0
+        cfa_reg_name = self._reg_names.get(cfa_rule.reg, f'R{cfa_rule.reg}')
+        cfa_base = registers.get(cfa_reg_name)
+        if cfa_base is None:
+            return 0
+        return cfa_base + cfa_rule.offset
 
     def unwind_frame(
         self, pc: int, registers: dict[str, int],
