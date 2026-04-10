@@ -133,6 +133,7 @@ def main() -> None:
             extra_sources=extra_sources,
             rsod_text=rsod_text,
             created_at=datetime.now(timezone.utc).isoformat(),
+            elf_path=args.symbol_file.resolve(),
         ))
 
         _log(f"Session {session_id}: {len(result.frames)} frames, "

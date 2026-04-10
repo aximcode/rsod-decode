@@ -19,8 +19,10 @@ from .models import (
     CrashInfo, FrameInfo, SymbolSource, VarInfo,
     clean_path, dwarf_for_frame, find_source_file, module_key,
 )
+from .corefile import write_corefile
 from .decoder import AnalysisResult, analyze_rsod
 from .dwarf_info import DwarfInfo
+from .gdb_bridge import GdbSession, find_gdb
 from .symbols import SymbolLoadError, load_symbols
 
 
@@ -38,6 +40,8 @@ class Session:
     rsod_text: str = ''
     created_at: str = ''
     temp_dir: Path | None = None
+    elf_path: Path | None = None
+    gdb: GdbSession | None = None
 
     @property
     def img_base(self) -> int:
@@ -631,11 +635,88 @@ def create_app(repo_root: Path | None = None,
         _cleanup_session(session)
         return jsonify(deleted=True)
 
+    # -----------------------------------------------------------------
+    # WebSocket /ws/gdb/<session_id> — GDB terminal bridge
+    # -----------------------------------------------------------------
+    try:
+        from flask_sock import Sock
+        sock = Sock(app)
+
+        @sock.route('/ws/gdb/<session_id>')
+        def gdb_terminal(ws, session_id: str):
+            session = _sessions.get(session_id)
+            if not session:
+                ws.close(reason='session not found')
+                return
+
+            # Launch GDB on first connection (lazy)
+            if not session.gdb and session.elf_path:
+                core_dir = session.temp_dir or Path(tempfile.mkdtemp())
+                if not session.temp_dir:
+                    session.temp_dir = core_dir
+                core_path = core_dir / 'crash.core'
+                write_corefile(
+                    session.result.crash_info.registers,
+                    session.result.crash_info.crash_pc,
+                    session.result.stack_base,
+                    session.result.stack_mem,
+                    session.elf_path,
+                    core_path,
+                    image_base=session.img_base,
+                )
+                session.gdb = GdbSession(
+                    session.elf_path, core_path, session.img_base)
+
+            if not session.gdb:
+                ws.close(reason='GDB not available')
+                return
+
+            gdb = session.gdb
+            import json as _json
+            from simple_websocket import ConnectionClosed
+            try:
+                while gdb.alive:
+                    # Read GDB output → send to browser
+                    output = gdb.read(timeout=0.05)
+                    if output:
+                        ws.send(output)
+
+                    # Read browser input → send to GDB
+                    # receive returns None on timeout, raises
+                    # ConnectionClosed when the client disconnects.
+                    data = ws.receive(timeout=0.05)
+                    if data is None:
+                        continue
+
+                    if isinstance(data, str):
+                        data = data.encode()
+
+                    # Control messages: first byte 0x01
+                    if len(data) > 1 and data[0] == 0x01:
+                        try:
+                            msg = _json.loads(data[1:])
+                            if msg.get('type') == 'frame_select':
+                                gdb.send_command(f'frame {msg["index"]}')
+                            elif msg.get('type') == 'resize':
+                                gdb.resize(msg.get('rows', 24),
+                                           msg.get('cols', 80))
+                        except (ValueError, KeyError):
+                            pass
+                    else:
+                        gdb.write(data)
+            except ConnectionClosed:
+                pass
+    except ImportError:
+        pass  # flask-sock not installed, GDB terminal disabled
+
     return app
 
 
 def _cleanup_session(session: Session) -> None:
-    """Close file handles and remove temp files for a session."""
+    """Close file handles, kill GDB, and remove temp files for a session."""
+    if session.gdb:
+        session.gdb.close()
+        session.gdb = None
     if session.source.dwarf:
         session.source.dwarf.close()
     for src in session.extra_sources.values():
