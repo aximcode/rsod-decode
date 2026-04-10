@@ -22,6 +22,8 @@ from .base import (
 # =============================================================================
 
 RE_PC_LINE = re.compile(r'^-->\s*PC\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
+RE_PC_LINE_WITH_OFFSET = re.compile(
+    r'^-->\s*PC\s+([0-9A-Fa-f]+)\s+\S+\s+\+([0-9A-Fa-f]+)', re.IGNORECASE)
 RE_ARM64_FRAME = re.compile(
     r'^\s*(s\d+)\s+([0-9A-Fa-f]+)\s+(\S+\.efi)\s+\+([0-9A-Fa-f]+)')
 RE_ARM64_REG = re.compile(
@@ -82,6 +84,12 @@ class UefiArm64Decoder(FormatDecoder):
             m = RE_PC_LINE.match(line)
             if m:
                 info.crash_pc = int(m.group(1), 16)
+                # Extract image_base from -->PC ABSADDR Module +OFFSET
+                m2 = RE_PC_LINE_WITH_OFFSET.match(line)
+                if m2:
+                    abs_addr = int(m2.group(1), 16)
+                    offset = int(m2.group(2), 16)
+                    info.image_base = abs_addr - offset
 
             for reg, val in RE_ARM64_REG.findall(line):
                 regs[reg] = int(val, 16)

@@ -50,6 +50,11 @@ class Session:
     def img_base(self) -> int:
         """Runtime image base: maps ELF addresses to runtime addresses."""
         ci = self.result.crash_info
+        # Prefer image_base from the decoder (computed from -->PC/-->RIP
+        # line which has both absolute address and module offset)
+        if ci.image_base:
+            return ci.image_base
+        # Fallback: derive from crash PC and first frame's ELF offset
         f0 = self.result.frames
         if ci.crash_pc and f0 and f0[0].address:
             return ci.crash_pc - f0[0].address

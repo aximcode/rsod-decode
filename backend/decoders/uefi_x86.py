@@ -22,6 +22,8 @@ from .base import (
 # =============================================================================
 
 RE_RIP_LINE = re.compile(r'^-->\s*RIP\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
+RE_RIP_LINE_WITH_OFFSET = re.compile(
+    r'^-->\s*RIP\s+([0-9A-Fa-f]+)\s+\S+\s+\+([0-9A-Fa-f]+)', re.IGNORECASE)
 RE_UEFI_X86_REG = re.compile(r'([A-Z0-9]{2})=([0-9A-Fa-f]{16})')
 RE_UEFI_X86_TYPE = re.compile(r'^Type:\s*(.+?)\s*Source:', re.IGNORECASE)
 RE_X86_FRAME = re.compile(
@@ -74,6 +76,11 @@ class UefiX86Decoder(FormatDecoder):
             m = RE_RIP_LINE.match(line)
             if m:
                 info.crash_pc = int(m.group(1), 16)
+                m2 = RE_RIP_LINE_WITH_OFFSET.match(line)
+                if m2:
+                    abs_addr = int(m2.group(1), 16)
+                    offset = int(m2.group(2), 16)
+                    info.image_base = abs_addr - offset
 
             for reg, val in RE_UEFI_X86_REG.findall(line):
                 regs[reg] = int(val, 16)
