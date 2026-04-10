@@ -428,7 +428,6 @@ def create_app(repo_root: Path | None = None,
                         if d['value'] is None:
                             continue
                         p['value'] = d['value']
-                        p['approximate'] = True
                         if p['is_expandable'] and p['expand_addr'] is None:
                             p['expand_addr'] = d['value']
                         break
