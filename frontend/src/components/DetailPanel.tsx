@@ -190,6 +190,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
 }) {
   const [expanded, setExpanded] = useState(false)
   const [children, setChildren] = useState<api.ExpandField[] | null>(null)
+  const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(false)
 
   const canExpand = v.is_expandable && v.expand_addr !== null
@@ -208,11 +209,20 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
     if (children !== null) return
     setLoading(true)
     api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset)
-      .then(r => { setChildren(r.fields); setLoading(false) })
+      .then(r => { setChildren(r.fields); setTotalCount(r.total_count); setLoading(false) })
       .catch(() => { setChildren([]); setLoading(false) })
   }
 
+  const loadMore = () => {
+    if (!children || loading) return
+    setLoading(true)
+    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset, children.length)
+      .then(r => { setChildren([...children, ...r.fields]); setLoading(false) })
+      .catch(() => setLoading(false))
+  }
+
   const indent = depth * 16
+  const hasMore = children !== null && children.length < totalCount
 
   return (
     <>
@@ -224,7 +234,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
               disabled={!canExpand}
               className={`mr-1 w-4 inline-block ${canExpand ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-700 cursor-default'}`}
             >
-              {loading ? '\u00B7' : expanded ? '\u25BC' : '\u25B6'}
+              {loading && !children ? '\u00B7' : expanded ? '\u25BC' : '\u25B6'}
             </button>
           ) : (
             <span className="inline-block w-4 mr-1" />
@@ -247,6 +257,16 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
         <VarRow key={i} v={child} isCrashFrame={isCrashFrame} depth={depth + 1}
                 sessionId={sessionId} frameIndex={frameIndex} />
       ))}
+      {expanded && hasMore && (
+        <tr>
+          <td colSpan={4} className="py-1" style={{ paddingLeft: indent + 20 }}>
+            <button onClick={loadMore} disabled={loading}
+              className="text-xs text-blue-400 hover:text-blue-300 disabled:text-zinc-600">
+              {loading ? 'loading\u2026' : `show more (${children!.length} of ${totalCount})`}
+            </button>
+          </td>
+        </tr>
+      )}
       {expanded && children?.length === 0 && !loading && (
         <tr><td colSpan={4} className="py-1 text-zinc-600 text-xs italic" style={{ paddingLeft: indent + 20 }}>
           memory not available

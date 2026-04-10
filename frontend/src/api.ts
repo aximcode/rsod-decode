@@ -117,8 +117,13 @@ export async function expandVar(
   addr: number,
   typeOffset: number,
   cuOffset: number,
-): Promise<{ fields: ExpandField[] }> {
-  return request(`/api/expand/${sessionId}/${frameIndex}?addr=${addr.toString(16)}&type_offset=${typeOffset}&cu_offset=${cuOffset}`)
+  offset?: number,
+  count?: number,
+): Promise<{ fields: ExpandField[]; total_count: number }> {
+  let url = `/api/expand/${sessionId}/${frameIndex}?addr=${addr.toString(16)}&type_offset=${typeOffset}&cu_offset=${cuOffset}`
+  if (offset !== undefined) url += `&offset=${offset}`
+  if (count !== undefined) url += `&count=${count}`
+  return request(url)
 }
 
 export async function deleteSession(

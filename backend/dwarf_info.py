@@ -111,6 +111,16 @@ def _resolve_type(die: DIE | None, depth: int = 0) -> str:
         if 'DW_AT_type' in die.attributes:
             inner = _resolve_type(
                 die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+            # Include array size if available from DWARF subrange
+            for child in die.iter_children():
+                if child.tag == 'DW_TAG_subrange_type':
+                    cnt = child.attributes.get('DW_AT_count')
+                    ub = child.attributes.get('DW_AT_upper_bound')
+                    if cnt:
+                        return f'{inner}[{cnt.value}]'
+                    if ub:
+                        return f'{inner}[{ub.value + 1}]'
+                    break
             return f'{inner}[]'
         return '?[]'
 
@@ -581,35 +591,38 @@ class DwarfInfo:
         self, type_die: DIE, addr: int,
         stack_base: int = 0, stack_mem: bytes = b'',
         image_base: int = 0,
-    ) -> list[dict]:
+        offset: int = 0, count: int = 32,
+    ) -> tuple[list[dict], int]:
         """Expand a type at a given address into its child fields.
 
         Handles structs/classes (members + inheritance), pointers
         (dereference), arrays (elements), and enums (name lookup).
-        Returns a list of field dicts suitable for the API response.
+        Returns (fields, total_count).
         """
         if type_die is None:
-            return []
+            return [], 0
 
         # Store memory context for internal methods
         self._mem_ctx = (stack_base, stack_mem, image_base)
 
         real = _strip_qualifiers(type_die)
         if real is None:
-            return []
+            return [], 0
         tag = real.tag
 
         if tag in ('DW_TAG_structure_type', 'DW_TAG_class_type',
                     'DW_TAG_union_type'):
-            return self._expand_struct(real, addr)
+            fields = self._expand_struct(real, addr)
+            return fields, len(fields)
 
         if tag == 'DW_TAG_pointer_type':
-            return self._expand_pointer(real, addr)
+            fields = self._expand_pointer(real, addr)
+            return fields, len(fields)
 
         if tag == 'DW_TAG_array_type':
-            return self._expand_array(real, addr)
+            return self._expand_array(real, addr, offset, count)
 
-        return []
+        return [], 0
 
     def _read(self, addr: int, size: int) -> bytes | None:
         """Read memory using the current expand context."""
@@ -695,34 +708,40 @@ class DwarfInfo:
         return [self._make_field('*', type_name, ptr_val, byte_size, target_die)]
 
     def _expand_array(
-        self, die: DIE, addr: int, max_elements: int = 32,
-    ) -> list[dict]:
-        """Expand array elements."""
+        self, die: DIE, addr: int,
+        offset: int = 0, max_elements: int = 32,
+    ) -> tuple[list[dict], int]:
+        """Expand array elements with pagination.
+
+        Returns (fields, total_count).
+        """
         if 'DW_AT_type' not in die.attributes:
-            return []
+            return [], 0
         elem_die = die.get_DIE_from_attribute('DW_AT_type')
         elem_size = _resolve_byte_size(elem_die)
         if elem_size == 0:
-            return []
+            return [], 0
         elem_type = _resolve_type(elem_die)
 
-        count = max_elements
+        total = 0
         for child in die.iter_children():
             if child.tag == 'DW_TAG_subrange_type':
                 ub = child.attributes.get('DW_AT_upper_bound')
                 cnt = child.attributes.get('DW_AT_count')
                 if cnt:
-                    count = min(cnt.value, max_elements)
+                    total = cnt.value
                 elif ub:
-                    count = min(ub.value + 1, max_elements)
+                    total = ub.value + 1
                 break
 
+        start = min(offset, total)
+        end = min(start + max_elements, total)
         fields: list[dict] = []
-        for i in range(count):
+        for i in range(start, end):
             fields.append(self._make_field(
                 f'[{i}]', elem_type, addr + i * elem_size,
                 elem_size, elem_die))
-        return fields
+        return fields, total
 
     def _make_field(
         self, name: str, type_name: str, addr: int,
@@ -736,9 +755,12 @@ class DwarfInfo:
             'DW_TAG_structure_type', 'DW_TAG_class_type',
             'DW_TAG_union_type', 'DW_TAG_array_type')
 
-        # Read scalar value
+        # Read scalar value (arrays use base address, not element data)
+        is_array = real is not None and real.tag == 'DW_TAG_array_type'
         value = None
-        if byte_size > 0 and byte_size <= 8:
+        if is_array:
+            value = addr
+        elif byte_size > 0 and byte_size <= 8:
             value = self._read_i(addr, byte_size)
         elif is_pointer:
             value = self._read_i(addr, 8)

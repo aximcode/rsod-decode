@@ -460,26 +460,28 @@ def create_app(repo_root: Path | None = None,
         cu_offset = request.args.get('cu_offset', type=int)
         if addr is None or type_offset is None or cu_offset is None:
             return jsonify(error='addr, type_offset, cu_offset required'), 400
+        offset = request.args.get('offset', default=0, type=int)
+        count = request.args.get('count', default=32, type=int)
 
         frame = session.result.frames[frame_index]
         dwarf = dwarf_for_frame(
             frame, session.source, session.extra_sources)
         if not dwarf:
-            return jsonify(fields=[])
+            return jsonify(fields=[], total_count=0)
 
         type_die = dwarf.get_type_die(cu_offset, type_offset)
         if not type_die:
-            return jsonify(fields=[])
+            return jsonify(fields=[], total_count=0)
 
         ci = session.result.crash_info
         frames0 = session.result.frames
         img_base = (ci.crash_pc - frames0[0].address
                     if ci.crash_pc and frames0 else 0)
-        fields = dwarf.expand_type(
+        fields, total_count = dwarf.expand_type(
             type_die, addr,
             session.result.stack_base, session.result.stack_mem,
-            img_base)
-        return jsonify(fields=fields)
+            img_base, offset, count)
+        return jsonify(fields=fields, total_count=total_count)
 
     # -----------------------------------------------------------------
     # GET /api/disasm/<session_id>/<frame_index> — disassembly
