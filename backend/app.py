@@ -109,6 +109,26 @@ def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int 
     return int.from_bytes(stack_mem[offset:offset + size], 'little')
 
 
+def _build_frame_ctx(
+    frame: FrameInfo, session: object, img_base: int,
+) -> _FrameCtx:
+    """Build a _FrameCtx for resolving variable values in *frame*."""
+    has_unwound = bool(frame.frame_registers)
+    regs = frame.frame_registers or session.result.crash_info.registers
+    return _FrameCtx(
+        registers=regs,
+        stack_base=session.result.stack_base,
+        stack_mem=session.result.stack_mem,
+        frame_fp=frame.frame_fp,
+        is_crash_frame=frame.is_crash_frame,
+        has_unwound_regs=has_unwound,
+        frame_cfa=frame.frame_cfa,
+        dwarf=dwarf_for_frame(
+            frame, session.source, session.extra_sources),
+        image_base=img_base,
+    )
+
+
 def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
     value = None
     mem_addr: int | None = None  # memory address for expandable types
@@ -343,26 +363,12 @@ def create_app(repo_root: Path | None = None,
         # Use the correct DWARF source for this frame's module
         dwarf = dwarf_for_frame(
             frame, session.source, session.extra_sources)
+        ci = session.result.crash_info
+        frames0 = session.result.frames
+        img_base = (ci.crash_pc - frames0[0].address
+                    if ci.crash_pc and frames0 else 0)
         if dwarf and frame.address:
-            # Prefer CFI-unwound per-frame registers over crash registers
-            has_unwound = bool(frame.frame_registers)
-            regs = frame.frame_registers or session.result.crash_info.registers
-            # Compute runtime image base for ELF section reads
-            ci = session.result.crash_info
-            frames0 = session.result.frames
-            img_base = (ci.crash_pc - frames0[0].address
-                        if ci.crash_pc and frames0 else 0)
-            ctx = _FrameCtx(
-                registers=regs,
-                stack_base=session.result.stack_base,
-                stack_mem=session.result.stack_mem,
-                frame_fp=frame.frame_fp,
-                is_crash_frame=frame.is_crash_frame,
-                has_unwound_regs=has_unwound,
-                frame_cfa=frame.frame_cfa,
-                dwarf=dwarf,
-                image_base=img_base,
-            )
+            ctx = _build_frame_ctx(frame, session, img_base)
             # For non-crash frames, use call_addr - 1 for DWARF location
             # lookup.  The return address lands in DW_OP_entry_value ranges
             # (unresolvable for caller-saved regs).  Subtracting 1 from the
@@ -375,6 +381,42 @@ def create_app(repo_root: Path | None = None,
             locals_ = dwarf.get_locals(lookup_pc)
             result['params'] = [_var_to_dict(v, ctx) for v in params]
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
+
+            # Infer unresolved params from ancestor frames.  When a param
+            # is in a caller-saved register or DW_OP_entry_value with no
+            # value, search outer frames for the same-named variable with
+            # a resolved value.  Skip stack-based locations — if the read
+            # failed there, ancestors share the same stack memory.
+            for p in result['params']:
+                if p['value'] is not None:
+                    continue
+                if _RE_MEM_LOC.match(p['location']):
+                    continue
+                for anc_idx in range(frame_index + 1,
+                                     len(session.result.frames)):
+                    anc = session.result.frames[anc_idx]
+                    anc_dwarf = dwarf_for_frame(
+                        anc, session.source, session.extra_sources)
+                    if not anc_dwarf or not anc.address:
+                        continue
+                    anc_pc = anc.address
+                    if not anc.is_crash_frame and anc.call_addr:
+                        anc_pc = anc.call_addr - 1
+                    anc_ctx = _build_frame_ctx(anc, session, img_base)
+                    for var in (*anc_dwarf.get_params(anc_pc),
+                                *anc_dwarf.get_locals(anc_pc)):
+                        if var.name != p['name']:
+                            continue
+                        d = _var_to_dict(var, anc_ctx)
+                        if d['value'] is None:
+                            continue
+                        p['value'] = d['value']
+                        p['approximate'] = True
+                        if p['is_expandable'] and p['expand_addr'] is None:
+                            p['expand_addr'] = d['value']
+                        break
+                    if p['value'] is not None:
+                        break
         else:
             result['params'] = []
             result['locals'] = []
