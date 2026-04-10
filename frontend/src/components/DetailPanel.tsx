@@ -4,6 +4,7 @@ import type { FrameDetail, Instruction, SourceLine, VarInfo } from '../types'
 import { ExpressionEval } from './ExpressionEval'
 import { formatValueWithHex } from './HexAddress'
 import { MemoryView } from './MemoryView'
+import { VarTooltip } from './VarTooltip'
 
 interface Props {
   sessionId: string
@@ -240,6 +241,9 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex, onNavigateMemor
   const [children, setChildren] = useState<api.ExpandField[] | null>(null)
   const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [showTooltip, setShowTooltip] = useState(false)
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const nameRef = useRef<HTMLSpanElement>(null)
 
   const varKey = 'var_key' in v ? (v as { var_key?: string }).var_key : undefined
   const canExpand = v.is_expandable && (v.expand_addr !== null || !!varKey)
@@ -288,8 +292,30 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex, onNavigateMemor
           ) : (
             <span className="inline-block w-4 mr-1" />
           )}
-          <span className="text-yellow-300">{v.name}</span>
+          <span
+            ref={nameRef}
+            className={`text-yellow-300 ${canExpand && !expanded ? 'cursor-help' : ''}`}
+            onMouseEnter={() => {
+              if (!canExpand || expanded) return
+              hoverTimer.current = setTimeout(() => setShowTooltip(true), 300)
+            }}
+            onMouseLeave={() => {
+              if (hoverTimer.current) { clearTimeout(hoverTimer.current); hoverTimer.current = null }
+            }}
+          >{v.name}</span>
           {access && <span className="text-zinc-600 text-xs ml-1">{access}</span>}
+          {showTooltip && canExpand && (
+            <VarTooltip
+              sessionId={sessionId}
+              frameIndex={frameIndex}
+              expandAddr={v.expand_addr}
+              typeOffset={v.type_offset}
+              cuOffset={v.cu_offset}
+              varKey={varKey}
+              anchorRef={nameRef}
+              onClose={() => setShowTooltip(false)}
+            />
+          )}
         </td>
         <td className="py-1.5 pr-4 text-zinc-400">{v.type}</td>
         <td className="py-1.5 pr-4 text-zinc-500">{location}</td>
