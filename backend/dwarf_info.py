@@ -17,6 +17,7 @@ from elftools.dwarf.compileunit import CompileUnit
 from elftools.dwarf.descriptions import (
     describe_form_class, describe_reg_name, set_global_machine_arch,
 )
+from elftools.dwarf.callframe import FDE, RegisterRule
 from elftools.dwarf.dwarf_expr import DWARFExprParser
 from elftools.dwarf.locationlists import LocationParser
 
@@ -201,6 +202,130 @@ def _decode_location(loc_expr: list[int] | bytes,
 
 
 # =============================================================================
+# CFI-based register unwinding
+# =============================================================================
+
+# DWARF register numbers → register name convention, per architecture
+_ARM64_REG_NAMES: dict[int, str] = {
+    **{i: f'X{i}' for i in range(29)},
+    29: 'FP', 30: 'LR', 31: 'SP',
+}
+_ARM64_CALLEE_SAVED = {
+    'X19', 'X20', 'X21', 'X22', 'X23',
+    'X24', 'X25', 'X26', 'X27', 'X28', 'FP',
+}
+
+_X86_64_REG_NAMES: dict[int, str] = {
+    0: 'RAX', 1: 'RDX', 2: 'RCX', 3: 'RBX',
+    4: 'RSI', 5: 'RDI', 6: 'RBP', 7: 'RSP',
+    8: 'R8', 9: 'R9', 10: 'R10', 11: 'R11',
+    12: 'R12', 13: 'R13', 14: 'R14', 15: 'R15',
+    16: 'RIP',
+}
+_X86_64_CALLEE_SAVED = {'RBX', 'RBP', 'R12', 'R13', 'R14', 'R15'}
+
+
+class CFIUnwinder:
+    """Reconstruct per-frame register state using .eh_frame CFI rules.
+
+    Given crash-time registers and stack memory, walks the call chain
+    applying CFI rules at each frame to recover the caller's registers.
+    """
+
+    def __init__(
+        self, fde_list: list[FDE],
+        reg_names: dict[int, str],
+        callee_saved: set[str],
+    ) -> None:
+        self._fdes = sorted(fde_list, key=lambda f: f['initial_location'])
+        self._starts = [f['initial_location'] for f in self._fdes]
+        self._reg_names = reg_names
+        self._callee_saved = callee_saved
+
+    def _find_fde(self, pc: int) -> FDE | None:
+        """Find the FDE covering a given PC via binary search."""
+        import bisect
+        idx = bisect.bisect_right(self._starts, pc) - 1
+        if idx < 0:
+            return None
+        fde = self._fdes[idx]
+        if pc < fde['initial_location'] + fde['address_range']:
+            return fde
+        return None
+
+    def unwind_frame(
+        self, pc: int, registers: dict[str, int],
+        stack_base: int, stack_mem: bytes,
+    ) -> dict[str, int] | None:
+        """Unwind one frame: given register state at `pc`, return caller's registers.
+
+        Returns None if CFI rules are unavailable for this PC.
+        """
+        fde = self._find_fde(pc)
+        if fde is None:
+            return None
+
+        decoded = fde.get_decoded()
+        if not decoded.table:
+            return None
+
+        # Find the last CFI row with row.pc <= pc
+        best = decoded.table[0]
+        for row in decoded.table:
+            if row['pc'] <= pc:
+                best = row
+            else:
+                break
+
+        # Compute CFA (Canonical Frame Address)
+        cfa_rule = best['cfa']
+        if cfa_rule.expr is not None:
+            return None  # CFA expressions not supported yet
+        cfa_reg_name = self._reg_names.get(cfa_rule.reg, f'R{cfa_rule.reg}')
+        cfa_base = registers.get(cfa_reg_name)
+        if cfa_base is None:
+            return None
+        cfa = cfa_base + cfa_rule.offset
+
+        def read_mem(addr: int, size: int = 8) -> int | None:
+            off = addr - stack_base
+            if off < 0 or off + size > len(stack_mem):
+                return None
+            return int.from_bytes(stack_mem[off:off + size], 'little')
+
+        caller_regs: dict[str, int] = {}
+        for key, rule in best.items():
+            if key in ('pc', 'cfa'):
+                continue
+            if not hasattr(rule, 'type'):
+                continue
+            name = self._reg_names.get(key, f'R{key}') if isinstance(key, int) else str(key)
+            if rule.type == RegisterRule.OFFSET:
+                val = read_mem(cfa + rule.arg)
+                if val is not None:
+                    caller_regs[name] = val
+            elif rule.type == RegisterRule.SAME_VALUE:
+                if name in registers:
+                    caller_regs[name] = registers[name]
+            elif rule.type == RegisterRule.REGISTER:
+                src = self._reg_names.get(rule.arg, f'R{rule.arg}')
+                if src in registers:
+                    caller_regs[name] = registers[src]
+
+        # Stack pointer in the caller = CFA (by definition)
+        # Use the CFA's base register name (SP on ARM64, RSP on x86-64)
+        caller_regs[cfa_reg_name] = cfa
+
+        # Callee-saved registers not mentioned in CFI are implicitly
+        # SAME_VALUE (ABI guarantee). Carry them forward.
+        for name in self._callee_saved:
+            if name not in caller_regs and name in registers:
+                caller_regs[name] = registers[name]
+
+        return caller_regs
+
+
+# =============================================================================
 # DwarfInfo class
 # =============================================================================
 
@@ -273,6 +398,25 @@ class DwarfInfo:
     def dwarf_prefix(self) -> str:
         """The detected or configured DWARF path prefix."""
         return self._dwarf_prefix
+
+    def get_cfi_unwinder(self) -> CFIUnwinder | None:
+        """Create a CFI unwinder from .eh_frame data, or None if unavailable."""
+        if not self._dwarf:
+            return None
+        try:
+            fdes = [e for e in self._dwarf.EH_CFI_entries()
+                    if isinstance(e, FDE)]
+        except Exception:
+            return None
+        if not fdes:
+            return None
+        if self._cs_arch == CS_ARCH_ARM64:
+            reg_names = _ARM64_REG_NAMES
+            callee_saved = _ARM64_CALLEE_SAVED
+        else:
+            reg_names = _X86_64_REG_NAMES
+            callee_saved = _X86_64_CALLEE_SAVED
+        return CFIUnwinder(fdes, reg_names, callee_saved)
 
     def _detect_dwarf_prefix(self, repo_root: Path | None) -> str:
         """Auto-detect the DWARF path prefix from CU names.

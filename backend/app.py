@@ -95,6 +95,7 @@ class _FrameCtx:
     stack_mem: bytes
     frame_fp: int
     is_crash_frame: bool
+    has_unwound_regs: bool = False
 
 
 def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int | None:
@@ -113,14 +114,14 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
     # Direct register location
     if v.reg_name and v.reg_name in ctx.registers:
         value = ctx.registers[v.reg_name]
-        if not ctx.is_crash_frame:
+        if not ctx.is_crash_frame and not ctx.has_unwound_regs:
             approximate = True
-    # DW_OP_entry_value — clean up display, but crash-time register
-    # values are meaningless for non-crash frames (clobbered by callees)
+    # DW_OP_entry_value — value at function entry. Only resolvable for
+    # crash frame (registers are exact) or if CFI recovered the register.
     elif (m := _RE_ENTRY_VALUE.search(v.location)):
         reg = m.group(1).upper()
         location = f'{reg} (at entry)'
-        if ctx.is_crash_frame and reg in ctx.registers:
+        if reg in ctx.registers and (ctx.is_crash_frame or ctx.has_unwound_regs):
             value = ctx.registers[reg]
     # Indirect memory location: [REG+offset] — read from stack dump
     elif ctx.stack_mem:
@@ -286,12 +287,16 @@ def create_app(repo_root: Path | None = None,
         dwarf = dwarf_for_frame(
             frame, session.source, session.extra_sources)
         if dwarf and frame.address:
+            # Prefer CFI-unwound per-frame registers over crash registers
+            has_unwound = bool(frame.frame_registers)
+            regs = frame.frame_registers or session.result.crash_info.registers
             ctx = _FrameCtx(
-                registers=session.result.crash_info.registers,
+                registers=regs,
                 stack_base=session.result.stack_base,
                 stack_mem=session.result.stack_mem,
                 frame_fp=frame.frame_fp,
                 is_crash_frame=frame.is_crash_frame,
+                has_unwound_regs=has_unwound,
             )
             params = dwarf.get_params(frame.address)
             locals_ = dwarf.get_locals(frame.address)

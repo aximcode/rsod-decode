@@ -404,6 +404,28 @@ def analyze_rsod(
             if frame_idx < len(frames):
                 frames[frame_idx].frame_fp = fp_val
 
+    # 8b. CFI register unwinding — reconstruct per-frame register state
+    if stack_mem and frames:
+        # Crash frame gets the actual crash registers
+        frames[0].frame_registers = dict(crash_info.registers)
+
+        # Walk forward: each frame's registers are unwound from the previous
+        for i in range(1, len(frames)):
+            prev = frames[i - 1]
+            if not prev.frame_registers:
+                break
+            dwarf = dwarf_for_frame(prev, source, extra_sources)
+            if not dwarf:
+                break
+            unwinder = dwarf.get_cfi_unwinder()
+            if not unwinder:
+                break
+            caller_regs = unwinder.unwind_frame(
+                prev.address, prev.frame_registers, stack_base, stack_mem)
+            if caller_regs is None:
+                break
+            frames[i].frame_registers = caller_regs
+
     # 9. Re-resolve source_loc at call_addr — batch per module
     if frames:
         by_dwarf2: dict[int, tuple[DwarfInfo, list[FrameInfo]]] = {}
