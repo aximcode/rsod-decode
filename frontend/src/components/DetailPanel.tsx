@@ -34,7 +34,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, me
   const prevFrameIndex = useRef<number | null>(null)
   const prevNavId = useRef(0)
 
-  // Reset tab data when frame changes
+  // Reset tab data when frame or backend changes
   useEffect(() => {
     if (frame && frame.index !== prevFrameIndex.current) {
       prevFrameIndex.current = frame.index
@@ -42,6 +42,16 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, me
       setSource(null)
     }
   }, [frame])
+
+  // Force re-fetch when backend switches (same frame, different data)
+  const prevBackend = useRef(backend)
+  useEffect(() => {
+    if (backend !== prevBackend.current) {
+      prevBackend.current = backend
+      setDisasm(null)
+      setSource(null)
+    }
+  }, [backend])
 
   // Handle external memory navigation requests
   useEffect(() => {
@@ -69,7 +79,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, me
       if (!stale) { setDisasm([]); setDisasmLoading(false) }
     })
     return () => { stale = true }
-  }, [activeTab, frame, sessionId, disasm, disasmLoading])
+  }, [activeTab, frame, sessionId, disasm]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch source when tab selected
   useEffect(() => {
@@ -82,7 +92,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, me
       if (!stale) { setSource({ file: '', target_line: 0, lines: [] }); setSourceLoading(false) }
     })
     return () => { stale = true }
-  }, [activeTab, frame, sessionId, source, sourceLoading])
+  }, [activeTab, frame, sessionId, source]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (loading) {
     return (
