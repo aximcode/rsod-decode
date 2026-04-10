@@ -756,6 +756,9 @@ class DwarfInfo:
 
         # Expandable if struct, pointer-to-struct, or array
         is_expandable = is_aggregate
+        # For pointer-to-struct, use the target struct type so the expand
+        # endpoint expands the struct directly at the pointer value.
+        expand_die = type_die
         if is_pointer and real is not None and 'DW_AT_type' in real.attributes:
             target = _strip_qualifiers(
                 real.get_DIE_from_attribute('DW_AT_type'))
@@ -763,10 +766,10 @@ class DwarfInfo:
                     'DW_TAG_structure_type', 'DW_TAG_class_type',
                     'DW_TAG_union_type'):
                 is_expandable = True
+                expand_die = target
 
-        # Type DIE offsets for lazy expansion
-        type_offset = type_die.offset if type_die else 0
-        cu_offset = type_die.cu.cu_offset if type_die else 0
+        type_offset = expand_die.offset if expand_die else 0
+        cu_offset = expand_die.cu.cu_offset if expand_die else 0
 
         result: dict = {
             'name': name,

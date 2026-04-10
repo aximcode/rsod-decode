@@ -149,6 +149,8 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
     # Expandability and string preview
     is_expandable = False
     string_preview = None
+    expand_type_offset = v.type_offset
+    expand_cu_offset = v.cu_offset
     if ctx.dwarf and v.type_offset:
         type_die = ctx.dwarf.get_type_die(v.cu_offset, v.type_offset)
         if type_die:
@@ -167,6 +169,8 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
                             'DW_TAG_structure_type', 'DW_TAG_class_type',
                             'DW_TAG_union_type'):
                         is_expandable = True
+                        expand_type_offset = target.offset
+                        expand_cu_offset = target.cu.cu_offset
                 # String preview for char pointers
                 if is_pointer and value and _is_string_type(v.type_name):
                     string_preview = ctx.dwarf.read_string(
@@ -182,8 +186,8 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
         'approximate': approximate,
         'is_expandable': is_expandable,
         'string_preview': string_preview,
-        'type_offset': v.type_offset,
-        'cu_offset': v.cu_offset,
+        'type_offset': expand_type_offset,
+        'cu_offset': expand_cu_offset,
     }
 
 

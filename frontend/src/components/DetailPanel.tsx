@@ -187,13 +187,14 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
   const [children, setChildren] = useState<api.ExpandField[] | null>(null)
   const [loading, setLoading] = useState(false)
 
-  const isExpandable = v.is_expandable && v.value !== null
+  const canExpand = v.is_expandable && v.value !== null
+  const showToggle = v.is_expandable
   const approximate = 'approximate' in v && v.approximate
   const location = 'location' in v ? v.location : ''
   const access = 'access' in v ? (v as api.ExpandField).access : undefined
 
   const toggle = () => {
-    if (!isExpandable) return
+    if (!canExpand) return
     if (expanded) {
       setExpanded(false)
       return
@@ -212,8 +213,12 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
     <>
       <tr className="hover:bg-zinc-800/30">
         <td className="py-1.5 pr-4" style={{ paddingLeft: indent }}>
-          {isExpandable ? (
-            <button onClick={toggle} className="text-zinc-500 hover:text-zinc-300 mr-1 w-4 inline-block">
+          {showToggle ? (
+            <button
+              onClick={toggle}
+              disabled={!canExpand}
+              className={`mr-1 w-4 inline-block ${canExpand ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-700 cursor-default'}`}
+            >
               {loading ? '\u00B7' : expanded ? '\u25BC' : '\u25B6'}
             </button>
           ) : (
