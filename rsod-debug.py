@@ -159,8 +159,10 @@ def main() -> None:
             try:
                 from backend.gdb_backend import GdbBackend
                 # Build frame list for synthetic FP chain in core file
+                # Include ALL frames (even FP=0) so the synthetic builder
+                # can write return addresses for frames beyond the dump
                 frame_data = [(f.frame_fp, f.address)
-                              for f in result.frames if f.frame_fp]
+                              for f in result.frames]
                 sess.gdb_dwarf = GdbBackend(
                     args.symbol_file.resolve(),
                     result.crash_info.registers,

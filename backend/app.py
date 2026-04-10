@@ -701,7 +701,7 @@ def create_app(repo_root: Path | None = None,
                     session.temp_dir = core_dir
                 core_path = core_dir / 'crash.core'
                 frame_data = [(f.frame_fp, f.address)
-                              for f in session.result.frames if f.frame_fp]
+                              for f in session.result.frames]
                 write_corefile(
                     session.result.crash_info.registers,
                     session.result.crash_info.crash_pc,

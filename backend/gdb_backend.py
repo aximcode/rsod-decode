@@ -183,7 +183,7 @@ class GdbBackend:
                 p2 = self._result(f'-data-evaluate-expression (int){v.name}')
                 var.value = _parse_int(p2.get('value', ''))
             # Struct/array: try variable object
-            if val_str.startswith('{') or val_str == '':
+            if val_str.startswith('{') or val_str == '' or var.value is None:
                 try:
                     vk = f'g_{v.name}'
                     if vk in self._var_objects:
@@ -194,9 +194,12 @@ class GdbBackend:
                         var.is_expandable = True
                         var.var_key = vk
                         self._var_objects.add(vk)
-                        # Get address for expand_addr
+                        # Get address for expand_addr and value
                         pa = self._result(f'-data-evaluate-expression &{v.name}')
-                        var.expand_addr = _parse_int(pa.get('value', ''))
+                        addr = _parse_int(pa.get('value', ''))
+                        var.expand_addr = addr
+                        if var.value is None and addr is not None:
+                            var.value = addr
                 except Exception:
                     pass
             results.append(var)
@@ -240,8 +243,8 @@ class GdbBackend:
             except Exception:
                 pass
 
-        # For struct values shown as "{...}", use address as value
-        if val_str.startswith('{') and var.value is None:
+        # For structs/aggregates without a value, get the address
+        if var.is_expandable and var.value is None:
             addr_payload = self._result(
                 f'-data-evaluate-expression &{name}')
             var.value = _parse_int(addr_payload.get('value', ''))
