@@ -120,6 +120,32 @@ def _resolve_type(die: DIE | None, depth: int = 0) -> str:
     return '?'
 
 
+def _resolve_byte_size(die: DIE | None, depth: int = 0) -> int:
+    """Resolve the byte size of a type DIE, following qualifiers/typedefs.
+
+    Pointers always return 8 (ARM64/x86-64). Qualifiers (const, volatile,
+    etc.) are transparent and forward to the underlying type.
+    """
+    if depth > 10 or die is None:
+        return 0
+    tag = die.tag
+
+    # Base types, structs, enums, unions have DW_AT_byte_size directly
+    bs = die.attributes.get('DW_AT_byte_size')
+    if bs is not None:
+        return bs.value
+
+    # Pointers/references are always pointer-sized
+    if tag in ('DW_TAG_pointer_type', 'DW_TAG_reference_type'):
+        return 8
+
+    # Qualifiers and typedefs are transparent — follow DW_AT_type
+    if 'DW_AT_type' in die.attributes:
+        return _resolve_byte_size(
+            die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+    return 0
+
+
 def _decode_location(loc_expr: list[int] | bytes,
                      expr_parser: DWARFExprParser,
                      structs: object | None = None,
@@ -625,10 +651,11 @@ class DwarfInfo:
             name = resolved.attributes.get('DW_AT_name')
             var = VarInfo(name=name.value.decode() if name else '???')
 
-            # Type
+            # Type and byte size
             if 'DW_AT_type' in resolved.attributes:
                 type_die = resolved.get_DIE_from_attribute('DW_AT_type')
                 var.type_name = _resolve_type(type_die)
+                var.byte_size = _resolve_byte_size(type_die)
             else:
                 var.type_name = '?'
 

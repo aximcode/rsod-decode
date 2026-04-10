@@ -109,6 +109,7 @@ class VarInfo:
     type_name: str = ''
     location: str = ''
     reg_name: str | None = None
+    byte_size: int = 0
 
 
 # =============================================================================
@@ -134,6 +135,27 @@ class GitRef:
 def module_key(mod_name: str) -> str:
     """Normalize module name to lookup key (e.g. 'CrashTest.dll' -> 'crashtest')."""
     return re.sub(r'\.(dll|efi|debug|so)$', '', mod_name, flags=re.IGNORECASE).lower()
+
+
+def dwarf_for_frame(
+    frame: FrameInfo,
+    primary: SymbolSource,
+    extra_sources: dict[str, SymbolSource],
+) -> DwarfInfo | None:
+    """Get the correct DwarfInfo for a frame's module.
+
+    Returns None for modules without dedicated symbols to avoid
+    cross-module misresolution.
+    """
+    if frame.module:
+        mk = module_key(frame.module)
+        extra = extra_sources.get(mk)
+        if extra and extra.dwarf:
+            return extra.dwarf
+        if mk == primary.name.lower():
+            return primary.dwarf
+        return None
+    return primary.dwarf
 
 
 # =============================================================================

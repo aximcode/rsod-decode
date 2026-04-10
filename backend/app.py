@@ -17,7 +17,7 @@ from werkzeug.utils import secure_filename
 
 from .models import (
     CrashInfo, FrameInfo, SymbolSource, VarInfo,
-    clean_path, find_source_file, module_key,
+    clean_path, dwarf_for_frame, find_source_file, module_key,
 )
 from .decoder import AnalysisResult, analyze_rsod
 from .dwarf_info import DwarfInfo
@@ -87,6 +87,16 @@ _RE_ENTRY_VALUE = re.compile(
     r'\(DW_OP_entry_value:.*DW_OP_reg\d+\s+\((\w+)\).*DW_OP_stack_value\)')
 
 
+@dataclass
+class _FrameCtx:
+    """Context for resolving variable values within a specific frame."""
+    registers: dict[str, int]
+    stack_base: int
+    stack_mem: bytes
+    frame_fp: int
+    is_crash_frame: bool
+
+
 def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int | None:
     """Read an integer from the stack dump at the given address."""
     offset = addr - stack_base
@@ -95,49 +105,37 @@ def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int 
     return int.from_bytes(stack_mem[offset:offset + size], 'little')
 
 
-def _var_to_dict(
-    v: VarInfo, registers: dict[str, int],
-    stack_base: int = 0, stack_mem: bytes = b'',
-    frame_fp: int = 0,
-    is_crash_frame: bool = False,
-) -> dict:
+def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
     value = None
     location = v.location
     approximate = False
 
     # Direct register location
-    if v.reg_name and v.reg_name in registers:
-        value = registers[v.reg_name]
-        if not is_crash_frame:
+    if v.reg_name and v.reg_name in ctx.registers:
+        value = ctx.registers[v.reg_name]
+        if not ctx.is_crash_frame:
             approximate = True
     # DW_OP_entry_value — clean up display, but crash-time register
     # values are meaningless for non-crash frames (clobbered by callees)
     elif (m := _RE_ENTRY_VALUE.search(v.location)):
         reg = m.group(1).upper()
         location = f'{reg} (at entry)'
-        if is_crash_frame and reg in registers:
-            value = registers[reg]
+        if ctx.is_crash_frame and reg in ctx.registers:
+            value = ctx.registers[reg]
     # Indirect memory location: [REG+offset] — read from stack dump
-    elif stack_mem:
+    elif ctx.stack_mem:
         m = _RE_MEM_LOC.match(v.location)
         if m:
             reg = m.group(1)
             off = int(m.group(2)) if m.group(2) else 0
-            # Use the frame's own FP, not the crash-time register
-            if reg == 'FP' and frame_fp:
-                base = frame_fp
+            if reg == 'FP' and ctx.frame_fp:
+                base = ctx.frame_fp
             else:
-                base = registers.get(reg)
+                base = ctx.registers.get(reg)
             if base is not None:
                 addr = base + off
-                # Guess size from type name
-                if 'int' in v.type_name and '64' not in v.type_name:
-                    size = 4
-                elif 'char' in v.type_name and '*' not in v.type_name:
-                    size = 1
-                else:
-                    size = 8  # pointers, uint64_t, etc.
-                value = _read_stack(addr, size, stack_base, stack_mem)
+                size = v.byte_size or 8
+                value = _read_stack(addr, size, ctx.stack_base, ctx.stack_mem)
     return {
         'name': v.name,
         'type': v.type_name,
@@ -151,30 +149,6 @@ def _var_to_dict(
 def _registers_to_dict(regs: dict[str, int]) -> dict:
     return {k: f'0x{v:X}' for k, v in regs.items()}
 
-
-# =============================================================================
-# Multi-module DWARF lookup helper
-# =============================================================================
-
-def _get_dwarf_for_frame(
-    frame: FrameInfo,
-    source: SymbolSource,
-    extra_sources: dict[str, SymbolSource],
-) -> DwarfInfo | None:
-    """Get the correct DwarfInfo for a frame's module.
-
-    Returns None for modules without dedicated symbols to avoid
-    cross-module misresolution.
-    """
-    if frame.module:
-        mk = module_key(frame.module)
-        extra = extra_sources.get(mk)
-        if extra and extra.dwarf:
-            return extra.dwarf
-        if mk == source.name.lower():
-            return source.dwarf
-        return None
-    return source.dwarf
 
 
 # =============================================================================
@@ -309,20 +283,20 @@ def create_app(repo_root: Path | None = None,
         result: dict = _frame_to_dict(frame)
 
         # Use the correct DWARF source for this frame's module
-        dwarf = _get_dwarf_for_frame(
+        dwarf = dwarf_for_frame(
             frame, session.source, session.extra_sources)
         if dwarf and frame.address:
-            regs = session.result.crash_info.registers
-            sbase = session.result.stack_base
-            smem = session.result.stack_mem
-            ffp = frame.frame_fp
-            crash = frame.is_crash_frame
+            ctx = _FrameCtx(
+                registers=session.result.crash_info.registers,
+                stack_base=session.result.stack_base,
+                stack_mem=session.result.stack_mem,
+                frame_fp=frame.frame_fp,
+                is_crash_frame=frame.is_crash_frame,
+            )
             params = dwarf.get_params(frame.address)
             locals_ = dwarf.get_locals(frame.address)
-            result['params'] = [_var_to_dict(v, regs, sbase, smem, ffp, crash)
-                                for v in params]
-            result['locals'] = [_var_to_dict(v, regs, sbase, smem, ffp, crash)
-                                for v in locals_]
+            result['params'] = [_var_to_dict(v, ctx) for v in params]
+            result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
         else:
             result['params'] = []
             result['locals'] = []
@@ -342,7 +316,7 @@ def create_app(repo_root: Path | None = None,
             return jsonify(error='frame index out of range'), 404
 
         frame = session.result.frames[frame_index]
-        dwarf = _get_dwarf_for_frame(
+        dwarf = dwarf_for_frame(
             frame, session.source, session.extra_sources)
         # Use call_addr for disassembly center and target highlight
         target_addr = frame.call_addr or frame.address

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .models import (
     CrashInfo, FrameInfo, GitRef, MapSymbol, SymbolSource, SymbolTable,
-    VarInfo, clean_path, find_source_file, module_key,
+    VarInfo, clean_path, dwarf_for_frame, find_source_file, module_key,
 )
 from .dwarf_info import DwarfInfo
 from .esr import format_esr
@@ -372,22 +372,12 @@ def analyze_rsod(
                     fp_unwound = True
                     log(f"FP chain: {len(chain)} frames unwound from stack dump")
 
-    # Helper: get the DWARF source for a frame's module (None if unavailable)
-    def _dwarf_for_frame(f: FrameInfo) -> DwarfInfo | None:
-        mk = module_key(f.module) if f.module else ''
-        if mk == default_key:
-            return source.dwarf
-        src = extra_sources.get(mk)
-        if src and src.has_debug_info():
-            return src.dwarf
-        return None
-
     # 7. Call-site verification via capstone — batch per module
     call_verified: dict[int, bool] = {}
     if frames:
         by_dwarf: dict[int, tuple[DwarfInfo, list[int]]] = {}
         for f in frames:
-            dwarf = _dwarf_for_frame(f)
+            dwarf = dwarf_for_frame(f, source, extra_sources)
             if dwarf:
                 key = id(dwarf)
                 if key not in by_dwarf:
@@ -420,7 +410,7 @@ def analyze_rsod(
         for f in frames:
             if f.is_crash_frame:
                 continue
-            dwarf = _dwarf_for_frame(f)
+            dwarf = dwarf_for_frame(f, source, extra_sources)
             if not dwarf:
                 continue
             key = id(dwarf)
