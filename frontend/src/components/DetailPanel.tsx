@@ -127,8 +127,8 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
 
       {/* Tab content */}
       <div className="flex-1 overflow-auto p-4">
-        {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" />}
-        {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" />}
+        {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" sessionId={sessionId} frameIndex={frame.index} />}
+        {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" sessionId={sessionId} frameIndex={frame.index} />}
         {activeTab === 'Disassembly' && <DisassemblyView instructions={disasm} loading={disasmLoading} />}
         {activeTab === 'Source' && <SourceView source={source} loading={sourceLoading} />}
       </div>
@@ -140,7 +140,15 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
 // Shared variable table (Params + Locals)
 // ---------------------------------------------------------------------------
 
-function VarsTable({ vars, isCrashFrame, label }: { vars: VarInfo[]; isCrashFrame: boolean; label: string }) {
+interface VarsTableProps {
+  vars: VarInfo[]
+  isCrashFrame: boolean
+  label: string
+  sessionId: string
+  frameIndex: number
+}
+
+function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex }: VarsTableProps) {
   if (vars.length === 0) {
     return <div className="text-zinc-600 text-sm">No {label} available for this frame</div>
   }
@@ -162,17 +170,78 @@ function VarsTable({ vars, isCrashFrame, label }: { vars: VarInfo[]; isCrashFram
         </thead>
         <tbody className="divide-y divide-zinc-800/50">
           {vars.map((v, i) => (
-            <tr key={i} className="hover:bg-zinc-800/30">
-              <td className="py-1.5 pr-4 text-yellow-300">{v.name}</td>
-              <td className="py-1.5 pr-4 text-zinc-400">{v.type}</td>
-              <td className="py-1.5 pr-4 text-zinc-500">{v.location}</td>
-              <td className={`py-1.5 ${v.approximate ? 'text-zinc-500 italic' : 'text-zinc-200'}`}>
-                {v.approximate && v.value !== null ? '~ ' : ''}{formatValue(v.value)}
-              </td>
-            </tr>
+            <VarRow key={i} v={v} isCrashFrame={isCrashFrame} depth={0}
+                    sessionId={sessionId} frameIndex={frameIndex} />
           ))}
         </tbody>
       </table>
+    </>
+  )
+}
+
+function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
+  v: VarInfo | api.ExpandField; isCrashFrame: boolean; depth: number
+  sessionId: string; frameIndex: number
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [children, setChildren] = useState<api.ExpandField[] | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const isExpandable = v.is_expandable && v.value !== null
+  const approximate = 'approximate' in v && v.approximate
+  const location = 'location' in v ? v.location : ''
+  const access = 'access' in v ? (v as api.ExpandField).access : undefined
+
+  const toggle = () => {
+    if (!isExpandable) return
+    if (expanded) {
+      setExpanded(false)
+      return
+    }
+    setExpanded(true)
+    if (children !== null) return
+    setLoading(true)
+    api.expandVar(sessionId, frameIndex, v.value!, v.type_offset, v.cu_offset)
+      .then(r => { setChildren(r.fields); setLoading(false) })
+      .catch(() => { setChildren([]); setLoading(false) })
+  }
+
+  const indent = depth * 16
+
+  return (
+    <>
+      <tr className="hover:bg-zinc-800/30">
+        <td className="py-1.5 pr-4" style={{ paddingLeft: indent }}>
+          {isExpandable ? (
+            <button onClick={toggle} className="text-zinc-500 hover:text-zinc-300 mr-1 w-4 inline-block">
+              {loading ? '\u00B7' : expanded ? '\u25BC' : '\u25B6'}
+            </button>
+          ) : (
+            <span className="inline-block w-4 mr-1" />
+          )}
+          <span className="text-yellow-300">{v.name}</span>
+          {access && <span className="text-zinc-600 text-xs ml-1">{access}</span>}
+        </td>
+        <td className="py-1.5 pr-4 text-zinc-400">{v.type}</td>
+        <td className="py-1.5 pr-4 text-zinc-500">{location}</td>
+        <td className={`py-1.5 ${approximate ? 'text-zinc-500 italic' : 'text-zinc-200'}`}>
+          {approximate && v.value !== null ? '~ ' : ''}{formatValue(v.value)}
+          {v.string_preview && (
+            <span className="text-green-400 ml-2">
+              &quot;{v.string_preview.length > 48 ? v.string_preview.slice(0, 48) + '\u2026' : v.string_preview}&quot;
+            </span>
+          )}
+        </td>
+      </tr>
+      {expanded && children?.map((child, i) => (
+        <VarRow key={i} v={child} isCrashFrame={isCrashFrame} depth={depth + 1}
+                sessionId={sessionId} frameIndex={frameIndex} />
+      ))}
+      {expanded && children?.length === 0 && !loading && (
+        <tr><td colSpan={4} className="py-1 text-zinc-600 text-xs italic" style={{ paddingLeft: indent + 20 }}>
+          memory not available
+        </td></tr>
+      )}
     </>
   )
 }

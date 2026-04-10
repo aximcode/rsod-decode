@@ -147,6 +147,61 @@ def _resolve_byte_size(die: DIE | None, depth: int = 0) -> int:
     return 0
 
 
+def _strip_qualifiers(die: DIE | None, depth: int = 0) -> DIE | None:
+    """Follow const/volatile/typedef qualifiers to the underlying type."""
+    if depth > 10 or die is None:
+        return None
+    if die.tag in ('DW_TAG_const_type', 'DW_TAG_volatile_type',
+                    'DW_TAG_typedef', 'DW_TAG_restrict_type'):
+        if 'DW_AT_type' in die.attributes:
+            return _strip_qualifiers(
+                die.get_DIE_from_attribute('DW_AT_type'), depth + 1)
+        return None
+    return die
+
+
+def _member_offset(die: DIE) -> int:
+    """Get the byte offset of a struct/class member or base class."""
+    attr = die.attributes.get('DW_AT_data_member_location')
+    if attr is None:
+        return 0
+    if isinstance(attr.value, int):
+        return attr.value
+    # DWARF expression — common case is DW_OP_plus_uconst
+    if isinstance(attr.value, list) and len(attr.value) >= 2:
+        if attr.value[0] == 0x23:  # DW_OP_plus_uconst
+            return attr.value[1]
+    return 0
+
+
+_ACCESS_MAP = {1: 'public', 2: 'protected', 3: 'private'}
+
+
+def _access_str(die: DIE) -> str:
+    """Get accessibility string for a class member."""
+    attr = die.attributes.get('DW_AT_accessibility')
+    if attr:
+        return _ACCESS_MAP.get(attr.value, '')
+    return ''
+
+
+def _is_string_type(type_name: str) -> bool:
+    """Check if a type name represents a C string pointer."""
+    normalized = type_name.replace('const ', '').replace('volatile ', '').strip()
+    return normalized in ('char*', 'CHAR8*', 'unsigned char*', 'signed char*')
+
+
+def _resolve_enum_name(die: DIE, value: int) -> str | None:
+    """Resolve an enum value to its enumerator name."""
+    for child in die.iter_children():
+        if child.tag == 'DW_TAG_enumerator':
+            val_attr = child.attributes.get('DW_AT_const_value')
+            if val_attr and val_attr.value == value:
+                name_attr = child.attributes.get('DW_AT_name')
+                return name_attr.value.decode() if name_attr else None
+    return None
+
+
 def _decode_location(loc_expr: list[int] | bytes,
                      expr_parser: DWARFExprParser,
                      structs: object | None = None,
@@ -385,7 +440,12 @@ class DwarfInfo:
         # Capstone disassembler (cached)
         self._cs = Cs(self._cs_arch, self._cs_mode)
 
-        # Cache .text section for disassembly
+        # Cache ELF sections for memory reads
+        self._sections: list[tuple[int, bytes]] = []  # (base_addr, data)
+        for name in ('.text', '.rodata', '.data'):
+            sec = self._elf.get_section_by_name(name)
+            if sec and sec['sh_size'] > 0:
+                self._sections.append((sec['sh_addr'], sec.data()))
         text_sec = self._elf.get_section_by_name('.text')
         if text_sec:
             self._text_data: bytes = text_sec.data()
@@ -417,6 +477,287 @@ class DwarfInfo:
             reg_names = _X86_64_REG_NAMES
             callee_saved = _X86_64_CALLEE_SAVED
         return CFIUnwinder(fdes, reg_names, callee_saved)
+
+    # -----------------------------------------------------------------
+    # Memory reading (ELF sections + external stack dump)
+    # -----------------------------------------------------------------
+
+    def read_memory(
+        self, addr: int, size: int,
+        stack_base: int = 0, stack_mem: bytes = b'',
+        image_base: int = 0,
+    ) -> bytes | None:
+        """Read `size` bytes from `addr`, checking stack dump then ELF sections.
+
+        For ELF section reads, `image_base` is subtracted from `addr` to
+        translate runtime addresses back to ELF file offsets.
+        """
+        # Try stack dump first (runtime addresses)
+        if stack_mem:
+            off = addr - stack_base
+            if 0 <= off <= len(stack_mem) - size:
+                return stack_mem[off:off + size]
+        # Try ELF sections — translate runtime addr to ELF addr
+        elf_addr = addr - image_base
+        for sec_addr, sec_data in self._sections:
+            off = elf_addr - sec_addr
+            if 0 <= off <= len(sec_data) - size:
+                return sec_data[off:off + size]
+        return None
+
+    def read_int(
+        self, addr: int, size: int,
+        stack_base: int = 0, stack_mem: bytes = b'',
+        image_base: int = 0,
+    ) -> int | None:
+        """Read an integer of `size` bytes from `addr`."""
+        data = self.read_memory(addr, size, stack_base, stack_mem, image_base)
+        if data is None:
+            return None
+        return int.from_bytes(data, 'little')
+
+    def read_string(
+        self, addr: int,
+        stack_base: int = 0, stack_mem: bytes = b'',
+        image_base: int = 0,
+        max_len: int = 256,
+    ) -> str | None:
+        """Read a null-terminated C string from `addr`."""
+        data = self.read_memory(addr, max_len, stack_base, stack_mem, image_base)
+        if data is None:
+            for try_len in (64, 16, 1):
+                data = self.read_memory(
+                    addr, try_len, stack_base, stack_mem, image_base)
+                if data is not None:
+                    break
+            if data is None:
+                return None
+        nul = data.find(b'\0')
+        if nul >= 0:
+            data = data[:nul]
+        try:
+            return data.decode('utf-8', errors='replace')
+        except Exception:
+            return None
+
+    # -----------------------------------------------------------------
+    # Type expansion (structs, classes, pointers, enums, arrays)
+    # -----------------------------------------------------------------
+
+    def get_type_die(self, cu_offset: int, type_offset: int) -> DIE | None:
+        """Look up a type DIE by CU offset and DIE offset."""
+        if not self._dwarf:
+            return None
+        try:
+            cu = self._dwarf.get_CU_at(cu_offset)
+            return cu.get_DIE_from_refaddr(type_offset)
+        except Exception:
+            return None
+
+    def expand_type(
+        self, type_die: DIE, addr: int,
+        stack_base: int = 0, stack_mem: bytes = b'',
+        image_base: int = 0,
+    ) -> list[dict]:
+        """Expand a type at a given address into its child fields.
+
+        Handles structs/classes (members + inheritance), pointers
+        (dereference), arrays (elements), and enums (name lookup).
+        Returns a list of field dicts suitable for the API response.
+        """
+        if type_die is None:
+            return []
+
+        # Store memory context for internal methods
+        self._mem_ctx = (stack_base, stack_mem, image_base)
+
+        real = _strip_qualifiers(type_die)
+        if real is None:
+            return []
+        tag = real.tag
+
+        if tag in ('DW_TAG_structure_type', 'DW_TAG_class_type',
+                    'DW_TAG_union_type'):
+            return self._expand_struct(real, addr)
+
+        if tag == 'DW_TAG_pointer_type':
+            return self._expand_pointer(real, addr)
+
+        if tag == 'DW_TAG_array_type':
+            return self._expand_array(real, addr)
+
+        return []
+
+    def _read(self, addr: int, size: int) -> bytes | None:
+        """Read memory using the current expand context."""
+        sb, sm, ib = self._mem_ctx
+        return self.read_memory(addr, size, sb, sm, ib)
+
+    def _read_i(self, addr: int, size: int) -> int | None:
+        """Read integer using the current expand context."""
+        sb, sm, ib = self._mem_ctx
+        return self.read_int(addr, size, sb, sm, ib)
+
+    def _read_s(self, addr: int, max_len: int = 256) -> str | None:
+        """Read string using the current expand context."""
+        sb, sm, ib = self._mem_ctx
+        return self.read_string(addr, sb, sm, ib, max_len)
+
+    def _expand_struct(self, die: DIE, base_addr: int) -> list[dict]:
+        """Expand struct/class/union members."""
+        fields: list[dict] = []
+
+        for child in die.iter_children():
+            if child.tag == 'DW_TAG_inheritance':
+                if 'DW_AT_type' not in child.attributes:
+                    continue
+                base_die = child.get_DIE_from_attribute('DW_AT_type')
+                base_name = _resolve_type(base_die)
+                offset = _member_offset(child)
+                base_size = _resolve_byte_size(base_die)
+                fields.append(self._make_field(
+                    f'[base: {base_name}]', base_name, base_addr + offset,
+                    base_size, base_die, access=_access_str(child)))
+                continue
+
+            if child.tag != 'DW_TAG_member':
+                continue
+
+            name_attr = child.attributes.get('DW_AT_name')
+            name = name_attr.value.decode() if name_attr else '???'
+
+            if 'DW_AT_type' not in child.attributes:
+                continue
+            member_type = child.get_DIE_from_attribute('DW_AT_type')
+            type_name = _resolve_type(member_type)
+            byte_size = _resolve_byte_size(member_type)
+            offset = _member_offset(child)
+            access = _access_str(child)
+
+            if name.startswith('_vptr'):
+                val = self._read_i(base_addr + offset, 8)
+                fields.append({
+                    'name': 'vtable', 'type': type_name, 'value': val,
+                    'byte_size': 8, 'is_expandable': False,
+                    'string_preview': None, 'type_offset': 0,
+                    'cu_offset': 0, 'access': access,
+                })
+                continue
+
+            fields.append(self._make_field(
+                name, type_name, base_addr + offset,
+                byte_size, member_type, access=access))
+
+        return fields
+
+    def _expand_pointer(self, die: DIE, addr: int) -> list[dict]:
+        """Dereference a pointer and expand the target."""
+        ptr_val = self._read_i(addr, 8)
+        if ptr_val is None or ptr_val == 0:
+            return []
+
+        if 'DW_AT_type' not in die.attributes:
+            return []
+        target_die = die.get_DIE_from_attribute('DW_AT_type')
+        target = _strip_qualifiers(target_die)
+        if target is None:
+            return []
+
+        if target.tag in ('DW_TAG_structure_type', 'DW_TAG_class_type',
+                          'DW_TAG_union_type'):
+            return self._expand_struct(target, ptr_val)
+
+        type_name = _resolve_type(target_die)
+        byte_size = _resolve_byte_size(target_die)
+        return [self._make_field('*', type_name, ptr_val, byte_size, target_die)]
+
+    def _expand_array(
+        self, die: DIE, addr: int, max_elements: int = 32,
+    ) -> list[dict]:
+        """Expand array elements."""
+        if 'DW_AT_type' not in die.attributes:
+            return []
+        elem_die = die.get_DIE_from_attribute('DW_AT_type')
+        elem_size = _resolve_byte_size(elem_die)
+        if elem_size == 0:
+            return []
+        elem_type = _resolve_type(elem_die)
+
+        count = max_elements
+        for child in die.iter_children():
+            if child.tag == 'DW_TAG_subrange_type':
+                ub = child.attributes.get('DW_AT_upper_bound')
+                cnt = child.attributes.get('DW_AT_count')
+                if cnt:
+                    count = min(cnt.value, max_elements)
+                elif ub:
+                    count = min(ub.value + 1, max_elements)
+                break
+
+        fields: list[dict] = []
+        for i in range(count):
+            fields.append(self._make_field(
+                f'[{i}]', elem_type, addr + i * elem_size,
+                elem_size, elem_die))
+        return fields
+
+    def _make_field(
+        self, name: str, type_name: str, addr: int,
+        byte_size: int, type_die: DIE,
+        access: str = '',
+    ) -> dict:
+        """Build a field dict for the API response."""
+        real = _strip_qualifiers(type_die)
+        is_pointer = real is not None and real.tag == 'DW_TAG_pointer_type'
+        is_aggregate = real is not None and real.tag in (
+            'DW_TAG_structure_type', 'DW_TAG_class_type',
+            'DW_TAG_union_type', 'DW_TAG_array_type')
+
+        # Read scalar value
+        value = None
+        if byte_size > 0 and byte_size <= 8:
+            value = self._read_i(addr, byte_size)
+        elif is_pointer:
+            value = self._read_i(addr, 8)
+
+        # String preview for char pointers
+        string_preview = None
+        if is_pointer and value and _is_string_type(type_name):
+            string_preview = self._read_s(value, max_len=64)
+
+        # Enum name resolution
+        if real is not None and real.tag == 'DW_TAG_enumeration_type' and value is not None:
+            enum_name = _resolve_enum_name(real, value)
+            if enum_name:
+                string_preview = enum_name
+
+        # Expandable if struct, pointer-to-struct, or array
+        is_expandable = is_aggregate
+        if is_pointer and real is not None and 'DW_AT_type' in real.attributes:
+            target = _strip_qualifiers(
+                real.get_DIE_from_attribute('DW_AT_type'))
+            if target and target.tag in (
+                    'DW_TAG_structure_type', 'DW_TAG_class_type',
+                    'DW_TAG_union_type'):
+                is_expandable = True
+
+        # Type DIE offsets for lazy expansion
+        type_offset = type_die.offset if type_die else 0
+        cu_offset = type_die.cu.cu_offset if type_die else 0
+
+        result: dict = {
+            'name': name,
+            'type': type_name,
+            'value': value,
+            'byte_size': byte_size,
+            'is_expandable': is_expandable,
+            'string_preview': string_preview,
+            'type_offset': type_offset,
+            'cu_offset': cu_offset,
+        }
+        if access:
+            result['access'] = access
+        return result
 
     def _detect_dwarf_prefix(self, repo_root: Path | None) -> str:
         """Auto-detect the DWARF path prefix from CU names.
@@ -800,6 +1141,8 @@ class DwarfInfo:
                 type_die = resolved.get_DIE_from_attribute('DW_AT_type')
                 var.type_name = _resolve_type(type_die)
                 var.byte_size = _resolve_byte_size(type_die)
+                var.type_offset = type_die.offset
+                var.cu_offset = type_die.cu.cu_offset
             else:
                 var.type_name = '?'
 

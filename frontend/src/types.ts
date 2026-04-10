@@ -32,6 +32,10 @@ export interface VarInfo {
   reg_name: string | null
   value: number | null
   approximate: boolean
+  is_expandable: boolean
+  string_preview: string | null
+  type_offset: number
+  cu_offset: number
 }
 
 export interface FrameDetail extends FrameSummary {

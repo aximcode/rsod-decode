@@ -98,6 +98,28 @@ export async function resolveAddress(
   })
 }
 
+export interface ExpandField {
+  name: string
+  type: string
+  value: number | null
+  byte_size: number
+  is_expandable: boolean
+  string_preview: string | null
+  type_offset: number
+  cu_offset: number
+  access?: string
+}
+
+export async function expandVar(
+  sessionId: string,
+  frameIndex: number,
+  addr: number,
+  typeOffset: number,
+  cuOffset: number,
+): Promise<{ fields: ExpandField[] }> {
+  return request(`/api/expand/${sessionId}/${frameIndex}?addr=${addr.toString(16)}&type_offset=${typeOffset}&cu_offset=${cuOffset}`)
+}
+
 export async function deleteSession(
   sessionId: string,
 ): Promise<{ deleted: boolean }> {

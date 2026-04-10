@@ -96,6 +96,8 @@ class _FrameCtx:
     frame_fp: int
     is_crash_frame: bool
     has_unwound_regs: bool = False
+    dwarf: DwarfInfo | None = None
+    image_base: int = 0
 
 
 def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int | None:
@@ -136,7 +138,38 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
             if base is not None:
                 addr = base + off
                 size = v.byte_size or 8
-                value = _read_stack(addr, size, ctx.stack_base, ctx.stack_mem)
+                if size <= 8:
+                    value = _read_stack(addr, size, ctx.stack_base, ctx.stack_mem)
+                else:
+                    # Aggregate type — store the address, not the data
+                    value = addr
+    # Expandability and string preview
+    is_expandable = False
+    string_preview = None
+    if ctx.dwarf and v.type_offset:
+        type_die = ctx.dwarf.get_type_die(v.cu_offset, v.type_offset)
+        if type_die:
+            from .dwarf_info import _strip_qualifiers, _is_string_type
+            real = _strip_qualifiers(type_die)
+            if real:
+                is_pointer = real.tag == 'DW_TAG_pointer_type'
+                is_aggregate = real.tag in (
+                    'DW_TAG_structure_type', 'DW_TAG_class_type',
+                    'DW_TAG_union_type', 'DW_TAG_array_type')
+                is_expandable = is_aggregate
+                if is_pointer and 'DW_AT_type' in real.attributes:
+                    target = _strip_qualifiers(
+                        real.get_DIE_from_attribute('DW_AT_type'))
+                    if target and target.tag in (
+                            'DW_TAG_structure_type', 'DW_TAG_class_type',
+                            'DW_TAG_union_type'):
+                        is_expandable = True
+                # String preview for char pointers
+                if is_pointer and value and _is_string_type(v.type_name):
+                    string_preview = ctx.dwarf.read_string(
+                        value, ctx.stack_base, ctx.stack_mem,
+                        ctx.image_base, max_len=64)
+
     return {
         'name': v.name,
         'type': v.type_name,
@@ -144,6 +177,10 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
         'reg_name': v.reg_name,
         'value': value,
         'approximate': approximate,
+        'is_expandable': is_expandable,
+        'string_preview': string_preview,
+        'type_offset': v.type_offset,
+        'cu_offset': v.cu_offset,
     }
 
 
@@ -290,6 +327,11 @@ def create_app(repo_root: Path | None = None,
             # Prefer CFI-unwound per-frame registers over crash registers
             has_unwound = bool(frame.frame_registers)
             regs = frame.frame_registers or session.result.crash_info.registers
+            # Compute runtime image base for ELF section reads
+            ci = session.result.crash_info
+            frames0 = session.result.frames
+            img_base = (ci.crash_pc - frames0[0].address
+                        if ci.crash_pc and frames0 else 0)
             ctx = _FrameCtx(
                 registers=regs,
                 stack_base=session.result.stack_base,
@@ -297,6 +339,8 @@ def create_app(repo_root: Path | None = None,
                 frame_fp=frame.frame_fp,
                 is_crash_frame=frame.is_crash_frame,
                 has_unwound_regs=has_unwound,
+                dwarf=dwarf,
+                image_base=img_base,
             )
             params = dwarf.get_params(frame.address)
             locals_ = dwarf.get_locals(frame.address)
@@ -308,6 +352,43 @@ def create_app(repo_root: Path | None = None,
 
         result['call_verified'] = session.result.call_verified.get(frame.address)
         return jsonify(result)
+
+    # -----------------------------------------------------------------
+    # GET /api/expand/<session_id>/<frame_index> — expand variable type
+    # -----------------------------------------------------------------
+    @app.get('/api/expand/<session_id>/<int:frame_index>')
+    def expand_var(session_id: str, frame_index: int):
+        session = _sessions.get(session_id)
+        if not session:
+            return jsonify(error='session not found'), 404
+        if frame_index < 0 or frame_index >= len(session.result.frames):
+            return jsonify(error='frame index out of range'), 404
+
+        addr = request.args.get('addr', type=lambda x: int(x, 16))
+        type_offset = request.args.get('type_offset', type=int)
+        cu_offset = request.args.get('cu_offset', type=int)
+        if addr is None or type_offset is None or cu_offset is None:
+            return jsonify(error='addr, type_offset, cu_offset required'), 400
+
+        frame = session.result.frames[frame_index]
+        dwarf = dwarf_for_frame(
+            frame, session.source, session.extra_sources)
+        if not dwarf:
+            return jsonify(fields=[])
+
+        type_die = dwarf.get_type_die(cu_offset, type_offset)
+        if not type_die:
+            return jsonify(fields=[])
+
+        ci = session.result.crash_info
+        frames0 = session.result.frames
+        img_base = (ci.crash_pc - frames0[0].address
+                    if ci.crash_pc and frames0 else 0)
+        fields = dwarf.expand_type(
+            type_die, addr,
+            session.result.stack_base, session.result.stack_mem,
+            img_base)
+        return jsonify(fields=fields)
 
     # -----------------------------------------------------------------
     # GET /api/disasm/<session_id>/<frame_index> — disassembly

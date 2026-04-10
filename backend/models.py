@@ -111,6 +111,8 @@ class VarInfo:
     location: str = ''
     reg_name: str | None = None
     byte_size: int = 0
+    type_offset: int = 0  # DWARF DIE offset for type expansion
+    cu_offset: int = 0  # compilation unit offset
 
 
 # =============================================================================
