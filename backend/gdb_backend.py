@@ -173,6 +173,14 @@ class GdbBackend:
         var.value = _parse_int(val_str)
         var.string_preview = _extract_string_preview(val_str)
 
+        # Enum values: GDB returns name like "CRASH_MODE_PF" instead of int.
+        # Use the name as string_preview; try to get numeric value via MI.
+        if var.value is None and val_str and re.match(r'^[A-Za-z_]\w*$', val_str):
+            var.string_preview = val_str
+            # Get numeric value via expression evaluation
+            p = self._result(f'-data-evaluate-expression (int){name}')
+            var.value = _parse_int(p.get('value', ''))
+
         # Always try variable objects — GDB knows the real type
         if _is_expandable_type(type_name) or val_str.startswith('{') or val_str == '':
             var_key = f'v_{addr:x}_{name}'
