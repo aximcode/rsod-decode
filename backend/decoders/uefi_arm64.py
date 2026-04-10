@@ -140,9 +140,12 @@ class UefiArm64Decoder(FormatDecoder):
         default_info = line_info_by_module.get(default_module_key, {})
 
         for line in lines:
-            # --> PC line
+            # --> PC line (if we see a second one, reset — dual RSOD capture)
             pc_match = RE_PC_LINE.match(line)
             if pc_match:
+                if frames:
+                    # Second RSOD in the file — keep only the first
+                    break
                 addr = int(pc_match.group(1), 16)
                 ann = lookup_and_annotate(
                     addr - base_delta, table, default_info)
@@ -161,17 +164,26 @@ class UefiArm64Decoder(FormatDecoder):
 
                 mod_key = module_key(module)
                 src = (extra_sources or {}).get(mod_key)
-                use_table = src.table if src else table
+                # Only use primary table for the primary module;
+                # don't resolve other modules against wrong symbols
+                if src:
+                    use_table = src.table
+                elif mod_key == default_module_key:
+                    use_table = table
+                else:
+                    use_table = None
                 use_info = line_info_by_module.get(
                     mod_key, line_info_by_module.get(
                         default_module_key, {}))
 
-                if use_table.preferred_base == 0:
-                    lookup_addr = offset_in_module
-                else:
-                    lookup_addr = use_table.preferred_base + offset_in_module
+                result = None
+                if use_table:
+                    if use_table.preferred_base == 0:
+                        lookup_addr = offset_in_module
+                    else:
+                        lookup_addr = use_table.preferred_base + offset_in_module
+                    result = use_table.lookup(lookup_addr)
 
-                result = use_table.lookup(lookup_addr)
                 if result:
                     sym, off = result
                     loc = source_loc(use_info, offset_in_module)
