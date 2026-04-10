@@ -82,6 +82,9 @@ def _frame_to_dict(f: FrameInfo) -> dict:
 # Pattern for indirect memory locations: [REG+N] or [REG-N] or [REG]
 _RE_MEM_LOC = re.compile(r'^\[(\w+)([+-]\d+)?\]$')
 
+# Pattern for DW_OP_addr (absolute address for globals): 0xADDR
+_RE_ADDR_LOC = re.compile(r'^0x([0-9A-Fa-f]+)$')
+
 # Pattern for DW_OP_entry_value: (DW_OP_reg0 (x0)); DW_OP_stack_value)
 _RE_ENTRY_VALUE = re.compile(
     r'\(DW_OP_entry_value:.*DW_OP_reg\d+\s+\((\w+)\).*DW_OP_stack_value\)')
@@ -147,6 +150,18 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
         location = f'{reg} (at entry)'
         if reg in ctx.registers and (ctx.is_crash_frame or ctx.has_unwound_regs):
             value = ctx.registers[reg]
+    # DW_OP_addr — absolute address (global/static variables in ELF sections)
+    elif (m := _RE_ADDR_LOC.match(v.location)) and ctx.dwarf:
+        elf_addr = int(m.group(1), 16)
+        runtime_addr = elf_addr + ctx.image_base
+        mem_addr = runtime_addr
+        size = v.byte_size or 8
+        if size <= 8:
+            value = ctx.dwarf.read_int(
+                runtime_addr, size,
+                ctx.stack_base, ctx.stack_mem, ctx.image_base)
+        else:
+            value = runtime_addr
     # Indirect memory location: [REG+offset] or [CFA+offset]
     elif ctx.stack_mem:
         m = _RE_MEM_LOC.match(v.location)
@@ -417,9 +432,13 @@ def create_app(repo_root: Path | None = None,
                         break
                     if p['value'] is not None:
                         break
+
+            globals_ = dwarf.get_globals(frame.address)
+            result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
         else:
             result['params'] = []
             result['locals'] = []
+            result['globals'] = []
 
         result['call_verified'] = session.result.call_verified.get(frame.address)
         return jsonify(result)

@@ -1064,6 +1064,38 @@ class DwarfInfo:
             return []
         return self._extract_vars(func_die, 'DW_TAG_variable', addr)
 
+    def get_globals(self, addr: int) -> list[VarInfo]:
+        """Get CU-scope global/static variables for the function at addr."""
+        func_die = self._find_function_die(addr)
+        if not func_die:
+            return []
+        cu = func_die.cu
+        top_die = cu.get_top_DIE()
+        results: list[VarInfo] = []
+        for child in top_die.iter_children():
+            if child.tag != 'DW_TAG_variable':
+                continue
+            var = self._die_to_var_info(child)
+            if not var:
+                continue
+            # Globals have simple DW_OP_addr locations (not location lists)
+            loc_attr = child.attributes.get('DW_AT_location')
+            if loc_attr and self._loc_parser and self._expr_parser:
+                try:
+                    loc_data = self._loc_parser.parse_from_attribute(
+                        loc_attr, cu['version'])
+                    if not isinstance(loc_data, list):
+                        var.location, var.reg_name = _decode_location(
+                            loc_data.loc_expr, self._expr_parser,
+                            self._dwarf.structs)
+                except Exception:
+                    var.location = 'optimized out'
+            else:
+                var.location = 'optimized out'
+            if var.location != 'optimized out':
+                results.append(var)
+        return results
+
     # -----------------------------------------------------------------
     # Internal: CU lookup (cached)
     # -----------------------------------------------------------------
@@ -1156,8 +1188,26 @@ class DwarfInfo:
         return None
 
     # -----------------------------------------------------------------
-    # Internal: variable extraction (shared by params + locals)
+    # Internal: variable extraction (shared by params, locals, globals)
     # -----------------------------------------------------------------
+
+    @staticmethod
+    def _die_to_var_info(child: DIE) -> VarInfo | None:
+        """Extract name, type, and size from a variable/parameter DIE."""
+        resolved = _resolve_die(child)
+        name_attr = resolved.attributes.get('DW_AT_name')
+        if not name_attr:
+            return None
+        var = VarInfo(name=name_attr.value.decode())
+        if 'DW_AT_type' in resolved.attributes:
+            type_die = resolved.get_DIE_from_attribute('DW_AT_type')
+            var.type_name = _resolve_type(type_die)
+            var.byte_size = _resolve_byte_size(type_die)
+            var.type_offset = type_die.offset
+            var.cu_offset = type_die.cu.cu_offset
+        else:
+            var.type_name = '?'
+        return var
 
     def _extract_vars(self, func_die: DIE, tag: str,
                       crash_pc: int) -> list[VarInfo]:
@@ -1169,28 +1219,17 @@ class DwarfInfo:
             if child.tag != tag:
                 continue
 
-            resolved = _resolve_die(child)
-            name = resolved.attributes.get('DW_AT_name')
-            var = VarInfo(name=name.value.decode() if name else '???')
+            var = self._die_to_var_info(child)
+            if not var:
+                continue
 
-            # Type and byte size
-            if 'DW_AT_type' in resolved.attributes:
-                type_die = resolved.get_DIE_from_attribute('DW_AT_type')
-                var.type_name = _resolve_type(type_die)
-                var.byte_size = _resolve_byte_size(type_die)
-                var.type_offset = type_die.offset
-                var.cu_offset = type_die.cu.cu_offset
-            else:
-                var.type_name = '?'
-
-            # Location
+            # Location — may be a location list (PC-dependent)
             loc_attr = child.attributes.get('DW_AT_location')
             if loc_attr and self._loc_parser:
                 try:
                     loc_data = self._loc_parser.parse_from_attribute(
                         loc_attr, cu['version'], func_die)
                     if isinstance(loc_data, list):
-                        # Location list -- find entry valid at crash_pc
                         best = self._pick_location(loc_data, crash_pc, func_die)
                         if best and self._expr_parser:
                             var.location, var.reg_name = _decode_location(

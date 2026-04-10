@@ -23,8 +23,8 @@ function filterVars(vars: VarInfo[]): VarInfo[] {
   return vars.filter(v => v.name !== '???')
 }
 
-type TabId = 'Params' | 'Locals' | 'Disassembly' | 'Source'
-const TABS: TabId[] = ['Params', 'Locals', 'Disassembly', 'Source']
+type TabId = 'Params' | 'Locals' | 'Globals' | 'Disassembly' | 'Source'
+const TABS: TabId[] = ['Params', 'Locals', 'Globals', 'Disassembly', 'Source']
 
 export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: Props) {
   const [activeTab, setActiveTab] = useState<TabId>('Params')
@@ -129,6 +129,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
       <div className="flex-1 overflow-auto p-4">
         {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" sessionId={sessionId} frameIndex={frame.index} />}
         {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" sessionId={sessionId} frameIndex={frame.index} />}
+        {activeTab === 'Globals' && <VarsTable vars={filterVars(frame.globals)} isCrashFrame={isCrashFrame} label="global variables" sessionId={sessionId} frameIndex={frame.index} note="Values are from the ELF image (may differ at runtime)" />}
         {activeTab === 'Disassembly' && <DisassemblyView instructions={disasm} loading={disasmLoading} />}
         {activeTab === 'Source' && <SourceView source={source} loading={sourceLoading} />}
       </div>
@@ -146,15 +147,19 @@ interface VarsTableProps {
   label: string
   sessionId: string
   frameIndex: number
+  note?: string
 }
 
-function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex }: VarsTableProps) {
+function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex, note }: VarsTableProps) {
   if (vars.length === 0) {
     return <div className="text-zinc-600 text-sm">No {label} available for this frame</div>
   }
   return (
     <>
-      {!isCrashFrame && (
+      {note && (
+        <div className="text-xs text-zinc-600 mb-3 italic">{note}</div>
+      )}
+      {!note && !isCrashFrame && (
         <div className="text-xs text-zinc-600 mb-3 italic">
           Register values are from the crash point, not this frame's call site
         </div>

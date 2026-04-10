@@ -42,6 +42,7 @@ export interface VarInfo {
 export interface FrameDetail extends FrameSummary {
   params: VarInfo[]
   locals: VarInfo[]
+  globals: VarInfo[]
   call_verified: boolean | null
 }
 
