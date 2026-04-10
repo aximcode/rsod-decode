@@ -129,7 +129,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
       <div className="flex-1 overflow-auto p-4">
         {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" sessionId={sessionId} frameIndex={frame.index} />}
         {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" sessionId={sessionId} frameIndex={frame.index} />}
-        {activeTab === 'Globals' && <VarsTable vars={filterVars(frame.globals)} isCrashFrame={isCrashFrame} label="global variables" sessionId={sessionId} frameIndex={frame.index} note="Values are from the ELF image (may differ at runtime)" />}
+        {activeTab === 'Globals' && <VarsTable vars={filterVars(frame.globals)} isCrashFrame={isCrashFrame} label="global variables" sessionId={sessionId} frameIndex={frame.index} note="Runtime values not available — expand structs to see initial values from the ELF image" />}
         {activeTab === 'Disassembly' && <DisassemblyView instructions={disasm} loading={disasmLoading} />}
         {activeTab === 'Source' && <SourceView source={source} loading={sourceLoading} />}
       </div>
