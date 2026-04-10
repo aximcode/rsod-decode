@@ -21,7 +21,7 @@ from .models import (
     CrashInfo, FrameInfo, GitRef, MapSymbol, SymbolSource, SymbolTable,
     VarInfo, clean_path, dwarf_for_frame, find_source_file, module_key,
 )
-from .dwarf_info import DwarfInfo
+from .dwarf_backend import DwarfInfo
 from .esr import format_esr
 from .symbols import load_symbols
 from .decoders import FormatDecoder, detect_format

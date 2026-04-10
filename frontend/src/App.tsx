@@ -3,7 +3,7 @@ import { useSession } from './hooks/useSession'
 import { UploadForm } from './components/UploadForm'
 import { CrashBanner } from './components/CrashBanner'
 import { BacktracePanel } from './components/BacktracePanel'
-import { DetailPanel } from './components/DetailPanel'
+import { DetailPanel } from './components/detail'
 import { RegisterPanel } from './components/RegisterPanel'
 import { GdbPanel } from './components/GdbPanel'
 

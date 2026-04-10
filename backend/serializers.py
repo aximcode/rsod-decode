@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .dwarf_info import DwarfInfo, _strip_qualifiers, _is_string_type
+from .dwarf_backend import DwarfInfo, _strip_qualifiers, _is_string_type
 from .models import (
     CrashInfo, FrameInfo, SymbolSource, VarInfo, dwarf_for_frame,
 )

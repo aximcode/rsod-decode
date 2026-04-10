@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .models import MapSymbol, SymbolTable, SymbolSource
-from .dwarf_info import DwarfInfo
+from .dwarf_backend import DwarfInfo
 
 
 class SymbolLoadError(Exception):

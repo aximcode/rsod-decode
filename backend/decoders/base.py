@@ -11,7 +11,16 @@ from ..models import (
     CrashInfo, FrameInfo, MapSymbol, SymbolSource, SymbolTable,
     clean_path, module_key,
 )
-from ..dwarf_info import DwarfInfo
+from ..dwarf_backend import DwarfInfo
+
+# Re-export from submodules for backward compatibility
+from .annotations import (  # noqa: F401
+    annotate_regs, format_annotation, lookup_and_annotate,
+    source_loc,
+)
+from .unwinding import (  # noqa: F401
+    parse_stack_dump, walk_fp_chain, walk_rbp_chain,
+)
 
 
 # =============================================================================
@@ -89,63 +98,8 @@ RE_STACK_DUMP_ADDR = re.compile(r'^\s*>?\s*([0-9A-Fa-f]+):?\s+')
 RE_HEX16 = re.compile(r'\b([0-9A-Fa-f]{16})\b')
 
 
-# =============================================================================
-# Annotation helpers
-# =============================================================================
 
-def format_annotation(
-    sym: MapSymbol, offset: int, source_loc: str = '',
-) -> str:
-    """Format a symbol lookup result for inline annotation."""
-    obj = f"({sym.object_file})" if sym.object_file else ''
-    loc = f"  [{source_loc}]" if source_loc else ''
-    if sym.is_function:
-        return f"<- {sym.name}{obj} + 0x{offset:03X}{loc}"
-    return f"--data-- <- {sym.name}{obj}"
-
-
-def source_loc(
-    line_info: dict[int, list[tuple[str, str]]], addr: int,
-) -> str:
-    """Get the primary source location for an address."""
-    entries = line_info.get(addr, [])
-    return entries[0][1] if entries else ''
-
-
-def lookup_and_annotate(
-    addr: int, table: SymbolTable,
-    line_info: dict[int, list[tuple[str, str]]],
-) -> str | None:
-    """Look up addr, return annotation string or None."""
-    result = table.lookup(addr)
-    if not result:
-        return None
-    sym, offset = result
-    return format_annotation(sym, offset, source_loc(line_info, addr))
-
-
-# =============================================================================
-# Register annotation
-# =============================================================================
-
-def annotate_regs(
-    line: str, patterns: list[re.Pattern[str]],
-    table: SymbolTable, base_delta: int,
-) -> str:
-    """Annotate register values that resolve to symbols."""
-    matches: list[tuple[str, str]] = []
-    for pat in patterns:
-        matches = pat.findall(line)
-        if matches:
-            break
-    if not matches:
-        return line
-    anns: list[str] = []
-    for reg, val_hex in matches:
-        result = table.lookup(int(val_hex, 16) - base_delta)
-        if result:
-            anns.append(f"{reg}={format_annotation(*result)}")
-    return f"{line}  [{', '.join(anns)}]" if anns else line
+# (Annotation helpers moved to annotations.py)
 
 
 # =============================================================================
@@ -389,107 +343,8 @@ def parse_image_table(
     return table
 
 
-def walk_rbp_chain(
-    rbp: int, ret_addr: int, stack_memory: bytes, stack_base: int,
-    max_frames: int = 32,
-) -> list[tuple[int, int]]:
-    """Walk the x86-64 RBP chain through raw stack memory.
 
-    x86-64 frame layout: [RBP] = saved_RBP, [RBP+8] = return_addr.
-    Returns list of (return_address, frame_pointer) tuples.
-    """
-    stack_end = stack_base + len(stack_memory)
-    frames: list[tuple[int, int]] = []
-
-    if ret_addr:
-        frames.append((ret_addr, rbp))
-
-    cur_rbp = rbp
-    for _ in range(max_frames):
-        if cur_rbp == 0 or cur_rbp < stack_base or cur_rbp + 16 > stack_end:
-            break
-        offset = cur_rbp - stack_base
-        saved_rbp = struct.unpack_from('<Q', stack_memory, offset)[0]
-        saved_ret = struct.unpack_from('<Q', stack_memory, offset + 8)[0]
-        if saved_ret == 0:
-            break
-        frames.append((saved_ret, saved_rbp))
-        if saved_rbp <= cur_rbp:
-            break  # RBP must grow (stack grows down, frames go up)
-        cur_rbp = saved_rbp
-
-    return frames
-
-
-# Stack dump parser and FP chain walker (ARM64)
-# =============================================================================
-
-def parse_stack_dump(lines: list[str]) -> tuple[int, bytes]:
-    """Parse hex stack dump lines into a contiguous memory buffer.
-
-    Handles both single-value lines (Dell: ``ADDR  VALUE ...``) and
-    multi-value lines (EDK2: ``ADDR: V1 V2 V3 V4``).
-
-    Returns (base_address, memory_bytes). Gaps are filled with zeros.
-    """
-    entries: list[tuple[int, int]] = []
-    in_dump = False
-    for line in lines:
-        if 'stack dump' in line.lower():
-            in_dump = True
-            continue
-        if not in_dump:
-            continue
-        addr_m = RE_STACK_DUMP_ADDR.match(line)
-        if not addr_m:
-            continue
-        base_addr = int(addr_m.group(1), 16)
-        # Find all 16-hex-digit values after the address
-        rest = line[addr_m.end():]
-        values = RE_HEX16.findall(rest)
-        for i, val_hex in enumerate(values):
-            entries.append((base_addr + i * 8, int(val_hex, 16)))
-
-    if not entries:
-        return 0, b''
-
-    entries.sort(key=lambda x: x[0])
-    base = entries[0][0]
-    end = entries[-1][0] + 8
-    buf = bytearray(end - base)
-    for addr, val in entries:
-        struct.pack_into('<Q', buf, addr - base, val)
-    return base, bytes(buf)
-
-
-def walk_fp_chain(
-    fp: int, lr: int, stack_memory: bytes, stack_base: int,
-    max_frames: int = 32,
-) -> list[tuple[int, int]]:
-    """Walk the ARM64 frame pointer chain through raw stack memory.
-
-    Returns list of (return_address, frame_pointer) tuples.
-    The first entry is the crash LR.
-    """
-    stack_end = stack_base + len(stack_memory)
-    frames: list[tuple[int, int]] = []
-
-    if lr:
-        frames.append((lr, fp))
-
-    for _ in range(max_frames):
-        if fp == 0 or fp < stack_base or fp + 16 > stack_end:
-            break
-        off = fp - stack_base
-        saved_fp = struct.unpack_from('<Q', stack_memory, off)[0]
-        saved_lr = struct.unpack_from('<Q', stack_memory, off + 8)[0]
-        if saved_lr == 0:
-            break
-        frames.append((saved_lr, saved_fp))
-        fp = saved_fp
-
-    return frames
-
+# (Stack dump parser and chain walkers moved to unwinding.py)
 
 # =============================================================================
 # Shared x86 decode logic (used by both UefiX86 and Edk2X64)

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .dwarf_info import DwarfInfo
+    from .dwarf_backend import DwarfInfo
 
 
 # =============================================================================
