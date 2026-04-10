@@ -44,6 +44,7 @@ class Session:
     gdb: GdbSession | None = None
     gdb_dwarf: object | None = None  # GdbBackend instance (alternative DWARF backend)
     backend: str = 'pyelftools'  # 'pyelftools' or 'gdb'
+    frame_cache: dict[int, dict] = field(default_factory=dict)
 
     @property
     def img_base(self) -> int:
@@ -419,6 +420,10 @@ def create_app(repo_root: Path | None = None,
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
+        # Return cached response (static crash data never changes)
+        if frame_index in session.frame_cache:
+            return jsonify(session.frame_cache[frame_index])
+
         frame = session.result.frames[frame_index]
         result: dict = _frame_to_dict(frame)
 
@@ -493,6 +498,7 @@ def create_app(repo_root: Path | None = None,
             result['globals'] = []
 
         result['call_verified'] = session.result.call_verified.get(frame.address)
+        session.frame_cache[frame_index] = result
         return jsonify(result)
 
     # -----------------------------------------------------------------

@@ -114,26 +114,27 @@ class GdbBackend:
             if addr is not None:
                 self._frame_map[addr] = int(f['level'])
 
-    def _select_frame(self, addr: int) -> int | None:
-        """Switch GDB to the frame at the given address.
 
-        Tries the raw address, addr + image_base, and fuzzy match
-        (within ±16 bytes) since app.py may pass call_addr-1.
-        Returns the GDB frame index, or None if not found.
+    def _resolve_frame_idx(self, addr: int) -> int | None:
+        """Resolve an address to a GDB frame index (no GDB command sent).
+
+        Tries raw address, addr + image_base, and fuzzy match (±16 bytes).
         """
-        # Exact match
         for a in (addr, addr + self._image_base):
             if a in self._frame_map:
-                idx = self._frame_map[a]
-                self._cmd(f'-stack-select-frame {idx}')
-                return idx
-        # Fuzzy match (call_addr-1 adjustment)
+                return self._frame_map[a]
         runtime = addr + self._image_base
         for map_addr, idx in self._frame_map.items():
             if abs(map_addr - runtime) <= 16 or abs(map_addr - addr) <= 16:
-                self._cmd(f'-stack-select-frame {idx}')
                 return idx
         return None
+
+    def _select_frame(self, addr: int) -> int | None:
+        """Switch GDB to the frame at addr. Returns frame index."""
+        idx = self._resolve_frame_idx(addr)
+        if idx is not None:
+            self._cmd(f'-stack-select-frame {idx}')
+        return idx
 
     # -----------------------------------------------------------------
     # Variable extraction
@@ -147,9 +148,7 @@ class GdbBackend:
         results: list[VarInfo] = []
         for frame_args in payload.get('stack-args', []):
             for a in frame_args.get('args', []):
-                name = a.get('name', '?')
-                # Skip GDB's @entry variants
-                if '@entry' in name:
+                if '@entry' in a.get('name', ''):
                     continue
                 results.append(self._mi_var_to_varinfo(a, addr))
         return results
@@ -158,7 +157,8 @@ class GdbBackend:
         if self._select_frame(addr) is None:
             return []
         payload = self._result('-stack-list-locals 2')
-        return [self._mi_var_to_varinfo(v, addr) for v in payload.get('locals', [])]
+        return [self._mi_var_to_varinfo(v, addr)
+                for v in payload.get('locals', [])]
 
     def get_globals(self, addr: int) -> list[VarInfo]:
         # GDB can't discover CU-scope globals via MI.  Returns empty;
