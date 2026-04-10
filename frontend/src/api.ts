@@ -104,6 +104,7 @@ export interface ExpandField {
   value: number | null
   byte_size: number
   is_expandable: boolean
+  expand_addr: number | null
   string_preview: string | null
   type_offset: number
   cu_offset: number

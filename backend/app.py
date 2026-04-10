@@ -111,6 +111,7 @@ def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int 
 
 def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
     value = None
+    mem_addr: int | None = None  # memory address for expandable types
     location = v.location
     approximate = False
 
@@ -140,6 +141,7 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
                 base = ctx.registers.get(reg)
             if base is not None:
                 addr = base + off
+                mem_addr = addr
                 size = v.byte_size or 8
                 if size <= 8:
                     value = _read_stack(addr, size, ctx.stack_base, ctx.stack_mem)
@@ -177,6 +179,16 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
                         value, ctx.stack_base, ctx.stack_mem,
                         ctx.image_base, max_len=64)
 
+    # expand_addr: address the frontend passes to /api/expand.
+    # For pointer-to-struct: the pointer value (target address).
+    # For embedded aggregates: the field's memory address.
+    expand_addr: int | None = None
+    if is_expandable:
+        if is_pointer and value is not None:
+            expand_addr = value
+        elif mem_addr is not None:
+            expand_addr = mem_addr
+
     return {
         'name': v.name,
         'type': v.type_name,
@@ -185,6 +197,7 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
         'value': value,
         'approximate': approximate,
         'is_expandable': is_expandable,
+        'expand_addr': expand_addr,
         'string_preview': string_preview,
         'type_offset': expand_type_offset,
         'cu_offset': expand_cu_offset,
@@ -350,8 +363,16 @@ def create_app(repo_root: Path | None = None,
                 dwarf=dwarf,
                 image_base=img_base,
             )
-            params = dwarf.get_params(frame.address)
-            locals_ = dwarf.get_locals(frame.address)
+            # For non-crash frames, use call_addr - 1 for DWARF location
+            # lookup.  The return address lands in DW_OP_entry_value ranges
+            # (unresolvable for caller-saved regs).  Subtracting 1 from the
+            # call instruction address puts us inside the previous range
+            # where the variable is still on the stack (DW_OP_fbreg).
+            lookup_pc = frame.address
+            if not frame.is_crash_frame and frame.call_addr:
+                lookup_pc = frame.call_addr - 1
+            params = dwarf.get_params(lookup_pc)
+            locals_ = dwarf.get_locals(lookup_pc)
             result['params'] = [_var_to_dict(v, ctx) for v in params]
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
         else:

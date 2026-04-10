@@ -187,7 +187,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
   const [children, setChildren] = useState<api.ExpandField[] | null>(null)
   const [loading, setLoading] = useState(false)
 
-  const canExpand = v.is_expandable && v.value !== null
+  const canExpand = v.is_expandable && v.expand_addr !== null
   const showToggle = v.is_expandable
   const approximate = 'approximate' in v && v.approximate
   const location = 'location' in v ? v.location : ''
@@ -202,7 +202,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
     setExpanded(true)
     if (children !== null) return
     setLoading(true)
-    api.expandVar(sessionId, frameIndex, v.value!, v.type_offset, v.cu_offset)
+    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset)
       .then(r => { setChildren(r.fields); setLoading(false) })
       .catch(() => { setChildren([]); setLoading(false) })
   }

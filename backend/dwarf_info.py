@@ -771,12 +771,23 @@ class DwarfInfo:
         type_offset = expand_die.offset if expand_die else 0
         cu_offset = expand_die.cu.cu_offset if expand_die else 0
 
+        # expand_addr: the address the frontend should pass to /api/expand.
+        # For pointer-to-struct: the pointer value (target address).
+        # For embedded structs/arrays: the field's memory address in the parent.
+        expand_addr: int | None = None
+        if is_expandable:
+            if is_pointer and value is not None:
+                expand_addr = value
+            else:
+                expand_addr = addr
+
         result: dict = {
             'name': name,
             'type': type_name,
             'value': value,
             'byte_size': byte_size,
             'is_expandable': is_expandable,
+            'expand_addr': expand_addr,
             'string_preview': string_preview,
             'type_offset': type_offset,
             'cu_offset': cu_offset,
