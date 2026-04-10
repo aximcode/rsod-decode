@@ -151,12 +151,19 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
         if reg in ctx.registers and (ctx.is_crash_frame or ctx.has_unwound_regs):
             value = ctx.registers[reg]
     # DW_OP_addr — absolute address (global/static variables).
-    # We only have ELF initializers, not runtime values, so leave
-    # value as None (--).  Set mem_addr so structs are still expandable
-    # (field layout is useful even without live data).
+    # Values are ELF initializers, not runtime state — mark approximate.
     elif (m := _RE_ADDR_LOC.match(v.location)) and ctx.dwarf:
         elf_addr = int(m.group(1), 16)
-        mem_addr = elf_addr + ctx.image_base
+        runtime_addr = elf_addr + ctx.image_base
+        mem_addr = runtime_addr
+        approximate = True
+        size = v.byte_size or 8
+        if size <= 8:
+            value = ctx.dwarf.read_int(
+                runtime_addr, size,
+                ctx.stack_base, ctx.stack_mem, ctx.image_base)
+        else:
+            value = runtime_addr
     # Indirect memory location: [REG+offset] or [CFA+offset]
     elif ctx.stack_mem:
         m = _RE_MEM_LOC.match(v.location)
