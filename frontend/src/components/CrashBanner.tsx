@@ -1,4 +1,4 @@
-import type { CrashSummary } from '../types'
+import type { CrashSummary, LbrEntry } from '../types'
 
 interface Props {
   crash: CrashSummary
@@ -7,13 +7,14 @@ interface Props {
   gdbAvailable: boolean
   onSwitchBackend: (backend: 'pyelftools' | 'gdb') => void
   backendSwitching: boolean
+  lbr?: LbrEntry[]
 }
 
 function hex(n: number | null): string {
   return n !== null ? `0x${n.toString(16).toUpperCase()}` : '?'
 }
 
-export function CrashBanner({ crash, onNewAnalysis, backend, gdbAvailable, onSwitchBackend, backendSwitching }: Props) {
+export function CrashBanner({ crash, onNewAnalysis, backend, gdbAvailable, onSwitchBackend, backendSwitching, lbr }: Props) {
   const otherBackend = backend === 'gdb' ? 'pyelftools' : 'gdb'
   const canSwitch = backend === 'gdb' || gdbAvailable
 
@@ -57,6 +58,18 @@ export function CrashBanner({ crash, onNewAnalysis, backend, gdbAvailable, onSwi
             {crash.image_name}
             <span className="text-zinc-600 ml-2"> {crash.format}</span>
           </div>
+
+          {lbr && lbr.length > 0 && (
+            <div className="text-zinc-400 text-xs">
+              <span className="text-zinc-500">LBR:</span>{' '}
+              {lbr.map((e, i) => (
+                <span key={i} className="ml-2">
+                  <span className="text-zinc-600">{e.type}</span>{' '}
+                  <span className="text-zinc-300">{e.module}+0x{e.offset.toString(16).toUpperCase()}</span>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col gap-1.5 items-end shrink-0">

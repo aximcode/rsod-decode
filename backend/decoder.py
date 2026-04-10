@@ -29,6 +29,7 @@ from .decoders.base import (
     parse_stack_dump,
     resolve_addresses_dwarf,
     walk_fp_chain,
+    walk_rbp_chain,
 )
 
 
@@ -319,15 +320,25 @@ def _build_module_list(decoder: object) -> list[dict]:
     modules: list[dict] = []
     bases = getattr(decoder, 'module_bases', {})
     table = getattr(decoder, 'module_table', {})
-    for idx in sorted(set(bases) | set(table)):
+    img_table = getattr(decoder, 'image_table', {})
+    for idx in sorted(set(bases) | set(table) | set(img_table)):
         name, base = bases.get(idx, ('', 0))
         debug_path = table.get(idx, '')
+        size = 0
+        if idx in img_table:
+            iname, ibase, isize = img_table[idx]
+            if not name:
+                name = iname
+            if not base:
+                base = ibase
+            size = isize
         if not name and debug_path:
             name = debug_path.rsplit('/', 1)[-1]
         modules.append({
             'index': idx,
             'name': name,
             'base': base,
+            'size': size,
             'debug_path': debug_path,
         })
     return modules
@@ -392,6 +403,16 @@ def analyze_rsod(
             if chain:
                 fp_unwound = True
                 log(f"FP chain: {len(chain)} frames unwound from stack dump")
+
+    # 6b. RBP chain unwinding: x86-64 formats with raw stack dumps
+    if stack_mem and not chain and getattr(decoder, 'supports_rbp_chain', lambda: False)():
+        rbp = crash_info.registers.get('BP', 0)
+        ret = crash_info.registers.get('IP', 0)
+        if rbp and ret:
+            chain = walk_rbp_chain(rbp, ret, stack_mem, stack_base)
+            if chain:
+                fp_unwound = True
+                log(f"RBP chain: {len(chain)} frames unwound from stack dump")
 
     # 7. Call-site verification via capstone — batch per module
     call_verified: dict[int, bool] = {}

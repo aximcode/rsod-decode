@@ -444,6 +444,7 @@ def create_app(repo_root: Path | None = None,
             backend=session.backend,
             gdb_available=_gdb_available(),
             modules=r.modules,
+            lbr=r.crash_info.lbr,
         )
 
     # -----------------------------------------------------------------

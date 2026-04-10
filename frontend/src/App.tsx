@@ -56,6 +56,7 @@ export function App() {
         gdbAvailable={state.data.gdb_available}
         onSwitchBackend={switchBackend}
         backendSwitching={state.frameLoading}
+        lbr={state.data.lbr}
       />
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <BacktracePanel

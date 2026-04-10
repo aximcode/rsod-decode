@@ -91,6 +91,7 @@ class CrashInfo:
     esr: int | None = None
     far: int | None = None
     sp: int | None = None
+    lbr: list[dict] = field(default_factory=list)  # [{type, addr, module, offset}]
 
 
 # =============================================================================

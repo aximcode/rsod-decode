@@ -207,6 +207,76 @@ def resolve_addresses_dwarf(
 
 
 # =============================================================================
+# Image table parser (Dell UEFI formats)
+# =============================================================================
+
+RE_IMAGE_TABLE_ENTRY = re.compile(
+    r'^\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)\s+(\S+)')
+
+def parse_image_table(
+    lines: list[str],
+) -> dict[int, tuple[str, int, int]]:
+    """Parse the EFI Debug Support Table into {index: (name, base, size)}.
+
+    Format:
+        EFI Debug Support Table ...
+          BASE SIZE NAME
+          BASE SIZE NAME
+    """
+    table: dict[int, tuple[str, int, int]] = {}
+    in_table = False
+    idx = 0
+    for line in lines:
+        if 'EFI Debug Support Table' in line and 'TableSize' in line:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        m = RE_IMAGE_TABLE_ENTRY.match(line)
+        if not m:
+            if in_table and line.strip():
+                in_table = False
+            continue
+        base = int(m.group(1), 16)
+        size = int(m.group(2), 16)
+        name = m.group(3)
+        table[idx] = (name, base, size)
+        idx += 1
+    return table
+
+
+def walk_rbp_chain(
+    rbp: int, ret_addr: int, stack_memory: bytes, stack_base: int,
+    max_frames: int = 32,
+) -> list[tuple[int, int]]:
+    """Walk the x86-64 RBP chain through raw stack memory.
+
+    x86-64 frame layout: [RBP] = saved_RBP, [RBP+8] = return_addr.
+    Returns list of (return_address, frame_pointer) tuples.
+    """
+    stack_end = stack_base + len(stack_memory)
+    frames: list[tuple[int, int]] = []
+
+    if ret_addr:
+        frames.append((ret_addr, rbp))
+
+    cur_rbp = rbp
+    for _ in range(max_frames):
+        if cur_rbp == 0 or cur_rbp < stack_base or cur_rbp + 16 > stack_end:
+            break
+        offset = cur_rbp - stack_base
+        saved_rbp = struct.unpack_from('<Q', stack_memory, offset)[0]
+        saved_ret = struct.unpack_from('<Q', stack_memory, offset + 8)[0]
+        if saved_ret == 0:
+            break
+        frames.append((saved_ret, saved_rbp))
+        if saved_rbp <= cur_rbp:
+            break  # RBP must grow (stack grows down, frames go up)
+        cur_rbp = saved_rbp
+
+    return frames
+
+
 # Stack dump parser and FP chain walker (ARM64)
 # =============================================================================
 

@@ -447,6 +447,7 @@ function RsodLogView({ rsodText, modules }: { rsodText?: string; modules?: Modul
                 <th className="pr-3 pb-1">#</th>
                 <th className="pr-3 pb-1">Module</th>
                 <th className="pr-3 pb-1">Base</th>
+                <th className="pr-3 pb-1">Size</th>
                 <th className="pb-1">Debug Path</th>
               </tr>
             </thead>
@@ -456,6 +457,7 @@ function RsodLogView({ rsodText, modules }: { rsodText?: string; modules?: Modul
                   <td className="pr-3 py-0.5 text-zinc-600">{m.index}</td>
                   <td className="pr-3 py-0.5 text-zinc-300">{m.name}</td>
                   <td className="pr-3 py-0.5 text-zinc-500">{m.base ? `0x${m.base.toString(16).toUpperCase()}` : ''}</td>
+                  <td className="pr-3 py-0.5 text-zinc-600">{m.size ? `${(m.size / 1024).toFixed(0)}K` : ''}</td>
                   <td className="py-0.5 text-zinc-600 truncate max-w-xs" title={m.debug_path}>{m.debug_path}</td>
                 </tr>
               ))}

@@ -82,7 +82,15 @@ export interface ModuleInfo {
   index: number
   name: string
   base: number
+  size: number
   debug_path: string
+}
+
+export interface LbrEntry {
+  type: string
+  addr: number
+  module: string
+  offset: number
 }
 
 export interface SessionData {
@@ -96,6 +104,7 @@ export interface SessionData {
   backend: string
   gdb_available: boolean
   modules: ModuleInfo[]
+  lbr: LbrEntry[]
 }
 
 export interface CreateSessionResponse {

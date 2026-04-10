@@ -12,6 +12,7 @@ from .base import (
     format_annotation,
     lookup_and_annotate,
     make_frame,
+    parse_image_table,
     resolve_addresses_dwarf,
     source_loc,
 )
@@ -45,6 +46,7 @@ class UefiX86Decoder(FormatDecoder):
     def __init__(self) -> None:
         self.module_bases: dict[int, tuple[str, int]] = {}
         self.module_table: dict[int, str] = {}
+        self.image_table: dict[int, tuple[str, int, int]] = {}
 
     @staticmethod
     def detect(lines: list[str]) -> bool:
@@ -66,6 +68,7 @@ class UefiX86Decoder(FormatDecoder):
     ) -> CrashInfo:
         info = CrashInfo(fmt=self.name, image_base=table.preferred_base)
         regs: dict[str, int] = {}
+        lbr_entries: list[dict] = []
 
         for line in lines:
             if not info.exception_desc:
@@ -85,7 +88,18 @@ class UefiX86Decoder(FormatDecoder):
             for reg, val in RE_UEFI_X86_REG.findall(line):
                 regs[reg] = int(val, 16)
 
+            # LBR entries
+            lbr_m = RE_X86_LBR.match(line)
+            if lbr_m:
+                lbr_entries.append({
+                    'type': lbr_m.group(1),
+                    'addr': int(lbr_m.group(2), 16),
+                    'module': lbr_m.group(3),
+                    'offset': int(lbr_m.group(4), 16),
+                })
+
         info.registers = regs
+        info.lbr = lbr_entries
         info.sp = regs.get('SP', regs.get('RSP'))
 
         if info.crash_pc is not None:
@@ -219,7 +233,17 @@ class UefiX86Decoder(FormatDecoder):
 
             out.append(line)
 
+        # Parse image table if present
+        img_table = parse_image_table(lines)
+        if img_table:
+            self.module_bases = {
+                i: (name, base) for i, (name, base, _) in img_table.items()}
+            self.image_table = img_table
+
         return out, resolved, frames
 
     def supports_fp_chain(self) -> bool:
         return False
+
+    def supports_rbp_chain(self) -> bool:
+        return True

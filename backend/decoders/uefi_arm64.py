@@ -12,6 +12,7 @@ from .base import (
     format_annotation,
     lookup_and_annotate,
     make_frame,
+    parse_image_table,
     resolve_addresses_dwarf,
     source_loc,
 )
@@ -46,6 +47,7 @@ class UefiArm64Decoder(FormatDecoder):
     def __init__(self) -> None:
         self.module_bases: dict[int, tuple[str, int]] = {}
         self.module_table: dict[int, str] = {}
+        self.image_table: dict[int, tuple[str, int, int]] = {}
 
     @staticmethod
     def detect(lines: list[str]) -> bool:
@@ -236,6 +238,13 @@ class UefiArm64Decoder(FormatDecoder):
                 continue
 
             out.append(line)
+
+        # Parse image table if present (overrides frame-derived modules)
+        img_table = parse_image_table(lines)
+        if img_table:
+            self.module_bases = {
+                i: (name, base) for i, (name, base, _) in img_table.items()}
+            self.image_table = img_table
 
         return out, resolved, frames
 
