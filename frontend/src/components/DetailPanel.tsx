@@ -40,7 +40,6 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
       prevFrameIndex.current = frame.index
       setDisasm(null)
       setSource(null)
-      setActiveTab('Params')
     }
   }, [frame])
 
@@ -167,7 +166,9 @@ function VarsTable({ vars, isCrashFrame, label }: { vars: VarInfo[]; isCrashFram
               <td className="py-1.5 pr-4 text-yellow-300">{v.name}</td>
               <td className="py-1.5 pr-4 text-zinc-400">{v.type}</td>
               <td className="py-1.5 pr-4 text-zinc-500">{v.location}</td>
-              <td className={`py-1.5 ${isCrashFrame ? 'text-zinc-200' : 'text-zinc-500'}`}>{formatValue(v.value)}</td>
+              <td className={`py-1.5 ${v.approximate ? 'text-zinc-500 italic' : 'text-zinc-200'}`}>
+                {v.approximate && v.value !== null ? '~ ' : ''}{formatValue(v.value)}
+              </td>
             </tr>
           ))}
         </tbody>

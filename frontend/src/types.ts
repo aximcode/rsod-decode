@@ -31,6 +31,7 @@ export interface VarInfo {
   location: string
   reg_name: string | null
   value: number | null
+  approximate: boolean
 }
 
 export interface FrameDetail extends FrameSummary {

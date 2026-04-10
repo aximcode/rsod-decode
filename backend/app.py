@@ -4,6 +4,7 @@ Phase 1: In-memory session storage, file uploads to temp dir.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 import uuid
@@ -14,7 +15,10 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from werkzeug.utils import secure_filename
 
-from .models import CrashInfo, FrameInfo, SymbolSource, VarInfo, clean_path, find_source_file
+from .models import (
+    CrashInfo, FrameInfo, SymbolSource, VarInfo,
+    clean_path, find_source_file, module_key,
+)
 from .decoder import AnalysisResult, analyze_rsod
 from .dwarf_info import DwarfInfo
 from .symbols import SymbolLoadError, load_symbols
@@ -75,16 +79,72 @@ def _frame_to_dict(f: FrameInfo) -> dict:
     }
 
 
-def _var_to_dict(v: VarInfo, registers: dict[str, int]) -> dict:
+# Pattern for indirect memory locations: [REG+N] or [REG-N] or [REG]
+_RE_MEM_LOC = re.compile(r'^\[(\w+)([+-]\d+)?\]$')
+
+# Pattern for DW_OP_entry_value: (DW_OP_reg0 (x0)); DW_OP_stack_value)
+_RE_ENTRY_VALUE = re.compile(
+    r'\(DW_OP_entry_value:.*DW_OP_reg\d+\s+\((\w+)\).*DW_OP_stack_value\)')
+
+
+def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int | None:
+    """Read an integer from the stack dump at the given address."""
+    offset = addr - stack_base
+    if offset < 0 or offset + size > len(stack_mem):
+        return None
+    return int.from_bytes(stack_mem[offset:offset + size], 'little')
+
+
+def _var_to_dict(
+    v: VarInfo, registers: dict[str, int],
+    stack_base: int = 0, stack_mem: bytes = b'',
+    frame_fp: int = 0,
+    is_crash_frame: bool = False,
+) -> dict:
     value = None
+    location = v.location
+    approximate = False
+
+    # Direct register location
     if v.reg_name and v.reg_name in registers:
         value = registers[v.reg_name]
+        if not is_crash_frame:
+            approximate = True
+    # DW_OP_entry_value — clean up display, but crash-time register
+    # values are meaningless for non-crash frames (clobbered by callees)
+    elif (m := _RE_ENTRY_VALUE.search(v.location)):
+        reg = m.group(1).upper()
+        location = f'{reg} (at entry)'
+        if is_crash_frame and reg in registers:
+            value = registers[reg]
+    # Indirect memory location: [REG+offset] — read from stack dump
+    elif stack_mem:
+        m = _RE_MEM_LOC.match(v.location)
+        if m:
+            reg = m.group(1)
+            off = int(m.group(2)) if m.group(2) else 0
+            # Use the frame's own FP, not the crash-time register
+            if reg == 'FP' and frame_fp:
+                base = frame_fp
+            else:
+                base = registers.get(reg)
+            if base is not None:
+                addr = base + off
+                # Guess size from type name
+                if 'int' in v.type_name and '64' not in v.type_name:
+                    size = 4
+                elif 'char' in v.type_name and '*' not in v.type_name:
+                    size = 1
+                else:
+                    size = 8  # pointers, uint64_t, etc.
+                value = _read_stack(addr, size, stack_base, stack_mem)
     return {
         'name': v.name,
         'type': v.type_name,
-        'location': v.location,
+        'location': location,
         'reg_name': v.reg_name,
         'value': value,
+        'approximate': approximate,
     }
 
 
@@ -101,12 +161,19 @@ def _get_dwarf_for_frame(
     source: SymbolSource,
     extra_sources: dict[str, SymbolSource],
 ) -> DwarfInfo | None:
-    """Get the correct DwarfInfo for a frame's module."""
+    """Get the correct DwarfInfo for a frame's module.
+
+    Returns None for modules without dedicated symbols to avoid
+    cross-module misresolution.
+    """
     if frame.module:
-        mod_key = frame.module.replace('.efi', '').lower()
-        extra = extra_sources.get(mod_key)
+        mk = module_key(frame.module)
+        extra = extra_sources.get(mk)
         if extra and extra.dwarf:
             return extra.dwarf
+        if mk == source.name.lower():
+            return source.dwarf
+        return None
     return source.dwarf
 
 
@@ -245,11 +312,16 @@ def create_app(repo_root: Path | None = None,
         dwarf = _get_dwarf_for_frame(
             frame, session.source, session.extra_sources)
         if dwarf and frame.address:
+            regs = session.result.crash_info.registers
+            sbase = session.result.stack_base
+            smem = session.result.stack_mem
+            ffp = frame.frame_fp
+            crash = frame.is_crash_frame
             params = dwarf.get_params(frame.address)
             locals_ = dwarf.get_locals(frame.address)
-            result['params'] = [_var_to_dict(v, session.result.crash_info.registers)
+            result['params'] = [_var_to_dict(v, regs, sbase, smem, ffp, crash)
                                 for v in params]
-            result['locals'] = [_var_to_dict(v, session.result.crash_info.registers)
+            result['locals'] = [_var_to_dict(v, regs, sbase, smem, ffp, crash)
                                 for v in locals_]
         else:
             result['params'] = []

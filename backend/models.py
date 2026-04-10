@@ -72,6 +72,7 @@ class FrameInfo:
     inlines: list[tuple[str, str]] = field(default_factory=list)
     is_crash_frame: bool = False  # True for the crash PC frame (don't adjust)
     call_addr: int = 0  # address - instruction_size for call-site resolution
+    frame_fp: int = 0  # this frame's actual FP value (from FP chain walk)
 
 
 @dataclass
@@ -124,6 +125,15 @@ class GitRef:
 
     def label(self) -> str:
         return f"{self.short} ({self.summary})"
+
+
+# =============================================================================
+# Module key normalization (shared across decoders, decoder.py, app.py)
+# =============================================================================
+
+def module_key(mod_name: str) -> str:
+    """Normalize module name to lookup key (e.g. 'CrashTest.dll' -> 'crashtest')."""
+    return re.sub(r'\.(dll|efi|debug|so)$', '', mod_name, flags=re.IGNORECASE).lower()
 
 
 # =============================================================================

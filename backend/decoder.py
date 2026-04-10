@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .models import (
     CrashInfo, FrameInfo, GitRef, MapSymbol, SymbolSource, SymbolTable,
-    VarInfo, clean_path, find_source_file,
+    VarInfo, clean_path, find_source_file, module_key,
 )
 from .dwarf_info import DwarfInfo
 from .esr import format_esr
@@ -307,6 +307,8 @@ class AnalysisResult:
     call_verified: dict[int, bool] = field(default_factory=dict)
     line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]] = field(
         default_factory=dict)
+    stack_base: int = 0
+    stack_mem: bytes = b''
 
 
 # =============================================================================
@@ -370,33 +372,65 @@ def analyze_rsod(
                     fp_unwound = True
                     log(f"FP chain: {len(chain)} frames unwound from stack dump")
 
-    # 7. Call-site verification via capstone (ELF sources only)
+    # Helper: get the DWARF source for a frame's module (None if unavailable)
+    def _dwarf_for_frame(f: FrameInfo) -> DwarfInfo | None:
+        mk = module_key(f.module) if f.module else ''
+        if mk == default_key:
+            return source.dwarf
+        src = extra_sources.get(mk)
+        if src and src.has_debug_info():
+            return src.dwarf
+        return None
+
+    # 7. Call-site verification via capstone — batch per module
     call_verified: dict[int, bool] = {}
-    if source.dwarf and frames:
-        call_verified = verify_call_sites(
-            source.dwarf, [f.address for f in frames])
+    if frames:
+        by_dwarf: dict[int, tuple[DwarfInfo, list[int]]] = {}
+        for f in frames:
+            dwarf = _dwarf_for_frame(f)
+            if dwarf:
+                key = id(dwarf)
+                if key not in by_dwarf:
+                    by_dwarf[key] = (dwarf, [])
+                by_dwarf[key][1].append(f.address)
+        for dwarf, addrs in by_dwarf.values():
+            call_verified.update(verify_call_sites(dwarf, addrs))
 
-    # 8. Compute call_addr for each frame
+    # 8. Compute call_addr and frame_fp for each frame
     insn_size = decoder.insn_size
-
-    # call_addr = address - insn_size for non-crash frames.
-    # f.address is always the module offset, so this works regardless
-    # of whether we used FP chain unwinding or sNN/stack scanning.
     for f in frames:
         if f.index == 0:
             f.is_crash_frame = True
-            f.call_addr = f.address  # crash location, don't adjust
+            f.call_addr = f.address
+            f.frame_fp = crash_info.registers.get('FP', 0)
         else:
             f.call_addr = f.address - insn_size
 
-    # 9. Re-resolve source_loc at call_addr for non-crash frames
-    if source.dwarf and frames:
-        call_addrs = [f.call_addr for f in frames if not f.is_crash_frame]
-        if call_addrs:
-            call_info = resolve_addresses_dwarf(source.dwarf, call_addrs)
-            for f in frames:
-                if f.is_crash_frame:
-                    continue
+    # Assign per-frame FP from the FP chain walk.
+    # chain[i] = (return_addr, frame_pointer) — chain[0] is frame #1's data.
+    if chain and len(frames) > 1:
+        for i, (_, fp_val) in enumerate(chain):
+            frame_idx = i + 1
+            if frame_idx < len(frames):
+                frames[frame_idx].frame_fp = fp_val
+
+    # 9. Re-resolve source_loc at call_addr — batch per module
+    if frames:
+        by_dwarf2: dict[int, tuple[DwarfInfo, list[FrameInfo]]] = {}
+        for f in frames:
+            if f.is_crash_frame:
+                continue
+            dwarf = _dwarf_for_frame(f)
+            if not dwarf:
+                continue
+            key = id(dwarf)
+            if key not in by_dwarf2:
+                by_dwarf2[key] = (dwarf, [])
+            by_dwarf2[key][1].append(f)
+        for dwarf, flist in by_dwarf2.values():
+            call_info = resolve_addresses_dwarf(
+                dwarf, [f.call_addr for f in flist])
+            for f in flist:
                 entry = call_info.get(f.call_addr)
                 if entry:
                     f.source_loc = entry[0][1]
@@ -410,6 +444,8 @@ def analyze_rsod(
         rsod_format=decoder.name,
         call_verified=call_verified,
         line_info_by_module=line_info_by_module,
+        stack_base=stack_base if decoder.supports_fp_chain() else 0,
+        stack_mem=stack_mem if decoder.supports_fp_chain() else b'',
     )
 
 

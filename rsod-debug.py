@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 import uuid
 import webbrowser
@@ -137,18 +138,42 @@ def main() -> None:
         _log(f"Session {session_id}: {len(result.frames)} frames, "
              f"{result.resolved_count} addresses resolved")
 
-    # Build URL
-    host_display = 'localhost' if args.host == '0.0.0.0' else args.host
-    url = f"http://{host_display}:{args.port}"
-    if session_id:
-        url += f"/#session/{session_id}"
+    # Build URLs for all accessible addresses
+    session_hash = f"/#session/{session_id}" if session_id else ""
+    if args.host == '0.0.0.0':
+        urls = [f"http://127.0.0.1:{args.port}{session_hash}"]
+        seen = {'127.0.0.1'}
+        try:
+            for info in socket.getaddrinfo(
+                socket.gethostname(), None, socket.AF_INET,
+            ):
+                addr = info[4][0]
+                if addr not in seen:
+                    seen.add(addr)
+                    urls.append(f"http://{addr}:{args.port}{session_hash}")
+        except socket.gaierror:
+            pass
+        # Also try a UDP connect to find the default route address
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(('8.8.8.8', 80))
+                addr = s.getsockname()[0]
+                if addr not in seen:
+                    seen.add(addr)
+                    urls.append(f"http://{addr}:{args.port}{session_hash}")
+        except OSError:
+            pass
+    else:
+        urls = [f"http://{args.host}:{args.port}{session_hash}"]
 
-    _log(f"\nRSOD Debugger running at: {url}")
+    _log(f"\nRSOD Debugger running at:")
+    for u in urls:
+        _log(f"  {u}")
     _log("Press Ctrl+C to stop\n")
 
     # Open browser
     if not args.no_browser:
-        webbrowser.open(url)
+        webbrowser.open(urls[0])
 
     # Run server
     app.run(host=args.host, port=args.port, debug=False)

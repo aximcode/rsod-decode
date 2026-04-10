@@ -122,6 +122,7 @@ def _resolve_type(die: DIE | None, depth: int = 0) -> str:
 
 def _decode_location(loc_expr: list[int] | bytes,
                      expr_parser: DWARFExprParser,
+                     structs: object | None = None,
                      ) -> tuple[str, str | None]:
     """Decode a DWARF location expression to (description, register_name).
 
@@ -167,8 +168,10 @@ def _decode_location(loc_expr: list[int] | bytes,
         return f'0x{addr:X}', None
 
     # Fallback: use pyelftools' describe for complex expressions
-    from elftools.dwarf.descriptions import describe_DWARF_expr
-    return describe_DWARF_expr(bytes(loc_expr), expr_parser.structs), None
+    if structs is not None:
+        from elftools.dwarf.descriptions import describe_DWARF_expr
+        return describe_DWARF_expr(bytes(loc_expr), structs), None
+    return f'expr[{" ".join(f"{b:02X}" for b in loc_expr)}]', None
 
 
 # =============================================================================
@@ -640,12 +643,12 @@ class DwarfInfo:
                         best = self._pick_location(loc_data, crash_pc, func_die)
                         if best and self._expr_parser:
                             var.location, var.reg_name = _decode_location(
-                                best, self._expr_parser)
+                                best, self._expr_parser, self._dwarf.structs)
                         else:
                             var.location = 'optimized out'
                     elif self._expr_parser:
                         var.location, var.reg_name = _decode_location(
-                            loc_data.loc_expr, self._expr_parser)
+                            loc_data.loc_expr, self._expr_parser, self._dwarf.structs)
                 except Exception as e:
                     var.location = f'error: {e}'
             else:

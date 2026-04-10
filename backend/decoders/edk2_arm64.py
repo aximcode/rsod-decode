@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable
 from typing import ClassVar
 
-from ..models import CrashInfo, FrameInfo, SymbolSource, SymbolTable
+from ..models import CrashInfo, FrameInfo, SymbolSource, SymbolTable, module_key
 from .base import (
     FormatDecoder,
     annotate_regs,
@@ -143,19 +143,24 @@ class Edk2Arm64Decoder(FormatDecoder):
             if m:
                 offset = int(m.group(3), 16)
                 mod_name = m.group(5)
-                mod_key = _module_key(mod_name)
+                mod_key = module_key(mod_name)
                 module_addrs.setdefault(mod_key, []).append(offset)
 
-        # Resolve per-module via DWARF
+        # Resolve per-module via DWARF — only for modules with symbols
         dedicated: dict[str, SymbolSource] = {
             k: v for k, v in extra_sources.items() if v.has_debug_info()}
         for mod_key, addrs in module_addrs.items():
-            mod_src = dedicated.get(mod_key, source)
+            if mod_key in dedicated:
+                mod_src = dedicated[mod_key]
+            elif mod_key == default_key:
+                mod_src = source
+            else:
+                # No symbols for this module — skip resolution
+                continue
             if mod_src.has_debug_info() and mod_src.dwarf:
-                src_key = mod_key if mod_key in dedicated else default_key
                 info = resolve_addresses_dwarf(mod_src.dwarf, addrs)
                 if info:
-                    line_info_by_module.setdefault(src_key, {}).update(info)
+                    line_info_by_module.setdefault(mod_key, {}).update(info)
                     log(f"resolve [{mod_key}]: "
                         f"{len(info)}/{len(addrs)} resolved")
 
@@ -180,21 +185,33 @@ class Edk2Arm64Decoder(FormatDecoder):
             m = RE_EDK2_ARM64_PC_FRAME.match(line)
             if m:
                 offset = int(m.group(3), 16)
+                mod_idx = int(m.group(4))
                 mod_name = m.group(5)
-                mod_key = _module_key(mod_name)
+                mod_key = module_key(mod_name)
 
                 src = (extra_sources or {}).get(mod_key)
-                use_table = src.table if src else table
-                use_info = line_info_by_module.get(
-                    mod_key, line_info_by_module.get(
-                        default_module_key, {}))
+                is_primary = (mod_key == default_module_key)
 
-                if use_table.preferred_base == 0:
-                    lookup_addr = offset
+                if src:
+                    use_table = src.table
+                    use_info = line_info_by_module.get(mod_key, {})
+                elif is_primary:
+                    use_table = table
+                    use_info = line_info_by_module.get(
+                        default_module_key, {})
                 else:
-                    lookup_addr = use_table.preferred_base + offset
+                    # No symbols for this module — don't resolve
+                    use_table = None
+                    use_info = {}
 
-                result = use_table.lookup(lookup_addr)
+                result = None
+                if use_table is not None:
+                    if use_table.preferred_base == 0:
+                        lookup_addr = offset
+                    else:
+                        lookup_addr = use_table.preferred_base + offset
+                    result = use_table.lookup(lookup_addr)
+
                 if result:
                     sym, off = result
                     loc = source_loc(use_info, offset)
@@ -206,9 +223,14 @@ class Edk2Arm64Decoder(FormatDecoder):
                         sym, off, use_info, offset))
                     frame_idx += 1
                 else:
+                    # No symbol — use debug path from module table
+                    debug_path = self.module_table.get(mod_idx, '')
+                    frame = FrameInfo(
+                        index=frame_idx, address=offset, module=mod_name)
+                    if debug_path:
+                        frame.source_loc = debug_path
                     out.append(line)
-                    frames.append(FrameInfo(
-                        index=frame_idx, address=offset, module=mod_name))
+                    frames.append(frame)
                     frame_idx += 1
                 continue
 
@@ -229,10 +251,6 @@ class Edk2Arm64Decoder(FormatDecoder):
 # =============================================================================
 # Helpers
 # =============================================================================
-
-def _module_key(mod_name: str) -> str:
-    """Normalize module name to lookup key (e.g. 'CrashTest.dll' -> 'crashtest')."""
-    return re.sub(r'\.(dll|efi|debug|so)$', '', mod_name, flags=re.IGNORECASE).lower()
 
 
 def _parse_module_table(lines: list[str]) -> dict[int, str]:

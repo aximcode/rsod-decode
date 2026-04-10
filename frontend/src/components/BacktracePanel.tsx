@@ -1,3 +1,4 @@
+import { useCallback, useRef, useState } from 'react'
 import type { FrameSummary } from '../types'
 
 interface Props {
@@ -8,8 +9,32 @@ interface Props {
 }
 
 export function BacktracePanel({ frames, callVerified, selectedIndex, onSelect }: Props) {
+  const [width, setWidth] = useState(320)
+  const widthRef = useRef(320)
+  const startX = useRef(0)
+  const startW = useRef(0)
+  widthRef.current = width
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    startX.current = e.clientX
+    startW.current = widthRef.current
+
+    const onMouseMove = (ev: MouseEvent) => {
+      const newW = Math.max(200, Math.min(800, startW.current + ev.clientX - startX.current))
+      setWidth(newW)
+    }
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+    }
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [])
+
   return (
-    <div className="w-80 shrink-0 border-r border-zinc-800 overflow-y-auto bg-zinc-900">
+    <div className="shrink-0 border-r border-zinc-800 overflow-y-auto bg-zinc-900 relative flex" style={{ width }}>
+      <div className="flex-1 overflow-y-auto">
       <div className="px-3 py-2 border-b border-zinc-800 text-xs text-zinc-500 font-medium uppercase tracking-wider">
         Backtrace ({frames.length} frames)
       </div>
@@ -59,6 +84,12 @@ export function BacktracePanel({ frames, callVerified, selectedIndex, onSelect }
           )
         })}
       </div>
+      </div>
+      {/* Drag handle */}
+      <div
+        onMouseDown={onMouseDown}
+        className="w-1 cursor-col-resize hover:bg-blue-500/50 active:bg-blue-500/70 shrink-0"
+      />
     </div>
   )
 }
