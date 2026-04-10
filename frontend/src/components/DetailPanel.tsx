@@ -193,7 +193,8 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
   const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(false)
 
-  const canExpand = v.is_expandable && v.expand_addr !== null
+  const varKey = 'var_key' in v ? (v as { var_key?: string }).var_key : undefined
+  const canExpand = v.is_expandable && (v.expand_addr !== null || !!varKey)
   const showToggle = v.is_expandable
   const approximate = 'approximate' in v && v.approximate
   const location = 'location' in v ? v.location : ''
@@ -208,8 +209,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
     setExpanded(true)
     if (children !== null) return
     setLoading(true)
-    const vk = 'var_key' in v ? (v as { var_key?: string }).var_key : undefined
-    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset, undefined, undefined, vk)
+    api.expandVar(sessionId, frameIndex, v.expand_addr ?? 0, v.type_offset, v.cu_offset, undefined, undefined, varKey)
       .then(r => { setChildren(r.fields); setTotalCount(r.total_count); setLoading(false) })
       .catch(() => { setChildren([]); setLoading(false) })
   }
@@ -217,8 +217,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
   const loadMore = () => {
     if (!children || loading) return
     setLoading(true)
-    const vk2 = 'var_key' in v ? (v as { var_key?: string }).var_key : undefined
-    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset, children.length, undefined, vk2)
+    api.expandVar(sessionId, frameIndex, v.expand_addr ?? 0, v.type_offset, v.cu_offset, children.length, undefined, varKey)
       .then(r => { setChildren([...children, ...r.fields]); setLoading(false) })
       .catch(() => setLoading(false))
   }
