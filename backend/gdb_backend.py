@@ -76,6 +76,21 @@ class GdbBackend:
         self._var_objects: set[str] = set()  # track created var objects
         self._globals_cache: list[VarInfo] | None = None
 
+        # Track known memory ranges so we can distinguish real zeroes
+        # from unmapped core file regions (which GDB reads as 0)
+        self._valid_ranges: list[tuple[int, int]] = []
+        if stack_mem:
+            self._valid_ranges.append(
+                (stack_base, stack_base + len(stack_mem)))
+        # ELF sections mapped at runtime
+        from elftools.elf.elffile import ELFFile
+        with open(str(elf_path), 'rb') as f:
+            elf = ELFFile(f)
+            for sec in elf.iter_sections():
+                if sec['sh_size'] > 0 and sec['sh_addr'] > 0:
+                    rt = sec['sh_addr'] + image_base
+                    self._valid_ranges.append((rt, rt + sec['sh_size']))
+
         # Generate core file with synthetic FP chain for frames
         # beyond the stack dump
         self._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_gdb_'))
@@ -114,6 +129,13 @@ class GdbBackend:
             if addr is not None:
                 self._frame_map[addr] = int(f['level'])
 
+    def _has_memory(self, addr: int, size: int = 1) -> bool:
+        """Check if addr..addr+size falls within known memory."""
+        end = addr + size
+        for start, rend in self._valid_ranges:
+            if addr >= start and end <= rend:
+                return True
+        return False
 
     def _resolve_frame_idx(self, addr: int) -> int | None:
         """Resolve an address to a GDB frame index (no GDB command sent).
@@ -280,6 +302,11 @@ class GdbBackend:
         if not var_key:
             return [], 0
 
+        # Check if the struct/array base address is in known memory.
+        # The core file fills unmapped regions with zeroes, so GDB
+        # would report 0 for fields that don't actually exist.
+        addr_valid = self._has_memory(addr)
+
         payload = self._result(f'-var-list-children --all-values {var_key}')
         children = payload.get('children', [])
         total = int(payload.get('numchild', len(children)))
@@ -295,19 +322,41 @@ class GdbBackend:
             child_key = ch.get('name', '')  # GDB var object name
             numchild = int(ch.get('numchild', '0'))
 
-            value = _parse_int(child_val_str)
             is_expandable = numchild > 0 or child_val_str == '{...}'
-            string_preview = _extract_string_preview(child_val_str)
 
-            # For expandable children, the var_key is the child's
-            # GDB variable object name
-            expand_addr = value if is_expandable else None
+            if not addr_valid:
+                # Parent struct is outside known memory — values are
+                # zeroed core file padding, not real data
+                value = None
+                string_preview = None
+                expand_addr = None
+            else:
+                value = _parse_int(child_val_str)
+                string_preview = _extract_string_preview(child_val_str)
+
+                # For expandable children with no parseable value (arrays,
+                # embedded structs show "{...}"), resolve the address via GDB
+                expand_addr = value if is_expandable else None
+                if is_expandable and value is None and child_key:
+                    path_payload = self._result(
+                        f'-var-info-path-expression {child_key}')
+                    path_expr = path_payload.get('path_expr', '')
+                    if path_expr:
+                        addr_payload = self._result(
+                            f'-data-evaluate-expression &({path_expr})')
+                        addr_val = _parse_int(
+                            addr_payload.get('value', ''))
+                        if addr_val is not None:
+                            value = addr_val
+                            expand_addr = addr_val
+
+                # Enum resolution: GDB shows "CRASH_MODE_PF" directly
+                if not string_preview and re.match(
+                        r'^[A-Z_]+$', child_val_str):
+                    string_preview = child_val_str
+
             if is_expandable:
                 self._var_objects.add(child_key)
-
-            # Enum resolution: GDB shows "CRASH_MODE_PF" directly
-            if not string_preview and re.match(r'^[A-Z_]+$', child_val_str):
-                string_preview = child_val_str
 
             fields.append({
                 'name': child_name,
@@ -354,13 +403,54 @@ class GdbBackend:
         stack_base: int = 0, stack_mem: bytes = b'',
         image_base: int = 0,
     ) -> bytes | None:
+        if not self._has_memory(addr, size):
+            return None
         payload = self._result(
             f'-data-read-memory 0x{addr:x} x 1 1 {size}')
         mem = payload.get('memory', [])
         if not mem:
             return None
         data = mem[0].get('data', [])
-        return bytes(int(x, 16) & 0xFF for x in data) if data else None
+        if not data:
+            return None
+        try:
+            return bytes(int(x, 16) & 0xFF for x in data)
+        except ValueError:
+            return None
+
+    def read_memory_partial(
+        self, addr: int, size: int,
+        stack_base: int = 0, stack_mem: bytes = b'',
+        image_base: int = 0,
+    ) -> list[int | None]:
+        """Read memory, returning None for unreadable bytes."""
+        result: list[int | None] = [None] * size
+        # Only read bytes within known memory ranges
+        for i in range(size):
+            if self._has_memory(addr + i):
+                result[i] = -1  # placeholder: "should read"
+        # Batch-read contiguous valid ranges via GDB
+        i = 0
+        while i < size:
+            if result[i] != -1:
+                i += 1
+                continue
+            # Find contiguous run of valid bytes
+            j = i
+            while j < size and result[j] == -1:
+                j += 1
+            chunk_size = j - i
+            payload = self._result(
+                f'-data-read-memory 0x{addr + i:x} x 1 1 {chunk_size}')
+            mem = payload.get('memory', [])
+            data = mem[0].get('data', []) if mem else []
+            for k, x in enumerate(data):
+                try:
+                    result[i + k] = int(x, 16) & 0xFF
+                except ValueError:
+                    result[i + k] = None
+            i = j
+        return result
 
     # -----------------------------------------------------------------
     # Disassembly and source

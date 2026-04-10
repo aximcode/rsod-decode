@@ -8,10 +8,16 @@ import { RegisterPanel } from './components/RegisterPanel'
 import { GdbPanel } from './components/GdbPanel'
 
 export function App() {
-  const { state, upload, selectFrame, reset } = useSession()
+  const { state, upload, selectFrame, reset, switchBackend } = useSession()
   const [gdbOpen, setGdbOpen] = useState(false)
   const [gdbHeight, setGdbHeight] = useState(256)
   const dragging = useRef(false)
+  const [memoryNav, setMemoryNav] = useState<{ addr: number; id: number } | null>(null)
+  const navIdRef = useRef(0)
+
+  const navigateToMemory = useCallback((addr: number) => {
+    setMemoryNav({ addr, id: ++navIdRef.current })
+  }, [])
 
   const onDragStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
@@ -43,7 +49,14 @@ export function App() {
 
   return (
     <div className="flex flex-col h-screen">
-      <CrashBanner crash={state.data.crash_summary} onNewAnalysis={reset} />
+      <CrashBanner
+        crash={state.data.crash_summary}
+        onNewAnalysis={reset}
+        backend={state.data.backend}
+        gdbAvailable={state.data.gdb_available}
+        onSwitchBackend={switchBackend}
+        backendSwitching={state.frameLoading}
+      />
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <BacktracePanel
           frames={state.data.frames}
@@ -59,6 +72,8 @@ export function App() {
               loading={state.frameLoading}
               error={state.frameError}
               isCrashFrame={state.selectedFrame === 0}
+              memoryNav={memoryNav}
+              onNavigateMemory={navigateToMemory}
             />
           </div>
           <div
@@ -81,6 +96,7 @@ export function App() {
         <RegisterPanel
           registers={state.data.registers}
           format={state.data.format}
+          onNavigateMemory={navigateToMemory}
         />
       </div>
     </div>

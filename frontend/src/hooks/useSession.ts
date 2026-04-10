@@ -119,6 +119,44 @@ export function useSession() {
     }
   }, [])
 
+  const switchBackend = useCallback(async (backend: 'pyelftools' | 'gdb') => {
+    const sid = sessionIdRef.current
+    if (!sid) return
+
+    setState(prev => {
+      if (prev.status !== 'loaded') return prev
+      return { ...prev, frameLoading: true, frameError: null }
+    })
+
+    try {
+      const result = await api.switchBackend(sid, backend)
+      // Re-fetch current frame with new backend
+      let frameDetail: FrameDetail | null = null
+      let selectedFrame = 0
+      setState(prev => {
+        if (prev.status === 'loaded') selectedFrame = prev.selectedFrame
+        return prev
+      })
+      frameDetail = await api.getFrame(sid, selectedFrame)
+
+      setState(prev => {
+        if (prev.status !== 'loaded') return prev
+        return {
+          ...prev,
+          data: { ...prev.data, backend: result.backend },
+          frameDetail,
+          frameLoading: false,
+          frameError: null,
+        }
+      })
+    } catch (e) {
+      setState(prev => {
+        if (prev.status !== 'loaded') return prev
+        return { ...prev, frameLoading: false, frameError: e instanceof Error ? e.message : String(e) }
+      })
+    }
+  }, [])
+
   const reset = useCallback(async () => {
     const sid = sessionIdRef.current
     sessionIdRef.current = null
@@ -129,5 +167,5 @@ export function useSession() {
     setState({ status: 'idle' })
   }, [])
 
-  return { state, upload, selectFrame, reset }
+  return { state, upload, selectFrame, reset, switchBackend }
 }

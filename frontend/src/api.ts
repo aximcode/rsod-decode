@@ -121,6 +121,25 @@ export async function expandVar(
   return request(url)
 }
 
+export async function switchBackend(
+  sessionId: string,
+  backend: 'pyelftools' | 'gdb',
+): Promise<{ backend: string }> {
+  return request(`/api/backend/${sessionId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backend }),
+  })
+}
+
+export async function getMemory(
+  sessionId: string,
+  addr: number,
+  size = 256,
+): Promise<{ address: number; bytes: (number | null)[] }> {
+  return request(`/api/memory/${sessionId}?addr=${addr.toString(16)}&size=${size}`)
+}
+
 export async function deleteSession(
   sessionId: string,
 ): Promise<{ deleted: boolean }> {

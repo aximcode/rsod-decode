@@ -1,6 +1,9 @@
+import { HexAddress } from './HexAddress'
+
 interface Props {
   registers: Record<string, string>
   format: string
+  onNavigateMemory?: (addr: number) => void
 }
 
 const SPECIAL_REGS = new Set(['PC', 'ESR', 'FAR', 'SP', 'FP', 'LR', 'ELR', 'SPSR', 'RIP', 'RSP', 'RBP'])
@@ -48,7 +51,7 @@ function sortRegisters(regs: Record<string, string>, format: string): [string, s
   return [...general, ...special]
 }
 
-export function RegisterPanel({ registers, format }: Props) {
+export function RegisterPanel({ registers, format, onNavigateMemory }: Props) {
   const sorted = sortRegisters(registers, format)
   if (sorted.length === 0) return null
 
@@ -60,13 +63,21 @@ export function RegisterPanel({ registers, format }: Props) {
       <div className="px-3 py-1 font-mono text-xs">
         {sorted.map(([name, value]) => {
           const isSpecial = SPECIAL_REGS.has(name)
+          const numVal = value.startsWith('0x') || value.startsWith('0X')
+            ? parseInt(value, 16)
+            : parseInt(value)
+          const isAddr = onNavigateMemory && !isNaN(numVal) && numVal >= 0x10000
           return (
             <div
               key={name}
               className={`flex justify-between py-0.5 ${isSpecial ? 'text-yellow-300' : 'text-zinc-300'}`}
             >
               <span className={`w-10 shrink-0 ${isSpecial ? 'text-yellow-400' : 'text-zinc-500'}`}>{name}</span>
-              <span className="text-right">{value}</span>
+              <span className="text-right">
+                {isAddr
+                  ? <HexAddress value={numVal} onNavigate={onNavigateMemory!} className={isSpecial ? 'text-yellow-300 hover:text-yellow-200' : 'text-zinc-300 hover:text-zinc-100'} />
+                  : value}
+              </span>
             </div>
           )
         })}

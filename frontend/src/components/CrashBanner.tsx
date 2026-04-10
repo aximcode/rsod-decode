@@ -3,13 +3,20 @@ import type { CrashSummary } from '../types'
 interface Props {
   crash: CrashSummary
   onNewAnalysis: () => void
+  backend: string
+  gdbAvailable: boolean
+  onSwitchBackend: (backend: 'pyelftools' | 'gdb') => void
+  backendSwitching: boolean
 }
 
 function hex(n: number | null): string {
   return n !== null ? `0x${n.toString(16).toUpperCase()}` : '?'
 }
 
-export function CrashBanner({ crash, onNewAnalysis }: Props) {
+export function CrashBanner({ crash, onNewAnalysis, backend, gdbAvailable, onSwitchBackend, backendSwitching }: Props) {
+  const otherBackend = backend === 'gdb' ? 'pyelftools' : 'gdb'
+  const canSwitch = backend === 'gdb' || gdbAvailable
+
   return (
     <div className="bg-red-950 border-b border-red-900 px-4 py-3 font-mono text-sm shrink-0">
       <div className="flex items-start justify-between gap-4">
@@ -52,12 +59,26 @@ export function CrashBanner({ crash, onNewAnalysis }: Props) {
           </div>
         </div>
 
-        <button
-          onClick={onNewAnalysis}
-          className="shrink-0 text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-2 py-1 hover:border-zinc-500 transition-colors"
-        >
-          New Analysis
-        </button>
+        <div className="flex flex-col gap-1.5 items-end shrink-0">
+          <button
+            onClick={onNewAnalysis}
+            className="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-2 py-1 hover:border-zinc-500 transition-colors"
+          >
+            New Analysis
+          </button>
+          <div className="flex items-center gap-1.5 text-xs">
+            <span className="text-zinc-600">{backend}</span>
+            {canSwitch && (
+              <button
+                onClick={() => onSwitchBackend(otherBackend as 'pyelftools' | 'gdb')}
+                disabled={backendSwitching}
+                className="text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-1.5 py-0.5 hover:border-zinc-500 transition-colors disabled:opacity-50 disabled:cursor-wait"
+              >
+                {backendSwitching ? 'switching...' : `switch to ${otherBackend}`}
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   )

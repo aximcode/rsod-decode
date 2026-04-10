@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import type { FrameDetail, Instruction, SourceLine, VarInfo } from '../types'
+import { formatValueWithHex } from './HexAddress'
+import { MemoryView } from './MemoryView'
 
 interface Props {
   sessionId: string
@@ -8,31 +10,26 @@ interface Props {
   loading: boolean
   error?: string | null
   isCrashFrame: boolean
-}
-
-function formatValue(value: number | null): string {
-  if (value === null) return '\u2014'
-  const hex = `0x${value.toString(16).toUpperCase()}`
-  if (value < 0x10000) {
-    return `${hex} (${value})`
-  }
-  return hex
+  memoryNav: { addr: number; id: number } | null
+  onNavigateMemory: (addr: number) => void
 }
 
 function filterVars(vars: VarInfo[]): VarInfo[] {
   return vars.filter(v => v.name !== '???')
 }
 
-type TabId = 'Params' | 'Locals' | 'Globals' | 'Disassembly' | 'Source'
-const TABS: TabId[] = ['Params', 'Locals', 'Globals', 'Disassembly', 'Source']
+type TabId = 'Params' | 'Locals' | 'Globals' | 'Disassembly' | 'Source' | 'Memory'
+const TABS: TabId[] = ['Params', 'Locals', 'Globals', 'Disassembly', 'Source', 'Memory']
 
-export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: Props) {
+export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, memoryNav, onNavigateMemory }: Props) {
   const [activeTab, setActiveTab] = useState<TabId>('Params')
   const [disasm, setDisasm] = useState<Instruction[] | null>(null)
   const [disasmLoading, setDisasmLoading] = useState(false)
   const [source, setSource] = useState<{ file: string; target_line: number; lines: SourceLine[] } | null>(null)
   const [sourceLoading, setSourceLoading] = useState(false)
+  const [memoryAddr, setMemoryAddr] = useState<number | null>(null)
   const prevFrameIndex = useRef<number | null>(null)
+  const prevNavId = useRef(0)
 
   // Reset tab data when frame changes
   useEffect(() => {
@@ -42,6 +39,21 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
       setSource(null)
     }
   }, [frame])
+
+  // Handle external memory navigation requests
+  useEffect(() => {
+    if (memoryNav && memoryNav.id !== prevNavId.current) {
+      prevNavId.current = memoryNav.id
+      setMemoryAddr(memoryNav.addr)
+      setActiveTab('Memory')
+    }
+  }, [memoryNav])
+
+  const handleNavigateMemory = (addr: number) => {
+    setMemoryAddr(addr)
+    setActiveTab('Memory')
+    onNavigateMemory(addr)
+  }
 
   // Fetch disasm when tab selected
   useEffect(() => {
@@ -127,11 +139,12 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
 
       {/* Tab content */}
       <div className="flex-1 min-h-0 overflow-auto p-4">
-        {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" sessionId={sessionId} frameIndex={frame.index} />}
-        {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" sessionId={sessionId} frameIndex={frame.index} />}
-        {activeTab === 'Globals' && <VarsTable vars={filterVars(frame.globals)} isCrashFrame={isCrashFrame} label="global variables" sessionId={sessionId} frameIndex={frame.index} note="Runtime values not available — expand structs to see initial values from the ELF image" />}
+        {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" sessionId={sessionId} frameIndex={frame.index} onNavigateMemory={handleNavigateMemory} />}
+        {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" sessionId={sessionId} frameIndex={frame.index} onNavigateMemory={handleNavigateMemory} />}
+        {activeTab === 'Globals' && <VarsTable vars={filterVars(frame.globals)} isCrashFrame={isCrashFrame} label="global variables" sessionId={sessionId} frameIndex={frame.index} onNavigateMemory={handleNavigateMemory} note="Runtime values not available — expand structs to see initial values from the ELF image" />}
         {activeTab === 'Disassembly' && <DisassemblyView instructions={disasm} loading={disasmLoading} />}
         {activeTab === 'Source' && <SourceView source={source} loading={sourceLoading} />}
+        {activeTab === 'Memory' && <MemoryView sessionId={sessionId} address={memoryAddr} onNavigateMemory={handleNavigateMemory} />}
       </div>
     </div>
   )
@@ -147,10 +160,11 @@ interface VarsTableProps {
   label: string
   sessionId: string
   frameIndex: number
+  onNavigateMemory: (addr: number) => void
   note?: string
 }
 
-function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex, note }: VarsTableProps) {
+function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex, onNavigateMemory, note }: VarsTableProps) {
   if (vars.length === 0) {
     return <div className="text-zinc-600 text-sm">No {label} available for this frame</div>
   }
@@ -176,7 +190,7 @@ function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex, note }: V
         <tbody className="divide-y divide-zinc-800/50">
           {vars.map((v) => (
             <VarRow key={`${frameIndex}-${v.name}`} v={v} isCrashFrame={isCrashFrame} depth={0}
-                    sessionId={sessionId} frameIndex={frameIndex} />
+                    sessionId={sessionId} frameIndex={frameIndex} onNavigateMemory={onNavigateMemory} />
           ))}
         </tbody>
       </table>
@@ -184,9 +198,9 @@ function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex, note }: V
   )
 }
 
-function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
+function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex, onNavigateMemory }: {
   v: VarInfo | api.ExpandField; isCrashFrame: boolean; depth: number
-  sessionId: string; frameIndex: number
+  sessionId: string; frameIndex: number; onNavigateMemory: (addr: number) => void
 }) {
   const [expanded, setExpanded] = useState(false)
   const [children, setChildren] = useState<api.ExpandField[] | null>(null)
@@ -246,7 +260,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
         <td className="py-1.5 pr-4 text-zinc-400">{v.type}</td>
         <td className="py-1.5 pr-4 text-zinc-500">{location}</td>
         <td className={`py-1.5 ${approximate ? 'text-zinc-500 italic' : 'text-zinc-200'}`}>
-          {approximate && v.value !== null ? '~ ' : ''}{formatValue(v.value)}
+          {approximate && v.value !== null ? '~ ' : ''}{formatValueWithHex(v.value, onNavigateMemory)}
           {v.string_preview && (
             <span className="text-green-400 ml-2">
               &quot;{v.string_preview.length > 48 ? v.string_preview.slice(0, 48) + '\u2026' : v.string_preview}&quot;
@@ -256,7 +270,7 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
       </tr>
       {expanded && children?.map((child) => (
         <VarRow key={child.name} v={child} isCrashFrame={isCrashFrame} depth={depth + 1}
-                sessionId={sessionId} frameIndex={frameIndex} />
+                sessionId={sessionId} frameIndex={frameIndex} onNavigateMemory={onNavigateMemory} />
       ))}
       {expanded && hasMore && (
         <tr>

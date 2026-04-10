@@ -67,6 +67,17 @@ def register_session(session: Session) -> None:
     _sessions[session.id] = session
 
 
+def _gdb_available() -> bool:
+    """Check if GDB and pygdbmi are available for backend switching."""
+    try:
+        if not find_gdb():
+            return False
+        import pygdbmi  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # =============================================================================
 # Serialization helpers
 # =============================================================================
@@ -407,6 +418,8 @@ def create_app(repo_root: Path | None = None,
             format=r.rsod_format,
             call_verified={str(k): v for k, v in r.call_verified.items()},
             rsod_text=session.rsod_text,
+            backend=session.backend,
+            gdb_available=_gdb_available(),
         )
 
     # -----------------------------------------------------------------
@@ -546,6 +559,55 @@ def create_app(repo_root: Path | None = None,
         return jsonify(fields=fields, total_count=total_count)
 
     # -----------------------------------------------------------------
+    # GET /api/memory/<session_id> — raw memory read (hex dump)
+    # -----------------------------------------------------------------
+    @app.get('/api/memory/<session_id>')
+    def get_memory(session_id: str):
+        session = _sessions.get(session_id)
+        if not session:
+            return jsonify(error='session not found'), 404
+
+        addr = request.args.get('addr', type=lambda x: int(x, 16))
+        size = min(request.args.get('size', default=256, type=int), 4096)
+        if addr is None:
+            return jsonify(error='addr required'), 400
+
+        # Pick a backend for memory reads (frame-independent)
+        dwarf = None
+        if session.backend == 'gdb' and session.gdb_dwarf:
+            dwarf = session.gdb_dwarf
+        elif session.source.dwarf:
+            dwarf = session.source.dwarf
+        if not dwarf:
+            return jsonify(address=addr, bytes=[])
+
+        sb = session.result.stack_base
+        sm = session.result.stack_mem
+        ib = session.img_base
+
+        # GDB backend: use read_memory_partial for per-byte N/A handling
+        if hasattr(dwarf, 'read_memory_partial'):
+            result_bytes = dwarf.read_memory_partial(addr, size, sb, sm, ib)
+            return jsonify(address=addr, bytes=result_bytes)
+
+        # pyelftools: try full-block read first
+        data = dwarf.read_memory(addr, size, sb, sm, ib)
+        if data is not None:
+            return jsonify(address=addr, bytes=list(data))
+
+        # Fall back to 16-byte chunk reads for boundary cases
+        result_bytes: list[int | None] = []
+        for off in range(0, size, 16):
+            chunk_size = min(16, size - off)
+            chunk = dwarf.read_memory(addr + off, chunk_size, sb, sm, ib)
+            if chunk:
+                result_bytes.extend(chunk)
+            else:
+                result_bytes.extend([None] * chunk_size)
+
+        return jsonify(address=addr, bytes=result_bytes)
+
+    # -----------------------------------------------------------------
     # GET /api/disasm/<session_id>/<frame_index> — disassembly
     # -----------------------------------------------------------------
     @app.get('/api/disasm/<session_id>/<int:frame_index>')
@@ -672,6 +734,47 @@ def create_app(repo_root: Path | None = None,
                 response['function'] = addr_info.function
 
         return jsonify(response)
+
+    # -----------------------------------------------------------------
+    # POST /api/backend/<session_id> — switch DWARF backend
+    # -----------------------------------------------------------------
+    @app.post('/api/backend/<session_id>')
+    def switch_backend(session_id: str):
+        session = _sessions.get(session_id)
+        if not session:
+            return jsonify(error='session not found'), 404
+
+        data = request.get_json(silent=True) or {}
+        target = data.get('backend', '')
+        if target not in ('pyelftools', 'gdb'):
+            return jsonify(error='backend must be "pyelftools" or "gdb"'), 400
+
+        if target == session.backend:
+            return jsonify(backend=session.backend)
+
+        if target == 'gdb':
+            if not _gdb_available():
+                return jsonify(error='GDB/pygdbmi not available'), 400
+            if not session.gdb_dwarf:
+                try:
+                    from .gdb_backend import GdbBackend
+                    frame_data = [(f.frame_fp, f.address)
+                                  for f in session.result.frames]
+                    session.gdb_dwarf = GdbBackend(
+                        session.elf_path,
+                        session.result.crash_info.registers,
+                        session.result.crash_info.crash_pc,
+                        session.result.stack_base,
+                        session.result.stack_mem,
+                        session.img_base,
+                        frames=frame_data,
+                    )
+                except Exception as e:
+                    return jsonify(error=f'Failed to start GDB backend: {e}'), 500
+
+        session.backend = target
+        session.frame_cache.clear()
+        return jsonify(backend=session.backend)
 
     # -----------------------------------------------------------------
     # DELETE /api/session/<id> — cleanup

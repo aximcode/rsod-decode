@@ -84,6 +84,8 @@ export interface SessionData {
   format: string
   call_verified: Record<string, boolean>
   rsod_text: string
+  backend: string
+  gdb_available: boolean
 }
 
 export interface CreateSessionResponse {
