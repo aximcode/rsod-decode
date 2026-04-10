@@ -23,7 +23,7 @@ from .base import (
 
 RE_PC_LINE = re.compile(r'^-->\s*PC\s+([0-9A-Fa-f]+)(.*)', re.IGNORECASE)
 RE_ARM64_FRAME = re.compile(
-    r'^(s\d+)\s+([0-9A-Fa-f]+)\s+(\S+\.efi)\s+\+([0-9A-Fa-f]+)')
+    r'^\s*(s\d+)\s+([0-9A-Fa-f]+)\s+(\S+\.efi)\s+\+([0-9A-Fa-f]+)')
 RE_ARM64_REG = re.compile(
     r'(X\d+|FP|LR|SP|ELR|SPSR|FPSR|FAR|PC|ESR)=(?:0x)?([0-9A-Fa-f]+)')
 RE_UEFI_ARM64_TYPE = re.compile(r'^Type:\s*(.+)', re.IGNORECASE)
