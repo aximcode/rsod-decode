@@ -208,7 +208,8 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
     setExpanded(true)
     if (children !== null) return
     setLoading(true)
-    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset)
+    const vk = 'var_key' in v ? (v as { var_key?: string }).var_key : undefined
+    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset, undefined, undefined, vk)
       .then(r => { setChildren(r.fields); setTotalCount(r.total_count); setLoading(false) })
       .catch(() => { setChildren([]); setLoading(false) })
   }
@@ -216,7 +217,8 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
   const loadMore = () => {
     if (!children || loading) return
     setLoading(true)
-    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset, children.length)
+    const vk2 = 'var_key' in v ? (v as { var_key?: string }).var_key : undefined
+    api.expandVar(sessionId, frameIndex, v.expand_addr!, v.type_offset, v.cu_offset, children.length, undefined, vk2)
       .then(r => { setChildren([...children, ...r.fields]); setLoading(false) })
       .catch(() => setLoading(false))
   }

@@ -114,6 +114,12 @@ class VarInfo:
     byte_size: int = 0
     type_offset: int = 0  # DWARF DIE offset for type expansion
     cu_offset: int = 0  # compilation unit offset
+    # Pre-resolved fields (filled by GDB backend, skip _var_to_dict resolution)
+    value: int | None = None
+    is_expandable: bool | None = None  # None = let _var_to_dict decide
+    expand_addr: int | None = None
+    string_preview: str | None = None
+    var_key: str = ''  # GDB variable object name (for expand_type)
 
 
 # =============================================================================

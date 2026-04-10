@@ -42,6 +42,8 @@ class Session:
     temp_dir: Path | None = None
     elf_path: Path | None = None
     gdb: GdbSession | None = None
+    gdb_dwarf: object | None = None  # GdbBackend instance (alternative DWARF backend)
+    backend: str = 'pyelftools'  # 'pyelftools' or 'gdb'
 
     @property
     def img_base(self) -> int:
@@ -67,6 +69,13 @@ def register_session(session: Session) -> None:
 # =============================================================================
 # Serialization helpers
 # =============================================================================
+
+def _dwarf_for(session: Session, frame: FrameInfo) -> object | None:
+    """Get the DWARF backend for a frame, respecting session backend choice."""
+    if session.backend == 'gdb' and session.gdb_dwarf:
+        return session.gdb_dwarf
+    return dwarf_for_frame(frame, session.source, session.extra_sources)
+
 
 def _crash_info_to_dict(info: CrashInfo) -> dict:
     return {
@@ -151,6 +160,23 @@ def _build_frame_ctx(
 
 
 def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
+    # If the backend pre-resolved the value (GDB backend), use it directly
+    if v.value is not None or v.is_expandable is not None:
+        return {
+            'name': v.name,
+            'type': v.type_name,
+            'location': v.location,
+            'reg_name': v.reg_name,
+            'value': v.value,
+            'approximate': False,
+            'is_expandable': bool(v.is_expandable),
+            'expand_addr': v.expand_addr,
+            'string_preview': v.string_preview,
+            'type_offset': v.type_offset,
+            'cu_offset': v.cu_offset,
+            'var_key': v.var_key,
+        }
+
     value = None
     mem_addr: int | None = None  # memory address for expandable types
     location = v.location
@@ -396,9 +422,7 @@ def create_app(repo_root: Path | None = None,
         frame = session.result.frames[frame_index]
         result: dict = _frame_to_dict(frame)
 
-        # Use the correct DWARF source for this frame's module
-        dwarf = dwarf_for_frame(
-            frame, session.source, session.extra_sources)
+        dwarf = _dwarf_for(session, frame)
         img_base = session.img_base
         if dwarf and frame.address:
             ctx = _build_frame_ctx(frame, session, img_base)
@@ -450,7 +474,14 @@ def create_app(repo_root: Path | None = None,
                     if p['value'] is not None:
                         break
 
-            globals_ = dwarf.get_globals(frame.address)
+            # Always use pyelftools for globals (GDB can't reliably
+            # filter CU-scope vars; globals come from ELF sections anyway)
+            pyelf_dwarf = dwarf_for_frame(
+                frame, session.source, session.extra_sources)
+            if pyelf_dwarf:
+                globals_ = pyelf_dwarf.get_globals(frame.address)
+            else:
+                globals_ = dwarf.get_globals(frame.address)
             result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
         else:
             result['params'] = []
@@ -474,17 +505,26 @@ def create_app(repo_root: Path | None = None,
         addr = request.args.get('addr', type=lambda x: int(x, 16))
         type_offset = request.args.get('type_offset', type=int)
         cu_offset = request.args.get('cu_offset', type=int)
-        if addr is None or type_offset is None or cu_offset is None:
-            return jsonify(error='addr, type_offset, cu_offset required'), 400
+        var_key = request.args.get('var_key', type=str, default='')
+        if addr is None or (not var_key and (type_offset is None or cu_offset is None)):
+            return jsonify(error='addr required, plus type_offset+cu_offset or var_key'), 400
         offset = request.args.get('offset', default=0, type=int)
         count = request.args.get('count', default=32, type=int)
 
         frame = session.result.frames[frame_index]
-        dwarf = dwarf_for_frame(
-            frame, session.source, session.extra_sources)
+        dwarf = _dwarf_for(session, frame)
         if not dwarf:
             return jsonify(fields=[], total_count=0)
 
+        # GDB backend: use var_key for expansion
+        if var_key:
+            fields, total_count = dwarf.expand_type(
+                var_key, addr,
+                session.result.stack_base, session.result.stack_mem,
+                session.img_base, offset, count)
+            return jsonify(fields=fields, total_count=total_count)
+
+        # pyelftools backend: use type DIE
         type_die = dwarf.get_type_die(cu_offset, type_offset)
         if not type_die:
             return jsonify(fields=[], total_count=0)
@@ -507,8 +547,7 @@ def create_app(repo_root: Path | None = None,
             return jsonify(error='frame index out of range'), 404
 
         frame = session.result.frames[frame_index]
-        dwarf = dwarf_for_frame(
-            frame, session.source, session.extra_sources)
+        dwarf = _dwarf_for(session, frame)
         # Use call_addr for disassembly center and target highlight
         target_addr = frame.call_addr or frame.address
         if not dwarf or not target_addr:

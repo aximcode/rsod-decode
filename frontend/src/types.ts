@@ -39,6 +39,7 @@ export interface VarInfo {
   string_preview: string | null
   type_offset: number
   cu_offset: number
+  var_key?: string
 }
 
 export interface ExpandField {
@@ -52,6 +53,7 @@ export interface ExpandField {
   type_offset: number
   cu_offset: number
   access?: string
+  var_key?: string
 }
 
 export interface FrameDetail extends FrameSummary {

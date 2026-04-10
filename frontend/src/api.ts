@@ -112,10 +112,12 @@ export async function expandVar(
   cuOffset: number,
   offset?: number,
   count?: number,
+  varKey?: string,
 ): Promise<{ fields: ExpandField[]; total_count: number }> {
   let url = `/api/expand/${sessionId}/${frameIndex}?addr=${addr.toString(16)}&type_offset=${typeOffset}&cu_offset=${cuOffset}`
   if (offset !== undefined) url += `&offset=${offset}`
   if (count !== undefined) url += `&count=${count}`
+  if (varKey) url += `&var_key=${encodeURIComponent(varKey)}`
   return request(url)
 }
 

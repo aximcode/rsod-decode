@@ -31,6 +31,19 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _try_gdb_backend() -> bool:
+    """Check if GDB and pygdbmi are available."""
+    try:
+        import shutil
+        from backend.gdb_bridge import find_gdb
+        if not find_gdb():
+            return False
+        import pygdbmi  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Interactive RSOD crash debugger web UI.')
@@ -55,6 +68,10 @@ def main() -> None:
     parser.add_argument('--dwarf-prefix', type=str, default=None,
                         help='Path prefix to strip from DWARF source paths '
                              '(auto-detected if not specified)')
+    parser.add_argument('--backend', type=str, default='auto',
+                        choices=['auto', 'gdb', 'pyelftools'],
+                        help='DWARF backend: gdb (uses GDB/MI), '
+                             'pyelftools (standalone), auto (default)')
     args = parser.parse_args()
 
     # Validate file args
@@ -126,7 +143,7 @@ def main() -> None:
         result = analyze_rsod(rsod_text, source, extra_sources, base_override)
 
         session_id = uuid.uuid4().hex[:12]
-        register_session(Session(
+        sess = Session(
             id=session_id,
             result=result,
             source=source,
@@ -134,7 +151,26 @@ def main() -> None:
             rsod_text=rsod_text,
             created_at=datetime.now(timezone.utc).isoformat(),
             elf_path=args.symbol_file.resolve(),
-        ))
+        )
+
+        # Initialize GDB backend if requested
+        use_gdb = args.backend == 'gdb' or (args.backend == 'auto' and _try_gdb_backend())
+        if use_gdb:
+            try:
+                from backend.gdb_backend import GdbBackend
+                sess.gdb_dwarf = GdbBackend(
+                    args.symbol_file.resolve(),
+                    result.crash_info.registers,
+                    result.crash_info.crash_pc,
+                    result.stack_base, result.stack_mem,
+                    sess.img_base,
+                )
+                sess.backend = 'gdb'
+                _log(f"Using GDB backend")
+            except Exception as e:
+                _log(f"GDB backend failed, falling back to pyelftools: {e}")
+
+        register_session(sess)
 
         _log(f"Session {session_id}: {len(result.frames)} frames, "
              f"{result.resolved_count} addresses resolved")
