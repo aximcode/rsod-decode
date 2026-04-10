@@ -97,6 +97,7 @@ export function App() {
           registers={state.data.registers}
           format={state.data.format}
           onNavigateMemory={navigateToMemory}
+          frameRegisters={state.frameDetail?.frame_registers}
         />
       </div>
     </div>

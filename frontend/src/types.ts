@@ -61,6 +61,7 @@ export interface FrameDetail extends FrameSummary {
   locals: VarInfo[]
   globals: VarInfo[]
   call_verified: boolean | null
+  frame_registers?: Record<string, string>
 }
 
 export interface Instruction {

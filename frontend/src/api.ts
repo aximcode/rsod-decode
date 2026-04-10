@@ -132,6 +132,18 @@ export async function switchBackend(
   })
 }
 
+export interface MemoryRegion {
+  name: string
+  start: number
+  size: number
+}
+
+export async function getRegions(
+  sessionId: string,
+): Promise<{ regions: MemoryRegion[] }> {
+  return request(`/api/regions/${sessionId}`)
+}
+
 export async function getMemory(
   sessionId: string,
   addr: number,

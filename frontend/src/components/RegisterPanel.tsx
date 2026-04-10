@@ -4,6 +4,7 @@ interface Props {
   registers: Record<string, string>
   format: string
   onNavigateMemory?: (addr: number) => void
+  frameRegisters?: Record<string, string>
 }
 
 const SPECIAL_REGS = new Set(['PC', 'ESR', 'FAR', 'SP', 'FP', 'LR', 'ELR', 'SPSR', 'RIP', 'RSP', 'RBP'])
@@ -51,7 +52,7 @@ function sortRegisters(regs: Record<string, string>, format: string): [string, s
   return [...general, ...special]
 }
 
-export function RegisterPanel({ registers, format, onNavigateMemory }: Props) {
+export function RegisterPanel({ registers, format, onNavigateMemory, frameRegisters }: Props) {
   const sorted = sortRegisters(registers, format)
   if (sorted.length === 0) return null
 
@@ -63,20 +64,30 @@ export function RegisterPanel({ registers, format, onNavigateMemory }: Props) {
       <div className="px-3 py-1 font-mono text-xs">
         {sorted.map(([name, value]) => {
           const isSpecial = SPECIAL_REGS.has(name)
-          const numVal = value.startsWith('0x') || value.startsWith('0X')
-            ? parseInt(value, 16)
-            : parseInt(value)
+          const frameVal = frameRegisters?.[name]
+          const changed = frameVal !== undefined && frameVal !== value
+          const displayVal = changed ? frameVal : value
+          const numVal = displayVal.startsWith('0x') || displayVal.startsWith('0X')
+            ? parseInt(displayVal, 16)
+            : parseInt(displayVal)
           const isAddr = onNavigateMemory && !isNaN(numVal) && numVal >= 0x10000
           return (
             <div
               key={name}
-              className={`flex justify-between py-0.5 ${isSpecial ? 'text-yellow-300' : 'text-zinc-300'}`}
+              className={`flex justify-between py-0.5 ${
+                changed
+                  ? 'text-amber-300 border-l-2 border-amber-400 pl-1.5 -ml-1.5'
+                  : isSpecial ? 'text-yellow-300' : 'text-zinc-300'
+              }`}
+              title={changed ? `Crash: ${value}\nFrame: ${frameVal}` : undefined}
             >
-              <span className={`w-10 shrink-0 ${isSpecial ? 'text-yellow-400' : 'text-zinc-500'}`}>{name}</span>
+              <span className={`w-10 shrink-0 ${
+                changed ? 'text-amber-400' : isSpecial ? 'text-yellow-400' : 'text-zinc-500'
+              }`}>{name}</span>
               <span className="text-right">
                 {isAddr
-                  ? <HexAddress value={numVal} onNavigate={onNavigateMemory!} className={isSpecial ? 'text-yellow-300 hover:text-yellow-200' : 'text-zinc-300 hover:text-zinc-100'} />
-                  : value}
+                  ? <HexAddress value={numVal} onNavigate={onNavigateMemory!} className={changed ? 'text-amber-300 hover:text-amber-200' : isSpecial ? 'text-yellow-300 hover:text-yellow-200' : 'text-zinc-300 hover:text-zinc-100'} />
+                  : displayVal}
               </span>
             </div>
           )

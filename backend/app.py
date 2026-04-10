@@ -511,6 +511,8 @@ def create_app(repo_root: Path | None = None,
             result['globals'] = []
 
         result['call_verified'] = session.result.call_verified.get(frame.address)
+        if frame.frame_registers:
+            result['frame_registers'] = _registers_to_dict(frame.frame_registers)
         session.frame_cache[frame_index] = result
         return jsonify(result)
 
@@ -606,6 +608,40 @@ def create_app(repo_root: Path | None = None,
                 result_bytes.extend([None] * chunk_size)
 
         return jsonify(address=addr, bytes=result_bytes)
+
+    # -----------------------------------------------------------------
+    # GET /api/regions/<session_id> — known memory regions
+    # -----------------------------------------------------------------
+    @app.get('/api/regions/<session_id>')
+    def get_regions(session_id: str):
+        session = _sessions.get(session_id)
+        if not session:
+            return jsonify(error='session not found'), 404
+
+        regions: list[dict] = []
+        sb = session.result.stack_base
+        sm = session.result.stack_mem
+        if sm:
+            regions.append({
+                'name': 'Stack dump',
+                'start': sb,
+                'size': len(sm),
+            })
+
+        # ELF sections at runtime addresses
+        ib = session.img_base
+        if session.source.dwarf:
+            for sec_addr, sec_data in session.source.dwarf._sections:
+                rt_start = sec_addr + ib
+                regions.append({
+                    'name': session.source.dwarf._section_names.get(
+                        sec_addr, f'0x{sec_addr:X}'),
+                    'start': rt_start,
+                    'size': len(sec_data),
+                })
+
+        regions.sort(key=lambda r: r['start'])
+        return jsonify(regions=regions)
 
     # -----------------------------------------------------------------
     # GET /api/disasm/<session_id>/<frame_index> — disassembly

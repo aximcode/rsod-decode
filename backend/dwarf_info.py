@@ -484,10 +484,12 @@ class DwarfInfo:
 
         # Cache ELF sections for memory reads
         self._sections: list[tuple[int, bytes]] = []  # (base_addr, data)
+        self._section_names: dict[int, str] = {}  # base_addr → name
         for name in ('.text', '.rodata', '.data'):
             sec = self._elf.get_section_by_name(name)
             if sec and sec['sh_size'] > 0:
                 self._sections.append((sec['sh_addr'], sec.data()))
+                self._section_names[sec['sh_addr']] = name
         text_sec = self._elf.get_section_by_name('.text')
         if text_sec:
             self._text_data: bytes = text_sec.data()

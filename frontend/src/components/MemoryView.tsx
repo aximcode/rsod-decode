@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as api from '../api'
+import type { MemoryRegion } from '../api'
 import { HexAddress } from './HexAddress'
 
 interface Props {
@@ -11,13 +12,33 @@ interface Props {
 const BYTES_PER_ROW = 16
 const DEFAULT_SIZE = 256
 
+function formatSize(n: number): string {
+  if (n >= 1024) return `${(n / 1024).toFixed(1)}K`
+  return `${n}B`
+}
+
+function regionForAddr(regions: MemoryRegion[], addr: number): MemoryRegion | null {
+  for (const r of regions) {
+    if (addr >= r.start && addr < r.start + r.size) return r
+  }
+  return null
+}
+
 export function MemoryView({ sessionId, address, onNavigateMemory }: Props) {
   const [inputVal, setInputVal] = useState('')
   const [data, setData] = useState<(number | null)[] | null>(null)
   const [baseAddr, setBaseAddr] = useState<number>(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [regions, setRegions] = useState<MemoryRegion[]>([])
   const fetchId = useRef(0)
+
+  // Fetch regions once
+  useEffect(() => {
+    api.getRegions(sessionId)
+      .then(r => setRegions(r.regions))
+      .catch(() => {})
+  }, [sessionId])
 
   // Sync input field when address changes externally
   useEffect(() => {
@@ -53,6 +74,8 @@ export function MemoryView({ sessionId, address, onNavigateMemory }: Props) {
     if (!isNaN(val)) onNavigateMemory(val)
   }
 
+  const currentRegion = address !== null ? regionForAddr(regions, address) : null
+
   const rows = useMemo(() => {
     if (!data) return []
     const result: { offset: number; bytes: (number | null)[] }[] = []
@@ -62,18 +85,50 @@ export function MemoryView({ sessionId, address, onNavigateMemory }: Props) {
     return result
   }, [data])
 
-  if (address === null) {
-    return (
-      <div>
-        <AddressBar value={inputVal} onChange={setInputVal} onSubmit={submitAddr} />
-        <div className="text-zinc-600 text-sm mt-4">Enter an address or click a hex value to view memory</div>
-      </div>
-    )
-  }
-
   return (
     <div>
-      <AddressBar value={inputVal} onChange={setInputVal} onSubmit={submitAddr} />
+      <div className="flex gap-4 items-start">
+        <div className="flex-1">
+          <div className="flex gap-2 items-center">
+            <AddressBar value={inputVal} onChange={setInputVal} onSubmit={submitAddr} />
+            {currentRegion && (
+              <span className="text-xs text-emerald-400 bg-emerald-950/40 border border-emerald-800/50 rounded px-1.5 py-0.5 shrink-0">
+                {currentRegion.name}
+              </span>
+            )}
+            {address !== null && !currentRegion && !loading && (
+              <span className="text-xs text-zinc-600 italic shrink-0">unmapped</span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Region map */}
+      {regions.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {regions.map(r => {
+            const active = currentRegion === r
+            return (
+              <button
+                key={`${r.name}-${r.start}`}
+                onClick={() => onNavigateMemory(r.start)}
+                className={`text-xs font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                  active
+                    ? 'bg-emerald-950/60 border-emerald-700 text-emerald-300'
+                    : 'bg-zinc-800/50 border-zinc-700/50 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600'
+                }`}
+                title={`0x${r.start.toString(16).toUpperCase()} - 0x${(r.start + r.size).toString(16).toUpperCase()}`}
+              >
+                {r.name} <span className="text-zinc-600">{formatSize(r.size)}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {address === null && (
+        <div className="text-zinc-600 text-sm mt-4">Enter an address or click a hex value to view memory</div>
+      )}
 
       {loading && (
         <div className="text-zinc-500 text-sm flex items-center gap-2 mt-3">
@@ -149,7 +204,7 @@ function AddressBar({ value, onChange, onSubmit }: {
   onSubmit: () => void
 }) {
   return (
-    <div className="flex gap-2 items-center">
+    <>
       <label className="text-xs text-zinc-500 shrink-0">Address:</label>
       <input
         value={value}
@@ -165,6 +220,6 @@ function AddressBar({ value, onChange, onSubmit }: {
       >
         Go
       </button>
-    </div>
+    </>
   )
 }
