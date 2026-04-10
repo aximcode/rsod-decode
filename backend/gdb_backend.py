@@ -515,8 +515,10 @@ class GdbBackend:
     def disassemble_around(
         self, addr: int, context: int = 24,
     ) -> list[tuple[int, str, str]]:
-        start = addr - context * 4
-        end = addr + context * 4
+        # addr is an ELF offset; GDB needs runtime addresses
+        rt = addr + self._image_base
+        start = rt - context * 4
+        end = rt + context * 4
         payload = self._result(
             f'-data-disassemble -s 0x{start:x} -e 0x{end:x} -- 0')
         insns: list[tuple[int, str, str]] = []
@@ -528,17 +530,18 @@ class GdbBackend:
             mnemonic = parts[0] if parts else inst
             op_str = parts[1] if len(parts) > 1 else ''
             if a is not None:
-                insns.append((a, mnemonic, op_str))
+                # Convert runtime addresses back to ELF offsets
+                insns.append((a - self._image_base, mnemonic, op_str))
         return insns
 
     def source_lines_for_addrs(
         self, addrs: list[int],
     ) -> dict[int, str]:
+        """Map ELF addresses to source lines via GDB."""
         result: dict[int, str] = {}
         for addr in addrs:
-            payload = self._result(f'-symbol-info-line *0x{addr:x}')
-            # Parse from console output
-            for r in self._cmd(f'info line *0x{addr:x}'):
+            rt = addr + self._image_base
+            for r in self._cmd(f'info line *0x{rt:x}'):
                 if r['type'] == 'console':
                     line = r.get('payload', '')
                     m = re.search(r'Line (\d+) of "(.+?)"', line)
