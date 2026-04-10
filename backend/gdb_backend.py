@@ -74,6 +74,7 @@ class GdbBackend:
         self._image_base = image_base
         self._frame_map: dict[int, int] = {}  # our addr → GDB frame index
         self._var_objects: set[str] = set()  # track created var objects
+        self._globals_cache: list[VarInfo] | None = None
 
         # Generate core file with synthetic FP chain for frames
         # beyond the stack dump
@@ -83,9 +84,10 @@ class GdbBackend:
             registers, crash_pc, stack_base, stack_mem,
             elf_path, core_path, image_base, frames=frames)
 
-        # Launch GDB
+        # Launch GDB (reduce additional-output wait from 200ms to 10ms)
         self._gdb = GdbController(
-            command=['gdb', '--interpreter=mi3', '-q', '-nx', str(elf_path)])
+            command=['gdb', '--interpreter=mi3', '-q', '-nx', str(elf_path)],
+            time_to_check_for_additional_output_sec=0.01)
         self._cmd('set confirm off')
         self._cmd(f'target core {core_path}')
         self._cmd(f'add-symbol-file {elf_path} -o 0x{image_base:X}')
@@ -165,11 +167,13 @@ class GdbBackend:
         return []
 
     def evaluate_globals(self, names: list[VarInfo]) -> list[VarInfo]:
-        """Evaluate global variables by name using GDB.
+        """Evaluate global variables by name using GDB (cached).
 
         Takes VarInfo list from pyelftools (with names/types) and returns
         new VarInfo list with GDB-resolved values.
         """
+        if self._globals_cache is not None:
+            return self._globals_cache
         results: list[VarInfo] = []
         for v in names:
             p = self._result(f'-data-evaluate-expression {v.name}')
@@ -203,6 +207,7 @@ class GdbBackend:
                 except Exception:
                     pass
             results.append(var)
+        self._globals_cache = results
         return results
 
     def _mi_var_to_varinfo(self, mi_var: dict, addr: int) -> VarInfo:
@@ -223,11 +228,16 @@ class GdbBackend:
             p = self._result(f'-data-evaluate-expression (int){name}')
             var.value = _parse_int(p.get('value', ''))
 
-        # Always try variable objects — GDB knows the real type
-        if _is_expandable_type(type_name) or val_str.startswith('{') or val_str == '':
+        # Only create variable objects for likely-expandable types
+        # (structs, arrays, pointers) — skip scalars to avoid MI round-trips
+        needs_varobj = (
+            _is_expandable_type(type_name)
+            or val_str.startswith('{')
+            or (val_str == '' and var.value is None)  # unknown value, might be struct
+        )
+        if needs_varobj:
             var_key = f'v_{addr:x}_{name}'
             try:
-                # Clean up old var object if exists
                 if var_key in self._var_objects:
                     self._cmd(f'-var-delete {var_key}')
                     self._var_objects.discard(var_key)
@@ -236,19 +246,18 @@ class GdbBackend:
                 if numchild > 0 or p.get('value', '') == '{...}':
                     var.is_expandable = True
                     var.var_key = var_key
-                    var.expand_addr = var.value
                     self._var_objects.add(var_key)
+                    # Get address for expand_addr
+                    addr_payload = self._result(
+                        f'-data-evaluate-expression &{name}')
+                    addr_val = _parse_int(addr_payload.get('value', ''))
+                    var.expand_addr = addr_val
+                    if var.value is None:
+                        var.value = addr_val
                 else:
                     self._cmd(f'-var-delete {var_key}')
             except Exception:
                 pass
-
-        # For structs/aggregates without a value, get the address
-        if var.is_expandable and var.value is None:
-            addr_payload = self._result(
-                f'-data-evaluate-expression &{name}')
-            var.value = _parse_int(addr_payload.get('value', ''))
-            var.expand_addr = var.value
 
         return var
 

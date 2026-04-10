@@ -439,40 +439,38 @@ def create_app(repo_root: Path | None = None,
             result['params'] = [_var_to_dict(v, ctx) for v in params]
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
 
-            # Infer unresolved params from ancestor frames.  When a param
-            # is in a caller-saved register or DW_OP_entry_value with no
-            # value, search outer frames for the same-named variable with
-            # a resolved value.  Skip stack-based locations — if the read
-            # failed there, ancestors share the same stack memory.
-            for p in result['params']:
-                if p['value'] is not None:
-                    continue
-                if _RE_MEM_LOC.match(p['location']):
-                    continue
-                for anc_idx in range(frame_index + 1,
-                                     len(session.result.frames)):
-                    anc = session.result.frames[anc_idx]
-                    anc_dwarf = dwarf_for_frame(
-                        anc, session.source, session.extra_sources)
-                    if not anc_dwarf or not anc.address:
-                        continue
-                    anc_pc = anc.address
-                    if not anc.is_crash_frame and anc.call_addr:
-                        anc_pc = anc.call_addr - 1
-                    anc_ctx = _build_frame_ctx(anc, session, img_base)
-                    for var in (*anc_dwarf.get_params(anc_pc),
-                                *anc_dwarf.get_locals(anc_pc)):
-                        if var.name != p['name']:
-                            continue
-                        d = _var_to_dict(var, anc_ctx)
-                        if d['value'] is None:
-                            continue
-                        p['value'] = d['value']
-                        if p['is_expandable'] and p['expand_addr'] is None:
-                            p['expand_addr'] = d['value']
-                        break
+            # Infer unresolved params from ancestor frames (pyelftools only).
+            # GDB backend resolves entry_values itself, so skip this.
+            if session.backend != 'gdb':
+                for p in result['params']:
                     if p['value'] is not None:
-                        break
+                        continue
+                    if _RE_MEM_LOC.match(p['location']):
+                        continue
+                    for anc_idx in range(frame_index + 1,
+                                         len(session.result.frames)):
+                        anc = session.result.frames[anc_idx]
+                        anc_dwarf = dwarf_for_frame(
+                            anc, session.source, session.extra_sources)
+                        if not anc_dwarf or not anc.address:
+                            continue
+                        anc_pc = anc.address
+                        if not anc.is_crash_frame and anc.call_addr:
+                            anc_pc = anc.call_addr - 1
+                        anc_ctx = _build_frame_ctx(anc, session, img_base)
+                        for var in (*anc_dwarf.get_params(anc_pc),
+                                    *anc_dwarf.get_locals(anc_pc)):
+                            if var.name != p['name']:
+                                continue
+                            d = _var_to_dict(var, anc_ctx)
+                            if d['value'] is None:
+                                continue
+                            p['value'] = d['value']
+                            if p['is_expandable'] and p['expand_addr'] is None:
+                                p['expand_addr'] = d['value']
+                            break
+                        if p['value'] is not None:
+                            break
 
             # Globals: pyelftools discovers CU-scope names, GDB backend
             # evaluates values (if available) for runtime-accurate data.
