@@ -22,7 +22,8 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-from backend.app import Session, register_session, create_app
+from backend.app import create_app
+from backend.session import Session, register_session
 from backend.decoder import analyze_rsod
 from backend.symbols import SymbolLoadError, load_symbols
 

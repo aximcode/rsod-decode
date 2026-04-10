@@ -4,308 +4,36 @@ Phase 1: In-memory session storage, file uploads to temp dir.
 """
 from __future__ import annotations
 
-import re
 import shutil
 import tempfile
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request
 from werkzeug.utils import secure_filename
 
-from .models import (
-    CrashInfo, FrameInfo, SymbolSource, VarInfo,
-    clean_path, dwarf_for_frame, find_source_file, module_key,
-)
+from .models import SymbolSource, clean_path, dwarf_for_frame, find_source_file
 from .corefile import write_corefile
-from .decoder import AnalysisResult, analyze_rsod
-from .dwarf_info import DwarfInfo
-from .gdb_bridge import GdbSession, find_gdb
+from .decoder import analyze_rsod
+from .gdb_bridge import GdbSession
+from .serializers import (
+    _RE_MEM_LOC, _build_frame_ctx, _var_to_dict,
+    crash_info_to_dict, dwarf_for_session, frame_to_dict, registers_to_dict,
+)
+from .session import (
+    Session, cleanup_session, gdb_available, get_session, pop_session,
+    register_session, store_session,
+)
 from .symbols import SymbolLoadError, load_symbols
 
 
-# =============================================================================
-# Session data
-# =============================================================================
-
-@dataclass
-class Session:
-    """In-memory session holding all analysis state."""
-    id: str
-    result: AnalysisResult
-    source: SymbolSource
-    extra_sources: dict[str, SymbolSource] = field(default_factory=dict)
-    rsod_text: str = ''
-    created_at: str = ''
-    temp_dir: Path | None = None
-    elf_path: Path | None = None
-    gdb: GdbSession | None = None
-    gdb_dwarf: object | None = None  # GdbBackend instance (alternative DWARF backend)
-    backend: str = 'pyelftools'  # 'pyelftools' or 'gdb'
-    frame_cache: dict[int, dict] = field(default_factory=dict)
-
-    @property
-    def img_base(self) -> int:
-        """Runtime image base: maps ELF addresses to runtime addresses."""
-        ci = self.result.crash_info
-        # Prefer image_base from the decoder (computed from -->PC/-->RIP
-        # line which has both absolute address and module offset)
-        if ci.image_base:
-            return ci.image_base
-        # Fallback: derive from crash PC and first frame's ELF offset
-        f0 = self.result.frames
-        if ci.crash_pc and f0 and f0[0].address:
-            return ci.crash_pc - f0[0].address
-        return 0
-
-
-# Global session store (Phase 1: in-memory)
-_sessions: dict[str, Session] = {}
-
-MAX_SESSIONS = 50
-
-
-def register_session(session: Session) -> None:
-    """Register a pre-built session (used by rsod-debug.py for CLI sessions)."""
-    _sessions[session.id] = session
-
-
-def _gdb_available() -> bool:
-    """Check if GDB and pygdbmi are available for backend switching."""
-    try:
-        if not find_gdb():
-            return False
-        import pygdbmi  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-# =============================================================================
-# Serialization helpers
-# =============================================================================
-
-def _dwarf_for(session: Session, frame: FrameInfo) -> object | None:
-    """Get the DWARF backend for a frame, respecting session backend choice."""
-    if session.backend == 'gdb' and session.gdb_dwarf:
-        return session.gdb_dwarf
-    return dwarf_for_frame(frame, session.source, session.extra_sources)
-
-
-def _crash_info_to_dict(info: CrashInfo) -> dict:
-    return {
-        'format': info.fmt,
-        'exception_desc': info.exception_desc,
-        'crash_pc': info.crash_pc,
-        'crash_symbol': info.crash_symbol,
-        'image_name': info.image_name,
-        'image_base': info.image_base,
-        'esr': info.esr,
-        'far': info.far,
-        'sp': info.sp,
-    }
-
-
-def _frame_to_dict(f: FrameInfo) -> dict:
-    return {
-        'index': f.index,
-        'address': f.address,
-        'call_addr': f.call_addr,
-        'is_crash_frame': f.is_crash_frame,
-        'module': f.module,
-        'symbol': f.symbol.name if f.symbol else None,
-        'sym_offset': f.sym_offset,
-        'source_loc': f.source_loc,
-        'inlines': [{'function': func, 'source_loc': loc}
-                     for func, loc in f.inlines],
-    }
-
-
-# Pattern for indirect memory locations: [REG+N] or [REG-N] or [REG]
-_RE_MEM_LOC = re.compile(r'^\[(\w+)([+-]\d+)?\]$')
-
-# Pattern for DW_OP_addr (absolute address for globals): 0xADDR
-_RE_ADDR_LOC = re.compile(r'^0x([0-9A-Fa-f]+)$')
-
-# Pattern for DW_OP_entry_value: (DW_OP_reg0 (x0)); DW_OP_stack_value)
-_RE_ENTRY_VALUE = re.compile(
-    r'\(DW_OP_entry_value:.*DW_OP_reg\d+\s+\((\w+)\).*DW_OP_stack_value\)')
-
-
-@dataclass
-class _FrameCtx:
-    """Context for resolving variable values within a specific frame."""
-    registers: dict[str, int]
-    stack_base: int
-    stack_mem: bytes
-    frame_fp: int
-    is_crash_frame: bool
-    has_unwound_regs: bool = False
-    frame_cfa: int = 0
-    dwarf: DwarfInfo | None = None
-    image_base: int = 0
-
-
-def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int | None:
-    """Read an integer from the stack dump at the given address."""
-    offset = addr - stack_base
-    if offset < 0 or offset + size > len(stack_mem):
-        return None
-    return int.from_bytes(stack_mem[offset:offset + size], 'little')
-
-
-def _build_frame_ctx(
-    frame: FrameInfo, session: Session, img_base: int,
-) -> _FrameCtx:
-    """Build a _FrameCtx for resolving variable values in *frame*."""
-    has_unwound = bool(frame.frame_registers)
-    regs = frame.frame_registers or session.result.crash_info.registers
-    return _FrameCtx(
-        registers=regs,
-        stack_base=session.result.stack_base,
-        stack_mem=session.result.stack_mem,
-        frame_fp=frame.frame_fp,
-        is_crash_frame=frame.is_crash_frame,
-        has_unwound_regs=has_unwound,
-        frame_cfa=frame.frame_cfa,
-        dwarf=dwarf_for_frame(
-            frame, session.source, session.extra_sources),
-        image_base=img_base,
-    )
-
-
-def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
-    # If the backend pre-resolved the value (GDB backend), use it directly
-    if v.value is not None or v.is_expandable is not None:
-        return {
-            'name': v.name,
-            'type': v.type_name,
-            'location': v.location,
-            'reg_name': v.reg_name,
-            'value': v.value,
-            'approximate': False,
-            'is_expandable': bool(v.is_expandable),
-            'expand_addr': v.expand_addr,
-            'string_preview': v.string_preview,
-            'type_offset': v.type_offset,
-            'cu_offset': v.cu_offset,
-            'var_key': v.var_key,
-        }
-
-    value = None
-    mem_addr: int | None = None  # memory address for expandable types
-    location = v.location
-    approximate = False
-
-    # Direct register location
-    if v.reg_name and v.reg_name in ctx.registers:
-        value = ctx.registers[v.reg_name]
-        if not ctx.is_crash_frame and not ctx.has_unwound_regs:
-            approximate = True
-    # DW_OP_entry_value — value at function entry. Only resolvable for
-    # crash frame (registers are exact) or if CFI recovered the register.
-    elif (m := _RE_ENTRY_VALUE.search(v.location)):
-        reg = m.group(1).upper()
-        location = f'{reg} (at entry)'
-        if reg in ctx.registers and (ctx.is_crash_frame or ctx.has_unwound_regs):
-            value = ctx.registers[reg]
-    # DW_OP_addr — absolute address (global/static variables).
-    # Values are ELF initializers, not runtime state — mark approximate.
-    elif (m := _RE_ADDR_LOC.match(v.location)) and ctx.dwarf:
-        elf_addr = int(m.group(1), 16)
-        runtime_addr = elf_addr + ctx.image_base
-        mem_addr = runtime_addr
-        approximate = True
-        size = v.byte_size or 8
-        if size <= 8:
-            value = ctx.dwarf.read_int(
-                runtime_addr, size,
-                ctx.stack_base, ctx.stack_mem, ctx.image_base)
-        else:
-            value = runtime_addr
-    # Indirect memory location: [REG+offset] or [CFA+offset]
-    elif ctx.stack_mem:
-        m = _RE_MEM_LOC.match(v.location)
-        if m:
-            reg = m.group(1)
-            off = int(m.group(2)) if m.group(2) else 0
-            if reg == 'CFA' and ctx.frame_cfa:
-                base = ctx.frame_cfa
-            elif reg == 'FP' and ctx.frame_fp:
-                base = ctx.frame_fp
-            else:
-                base = ctx.registers.get(reg)
-            if base is not None:
-                addr = base + off
-                mem_addr = addr
-                size = v.byte_size or 8
-                if size <= 8:
-                    value = _read_stack(addr, size, ctx.stack_base, ctx.stack_mem)
-                else:
-                    # Aggregate type — store the address, not the data
-                    value = addr
-    # Expandability and string preview
-    is_pointer = False
-    is_expandable = False
-    string_preview = None
-    expand_type_offset = v.type_offset
-    expand_cu_offset = v.cu_offset
-    if ctx.dwarf and v.type_offset:
-        type_die = ctx.dwarf.get_type_die(v.cu_offset, v.type_offset)
-        if type_die:
-            from .dwarf_info import _strip_qualifiers, _is_string_type
-            real = _strip_qualifiers(type_die)
-            if real:
-                is_pointer = real.tag == 'DW_TAG_pointer_type'
-                is_aggregate = real.tag in (
-                    'DW_TAG_structure_type', 'DW_TAG_class_type',
-                    'DW_TAG_union_type', 'DW_TAG_array_type')
-                is_expandable = is_aggregate
-                if is_pointer and 'DW_AT_type' in real.attributes:
-                    target = _strip_qualifiers(
-                        real.get_DIE_from_attribute('DW_AT_type'))
-                    if target and target.tag in (
-                            'DW_TAG_structure_type', 'DW_TAG_class_type',
-                            'DW_TAG_union_type'):
-                        is_expandable = True
-                        expand_type_offset = target.offset
-                        expand_cu_offset = target.cu.cu_offset
-                # String preview for char pointers
-                if is_pointer and value and _is_string_type(v.type_name):
-                    string_preview = ctx.dwarf.read_string(
-                        value, ctx.stack_base, ctx.stack_mem,
-                        ctx.image_base, max_len=64)
-
-    # expand_addr: address the frontend passes to /api/expand.
-    # For pointer-to-struct: the pointer value (target address).
-    # For embedded aggregates: the field's memory address.
-    expand_addr: int | None = None
-    if is_expandable:
-        if is_pointer and value is not None:
-            expand_addr = value
-        elif mem_addr is not None:
-            expand_addr = mem_addr
-
-    return {
-        'name': v.name,
-        'type': v.type_name,
-        'location': location,
-        'reg_name': v.reg_name,
-        'value': value,
-        'approximate': approximate,
-        'is_expandable': is_expandable,
-        'expand_addr': expand_addr,
-        'string_preview': string_preview,
-        'type_offset': expand_type_offset,
-        'cu_offset': expand_cu_offset,
-    }
-
-
-def _registers_to_dict(regs: dict[str, int]) -> dict:
-    return {k: f'0x{v:X}' for k, v in regs.items()}
-
+def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
+    """Look up a session by ID, returning (session, None) or (None, 404-response)."""
+    session = get_session(session_id)
+    if session is None:
+        return None, (jsonify(error='session not found'), 404)
+    return session, None
 
 
 # =============================================================================
@@ -331,11 +59,6 @@ def create_app(repo_root: Path | None = None,
             return jsonify(error='rsod_log file required'), 400
         if 'symbol_file' not in request.files:
             return jsonify(error='symbol_file required'), 400
-
-        # Evict oldest session if at capacity
-        if len(_sessions) >= MAX_SESSIONS:
-            oldest_id = next(iter(_sessions))
-            _cleanup_session(_sessions.pop(oldest_id))
 
         rsod_file = request.files['rsod_log']
         sym_file = request.files['symbol_file']
@@ -405,7 +128,7 @@ def create_app(repo_root: Path | None = None,
         )
 
         # Auto-initialize GDB backend if available
-        if _gdb_available():
+        if gdb_available():
             try:
                 from .gdb_backend import GdbBackend
                 frame_data = [(f.frame_fp, f.address)
@@ -419,11 +142,11 @@ def create_app(repo_root: Path | None = None,
             except Exception:
                 pass
 
-        _sessions[session_id] = session
+        store_session(session)
 
         return jsonify(
             session_id=session_id,
-            crash_summary=_crash_info_to_dict(analysis.crash_info),
+            crash_summary=crash_info_to_dict(analysis.crash_info),
             frame_count=len(analysis.frames),
         ), 201
 
@@ -431,21 +154,21 @@ def create_app(repo_root: Path | None = None,
     # GET /api/session/<id> — get crash summary + frames + registers
     # -----------------------------------------------------------------
     @app.get('/api/session/<session_id>')
-    def get_session(session_id: str):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+    def get_session_route(session_id: str):
+        session, err = _get_session(session_id)
+        if err:
+            return err
         r = session.result
         return jsonify(
-            crash_summary=_crash_info_to_dict(r.crash_info),
-            frames=[_frame_to_dict(f) for f in r.frames],
-            registers=_registers_to_dict(r.crash_info.registers),
+            crash_summary=crash_info_to_dict(r.crash_info),
+            frames=[frame_to_dict(f) for f in r.frames],
+            registers=registers_to_dict(r.crash_info.registers),
             v_registers=r.crash_info.v_registers,
             format=r.rsod_format,
             call_verified={str(k): v for k, v in r.call_verified.items()},
             rsod_text=session.rsod_text,
             backend=session.backend,
-            gdb_available=_gdb_available(),
+            gdb_available=gdb_available(),
             modules=r.modules,
             lbr=r.crash_info.lbr,
         )
@@ -455,9 +178,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.get('/api/frame/<session_id>/<int:frame_index>')
     def get_frame(session_id: str, frame_index: int):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
@@ -466,9 +189,9 @@ def create_app(repo_root: Path | None = None,
             return jsonify(session.frame_cache[frame_index])
 
         frame = session.result.frames[frame_index]
-        result: dict = _frame_to_dict(frame)
+        result: dict = frame_to_dict(frame)
 
-        dwarf = _dwarf_for(session, frame)
+        dwarf = dwarf_for_session(session, frame)
         img_base = session.img_base
         if dwarf and frame.address:
             ctx = _build_frame_ctx(frame, session, img_base)
@@ -540,7 +263,7 @@ def create_app(repo_root: Path | None = None,
 
         result['call_verified'] = session.result.call_verified.get(frame.address)
         if frame.frame_registers:
-            result['frame_registers'] = _registers_to_dict(frame.frame_registers)
+            result['frame_registers'] = registers_to_dict(frame.frame_registers)
         session.frame_cache[frame_index] = result
         return jsonify(result)
 
@@ -549,9 +272,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.get('/api/expand/<session_id>/<int:frame_index>')
     def expand_var(session_id: str, frame_index: int):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
@@ -565,7 +288,7 @@ def create_app(repo_root: Path | None = None,
         count = request.args.get('count', default=32, type=int)
 
         frame = session.result.frames[frame_index]
-        dwarf = _dwarf_for(session, frame)
+        dwarf = dwarf_for_session(session, frame)
         if not dwarf:
             return jsonify(fields=[], total_count=0)
 
@@ -593,9 +316,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.get('/api/memory/<session_id>')
     def get_memory(session_id: str):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
 
         addr = request.args.get('addr', type=lambda x: int(x, 16))
         size = min(request.args.get('size', default=256, type=int), 4096)
@@ -642,9 +365,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.post('/api/eval/<session_id>/<int:frame_index>')
     def eval_expression(session_id: str, frame_index: int):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
@@ -670,9 +393,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.get('/api/regions/<session_id>')
     def get_regions(session_id: str):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
 
         regions: list[dict] = []
         sb = session.result.stack_base
@@ -704,14 +427,14 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.get('/api/disasm/<session_id>/<int:frame_index>')
     def get_disasm(session_id: str, frame_index: int):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
         frame = session.result.frames[frame_index]
-        dwarf = _dwarf_for(session, frame)
+        dwarf = dwarf_for_session(session, frame)
         # Use call_addr for disassembly center and target highlight
         target_addr = frame.call_addr or frame.address
         if not dwarf or not target_addr:
@@ -737,9 +460,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.get('/api/source/<session_id>/<int:frame_index>')
     def get_source(session_id: str, frame_index: int):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
@@ -793,9 +516,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.post('/api/resolve/<session_id>')
     def resolve_address(session_id: str):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
 
         data = request.get_json(silent=True) or {}
         addr_str = data.get('address', '')
@@ -832,9 +555,9 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.post('/api/backend/<session_id>')
     def switch_backend(session_id: str):
-        session = _sessions.get(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
+        session, err = _get_session(session_id)
+        if err:
+            return err
 
         data = request.get_json(silent=True) or {}
         target = data.get('backend', '')
@@ -845,7 +568,7 @@ def create_app(repo_root: Path | None = None,
             return jsonify(backend=session.backend)
 
         if target == 'gdb':
-            if not _gdb_available():
+            if not gdb_available():
                 return jsonify(error='GDB/pygdbmi not available'), 400
             if not session.gdb_dwarf:
                 try:
@@ -873,10 +596,10 @@ def create_app(repo_root: Path | None = None,
     # -----------------------------------------------------------------
     @app.delete('/api/session/<session_id>')
     def delete_session(session_id: str):
-        session = _sessions.pop(session_id, None)
+        session = pop_session(session_id)
         if not session:
             return jsonify(error='session not found'), 404
-        _cleanup_session(session)
+        cleanup_session(session)
         return jsonify(deleted=True)
 
     # -----------------------------------------------------------------
@@ -888,7 +611,7 @@ def create_app(repo_root: Path | None = None,
 
         @sock.route('/ws/gdb/<session_id>')
         def gdb_terminal(ws, session_id: str):
-            session = _sessions.get(session_id)
+            session = get_session(session_id)
             if not session:
                 ws.close(reason='session not found')
                 return
@@ -957,20 +680,6 @@ def create_app(repo_root: Path | None = None,
         pass  # flask-sock not installed, GDB terminal disabled
 
     return app
-
-
-def _cleanup_session(session: Session) -> None:
-    """Close file handles, kill GDB, and remove temp files for a session."""
-    if session.gdb:
-        session.gdb.close()
-        session.gdb = None
-    if session.source.dwarf:
-        session.source.dwarf.close()
-    for src in session.extra_sources.values():
-        if src.dwarf:
-            src.dwarf.close()
-    if session.temp_dir and session.temp_dir.exists():
-        shutil.rmtree(session.temp_dir, ignore_errors=True)
 
 
 
