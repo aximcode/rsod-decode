@@ -159,6 +159,44 @@ class GdbBackend:
         return idx
 
     # -----------------------------------------------------------------
+    # Expression evaluation
+    # -----------------------------------------------------------------
+
+    def evaluate_expression(self, addr: int, expr: str) -> dict:
+        """Evaluate a C expression in the given frame context.
+
+        Returns {'value': str, 'type': str} or {'error': str}.
+        """
+        if self._select_frame(addr) is None:
+            return {'error': 'Frame not found'}
+
+        # Get value
+        responses = self._cmd(f'-data-evaluate-expression {expr}')
+        value = None
+        for r in responses:
+            if r['type'] == 'result':
+                if r.get('message') == 'error':
+                    msg = r.get('payload', {}).get('msg', 'Unknown error')
+                    return {'error': msg}
+                if r.get('payload', {}).get('value'):
+                    value = r['payload']['value']
+
+        if value is None:
+            return {'error': 'No result'}
+
+        # Get type via "whatis" console command
+        type_name = ''
+        for r in self._cmd(f'whatis {expr}'):
+            if r.get('type') == 'console':
+                payload = r.get('payload', '')
+                # GDB outputs "type = int\n"
+                if 'type = ' in payload:
+                    type_name = payload.split('type = ', 1)[1].strip()
+                    break
+
+        return {'value': value, 'type': type_name}
+
+    # -----------------------------------------------------------------
     # Variable extraction
     # -----------------------------------------------------------------
 
@@ -269,13 +307,18 @@ class GdbBackend:
                     var.is_expandable = True
                     var.var_key = var_key
                     self._var_objects.add(var_key)
-                    # Get address for expand_addr
-                    addr_payload = self._result(
-                        f'-data-evaluate-expression &{name}')
-                    addr_val = _parse_int(addr_payload.get('value', ''))
-                    var.expand_addr = addr_val
-                    if var.value is None:
-                        var.value = addr_val
+                    # expand_addr: for pointers, use the pointer value
+                    # (where it points); for structs/arrays, use &name
+                    if var.value is not None and '*' in type_name:
+                        var.expand_addr = var.value
+                    else:
+                        addr_payload = self._result(
+                            f'-data-evaluate-expression &{name}')
+                        addr_val = _parse_int(
+                            addr_payload.get('value', ''))
+                        var.expand_addr = addr_val
+                        if var.value is None:
+                            var.value = addr_val
                 else:
                     self._cmd(f'-var-delete {var_key}')
             except Exception:
@@ -302,10 +345,23 @@ class GdbBackend:
         if not var_key:
             return [], 0
 
+        # Resolve actual address if the caller passed 0 (frontend
+        # default when expand_addr was None)
+        if addr == 0:
+            path_payload = self._result(
+                f'-var-info-path-expression {var_key}')
+            path_expr = path_payload.get('path_expr', '')
+            if path_expr:
+                addr_payload = self._result(
+                    f'-data-evaluate-expression &({path_expr})')
+                resolved = _parse_int(addr_payload.get('value', ''))
+                if resolved is not None:
+                    addr = resolved
+
         # Check if the struct/array base address is in known memory.
         # The core file fills unmapped regions with zeroes, so GDB
         # would report 0 for fields that don't actually exist.
-        addr_valid = self._has_memory(addr)
+        addr_valid = addr == 0 or self._has_memory(addr)
 
         payload = self._result(f'-var-list-children --all-values {var_key}')
         children = payload.get('children', [])

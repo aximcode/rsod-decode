@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import type { FrameDetail, Instruction, SourceLine, VarInfo } from '../types'
+import { ExpressionEval } from './ExpressionEval'
 import { formatValueWithHex } from './HexAddress'
 import { MemoryView } from './MemoryView'
 
@@ -12,6 +13,7 @@ interface Props {
   isCrashFrame: boolean
   memoryNav: { addr: number; id: number } | null
   onNavigateMemory: (addr: number) => void
+  backend: string
 }
 
 function filterVars(vars: VarInfo[]): VarInfo[] {
@@ -21,7 +23,8 @@ function filterVars(vars: VarInfo[]): VarInfo[] {
 type TabId = 'Params' | 'Locals' | 'Globals' | 'Disassembly' | 'Source' | 'Memory'
 const TABS: TabId[] = ['Params', 'Locals', 'Globals', 'Disassembly', 'Source', 'Memory']
 
-export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, memoryNav, onNavigateMemory }: Props) {
+export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, memoryNav, onNavigateMemory, backend }: Props) {
+  const [evalOpen, setEvalOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('Params')
   const [disasm, setDisasm] = useState<Instruction[] | null>(null)
   const [disasmLoading, setDisasmLoading] = useState(false)
@@ -114,6 +117,27 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, me
         <span className="text-zinc-200">{frame.symbol ?? '???'}</span>
         {frame.source_loc && (
           <span className="text-zinc-500 ml-2">{frame.source_loc}</span>
+        )}
+      </div>
+
+      {/* Expression evaluator */}
+      <div className="border-b border-zinc-800">
+        <button
+          onClick={() => setEvalOpen(!evalOpen)}
+          className="w-full px-4 py-1 text-xs text-zinc-500 hover:text-zinc-300 text-left flex items-center gap-1"
+        >
+          <span>{evalOpen ? '\u25BE' : '\u25B8'}</span>
+          Expression
+        </button>
+        {evalOpen && (
+          <div className="px-4 pb-2">
+            <ExpressionEval
+              sessionId={sessionId}
+              frameIndex={frame.index}
+              backend={backend}
+              onNavigateMemory={handleNavigateMemory}
+            />
+          </div>
         )}
       </div>
 

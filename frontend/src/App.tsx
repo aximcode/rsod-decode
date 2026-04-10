@@ -74,6 +74,7 @@ export function App() {
               isCrashFrame={state.selectedFrame === 0}
               memoryNav={memoryNav}
               onNavigateMemory={navigateToMemory}
+              backend={state.data.backend}
             />
           </div>
           <div

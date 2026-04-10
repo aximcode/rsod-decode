@@ -144,6 +144,18 @@ export async function getRegions(
   return request(`/api/regions/${sessionId}`)
 }
 
+export async function evalExpression(
+  sessionId: string,
+  frameIndex: number,
+  expr: string,
+): Promise<{ value?: string; type?: string; error?: string }> {
+  return request(`/api/eval/${sessionId}/${frameIndex}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expr }),
+  })
+}
+
 export async function getMemory(
   sessionId: string,
   addr: number,

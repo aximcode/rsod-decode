@@ -393,7 +393,24 @@ def create_app(repo_root: Path | None = None,
             rsod_text=rsod_text,
             created_at=datetime.now(timezone.utc).isoformat(),
             temp_dir=temp_dir,
+            elf_path=sym_path,
         )
+
+        # Auto-initialize GDB backend if available
+        if _gdb_available():
+            try:
+                from .gdb_backend import GdbBackend
+                frame_data = [(f.frame_fp, f.address)
+                              for f in analysis.frames]
+                session.gdb_dwarf = GdbBackend(
+                    sym_path, analysis.crash_info.registers,
+                    analysis.crash_info.crash_pc,
+                    analysis.stack_base, analysis.stack_mem,
+                    session.img_base, frames=frame_data)
+                session.backend = 'gdb'
+            except Exception:
+                pass
+
         _sessions[session_id] = session
 
         return jsonify(
@@ -608,6 +625,34 @@ def create_app(repo_root: Path | None = None,
                 result_bytes.extend([None] * chunk_size)
 
         return jsonify(address=addr, bytes=result_bytes)
+
+    # -----------------------------------------------------------------
+    # POST /api/eval/<session_id>/<frame_index> — evaluate expression
+    # -----------------------------------------------------------------
+    @app.post('/api/eval/<session_id>/<int:frame_index>')
+    def eval_expression(session_id: str, frame_index: int):
+        session = _sessions.get(session_id)
+        if not session:
+            return jsonify(error='session not found'), 404
+        if frame_index < 0 or frame_index >= len(session.result.frames):
+            return jsonify(error='frame index out of range'), 404
+
+        if session.backend != 'gdb' or not session.gdb_dwarf:
+            return jsonify(error='Expression evaluation requires GDB backend'), 400
+
+        data = request.get_json(silent=True) or {}
+        expr = data.get('expr', '').strip()
+        if not expr:
+            return jsonify(error='expr required'), 400
+
+        frame = session.result.frames[frame_index]
+        from .gdb_backend import GdbBackend
+        if isinstance(session.gdb_dwarf, GdbBackend):
+            result = session.gdb_dwarf.evaluate_expression(
+                frame.address, expr)
+            return jsonify(result)
+
+        return jsonify(error='GDB backend not available'), 400
 
     # -----------------------------------------------------------------
     # GET /api/regions/<session_id> — known memory regions
