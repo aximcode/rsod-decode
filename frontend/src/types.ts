@@ -18,6 +18,8 @@ export interface InlineInfo {
 export interface FrameSummary {
   index: number
   address: number
+  call_addr: number
+  is_crash_frame: boolean
   module: string
   symbol: string | null
   sym_offset: number
@@ -37,6 +39,19 @@ export interface VarInfo {
   string_preview: string | null
   type_offset: number
   cu_offset: number
+}
+
+export interface ExpandField {
+  name: string
+  type: string
+  value: number | null
+  byte_size: number
+  is_expandable: boolean
+  expand_addr: number | null
+  string_preview: string | null
+  type_offset: number
+  cu_offset: number
+  access?: string
 }
 
 export interface FrameDetail extends FrameSummary {

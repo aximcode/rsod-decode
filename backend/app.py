@@ -39,11 +39,25 @@ class Session:
     created_at: str = ''
     temp_dir: Path | None = None
 
+    @property
+    def img_base(self) -> int:
+        """Runtime image base: maps ELF addresses to runtime addresses."""
+        ci = self.result.crash_info
+        f0 = self.result.frames
+        if ci.crash_pc and f0 and f0[0].address:
+            return ci.crash_pc - f0[0].address
+        return 0
+
 
 # Global session store (Phase 1: in-memory)
 _sessions: dict[str, Session] = {}
 
 MAX_SESSIONS = 50
+
+
+def register_session(session: Session) -> None:
+    """Register a pre-built session (used by rsod-debug.py for CLI sessions)."""
+    _sessions[session.id] = session
 
 
 # =============================================================================
@@ -113,7 +127,7 @@ def _read_stack(addr: int, size: int, stack_base: int, stack_mem: bytes) -> int 
 
 
 def _build_frame_ctx(
-    frame: FrameInfo, session: object, img_base: int,
+    frame: FrameInfo, session: Session, img_base: int,
 ) -> _FrameCtx:
     """Build a _FrameCtx for resolving variable values in *frame*."""
     has_unwound = bool(frame.frame_registers)
@@ -186,6 +200,7 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
                     # Aggregate type — store the address, not the data
                     value = addr
     # Expandability and string preview
+    is_pointer = False
     is_expandable = False
     string_preview = None
     expand_type_offset = v.type_offset
@@ -380,10 +395,7 @@ def create_app(repo_root: Path | None = None,
         # Use the correct DWARF source for this frame's module
         dwarf = dwarf_for_frame(
             frame, session.source, session.extra_sources)
-        ci = session.result.crash_info
-        frames0 = session.result.frames
-        img_base = (ci.crash_pc - frames0[0].address
-                    if ci.crash_pc and frames0 else 0)
+        img_base = session.img_base
         if dwarf and frame.address:
             ctx = _build_frame_ctx(frame, session, img_base)
             # For non-crash frames, use call_addr - 1 for DWARF location
@@ -473,14 +485,10 @@ def create_app(repo_root: Path | None = None,
         if not type_die:
             return jsonify(fields=[], total_count=0)
 
-        ci = session.result.crash_info
-        frames0 = session.result.frames
-        img_base = (ci.crash_pc - frames0[0].address
-                    if ci.crash_pc and frames0 else 0)
         fields, total_count = dwarf.expand_type(
             type_die, addr,
             session.result.stack_base, session.result.stack_mem,
-            img_base, offset, count)
+            session.img_base, offset, count)
         return jsonify(fields=fields, total_count=total_count)
 
     # -----------------------------------------------------------------

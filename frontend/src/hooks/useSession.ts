@@ -21,7 +21,7 @@ export function useSession() {
   useEffect(() => {
     const cleanup = () => {
       if (sessionIdRef.current) {
-        navigator.sendBeacon(`/api/session/${sessionIdRef.current}`)
+        fetch(`/api/session/${sessionIdRef.current}`, { method: 'DELETE', keepalive: true })
       }
     }
     window.addEventListener('beforeunload', cleanup)

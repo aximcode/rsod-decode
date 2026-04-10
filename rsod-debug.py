@@ -22,7 +22,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-from backend.app import Session, _sessions, create_app
+from backend.app import Session, register_session, create_app
 from backend.decoder import analyze_rsod
 from backend.symbols import SymbolLoadError, load_symbols
 
@@ -126,14 +126,14 @@ def main() -> None:
         result = analyze_rsod(rsod_text, source, extra_sources, base_override)
 
         session_id = uuid.uuid4().hex[:12]
-        _sessions[session_id] = Session(
+        register_session(Session(
             id=session_id,
             result=result,
             source=source,
             extra_sources=extra_sources,
             rsod_text=rsod_text,
             created_at=datetime.now(timezone.utc).isoformat(),
-        )
+        ))
 
         _log(f"Session {session_id}: {len(result.frames)} frames, "
              f"{result.resolved_count} addresses resolved")

@@ -1,11 +1,14 @@
 import type {
   CreateSessionResponse,
+  ExpandField,
   FrameDetail,
   Instruction,
   SessionData,
   SourceLine,
   UploadOptions,
 } from './types'
+
+export type { ExpandField }
 
 class ApiError extends Error {
   override name = 'ApiError'
@@ -18,12 +21,14 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init)
   if (!res.ok) {
     let message = `HTTP ${res.status}`
-    try {
-      const body = await res.json()
-      if (body.error) message = body.error
-    } catch {
-      const text = await res.text().catch(() => '')
-      if (text) message = text.slice(0, 200)
+    const text = await res.text().catch(() => '')
+    if (text) {
+      try {
+        const body = JSON.parse(text)
+        if (body.error) message = body.error
+      } catch {
+        message = text.slice(0, 200)
+      }
     }
     throw new ApiError(res.status, message)
   }
@@ -98,18 +103,6 @@ export async function resolveAddress(
   })
 }
 
-export interface ExpandField {
-  name: string
-  type: string
-  value: number | null
-  byte_size: number
-  is_expandable: boolean
-  expand_addr: number | null
-  string_preview: string | null
-  type_offset: number
-  cu_offset: number
-  access?: string
-}
 
 export async function expandVar(
   sessionId: string,

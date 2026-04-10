@@ -183,7 +183,9 @@ def format_source_context(
         if src_lines:
             display_path = f"{file_part} @ {git_ref.short}"
     else:
-        src_path = source_root / file_part
+        src_path = find_source_file(source_root, file_part, target_line)
+        if not src_path:
+            src_path = source_root / file_part
         if not src_path.is_file():
             return []
         try:
@@ -361,6 +363,8 @@ def analyze_rsod(
     # 6. FP chain unwinding: ARM64 formats with raw stack dumps
     fp_unwound = False
     chain: list[tuple[int, int]] = []
+    stack_base = 0
+    stack_mem = b''
     if decoder.supports_fp_chain():
         stack_base, stack_mem = parse_stack_dump(lines)
         if stack_mem:
@@ -466,8 +470,8 @@ def analyze_rsod(
         rsod_format=decoder.name,
         call_verified=call_verified,
         line_info_by_module=line_info_by_module,
-        stack_base=stack_base if decoder.supports_fp_chain() else 0,
-        stack_mem=stack_mem if decoder.supports_fp_chain() else b'',
+        stack_base=stack_base,
+        stack_mem=stack_mem,
     )
 
 

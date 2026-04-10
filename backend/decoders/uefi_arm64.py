@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable
 from typing import ClassVar
 
-from ..models import CrashInfo, FrameInfo, SymbolSource, SymbolTable
+from ..models import CrashInfo, FrameInfo, SymbolSource, SymbolTable, module_key
 from .base import (
     FormatDecoder,
     annotate_regs,
@@ -103,7 +103,7 @@ class UefiArm64Decoder(FormatDecoder):
         for line in lines:
             fm = RE_ARM64_FRAME.match(line)
             if fm:
-                mod_key = fm.group(3).replace('.efi', '').lower()
+                mod_key = module_key(fm.group(3))
                 module_addrs.setdefault(mod_key, []).append(
                     int(fm.group(4), 16))
             pc = RE_PC_LINE.match(line)
@@ -159,7 +159,7 @@ class UefiArm64Decoder(FormatDecoder):
                 module = fm.group(3)
                 offset_in_module = int(fm.group(4), 16)
 
-                mod_key = module.replace('.efi', '').lower()
+                mod_key = module_key(module)
                 src = (extra_sources or {}).get(mod_key)
                 use_table = src.table if src else table
                 use_info = line_info_by_module.get(

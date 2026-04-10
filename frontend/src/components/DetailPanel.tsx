@@ -46,27 +46,27 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
   // Fetch disasm when tab selected
   useEffect(() => {
     if (activeTab !== 'Disassembly' || !frame || disasm !== null || disasmLoading) return
+    let stale = false
     setDisasmLoading(true)
     api.getDisasm(sessionId, frame.index).then(r => {
-      setDisasm(r.instructions)
-      setDisasmLoading(false)
+      if (!stale) { setDisasm(r.instructions); setDisasmLoading(false) }
     }).catch(() => {
-      setDisasm([])
-      setDisasmLoading(false)
+      if (!stale) { setDisasm([]); setDisasmLoading(false) }
     })
+    return () => { stale = true }
   }, [activeTab, frame, sessionId, disasm, disasmLoading])
 
   // Fetch source when tab selected
   useEffect(() => {
     if (activeTab !== 'Source' || !frame || source !== null || sourceLoading) return
+    let stale = false
     setSourceLoading(true)
     api.getSource(sessionId, frame.index).then(r => {
-      setSource(r)
-      setSourceLoading(false)
+      if (!stale) { setSource(r); setSourceLoading(false) }
     }).catch(() => {
-      setSource({ file: '', target_line: 0, lines: [] })
-      setSourceLoading(false)
+      if (!stale) { setSource({ file: '', target_line: 0, lines: [] }); setSourceLoading(false) }
     })
+    return () => { stale = true }
   }, [activeTab, frame, sessionId, source, sourceLoading])
 
   if (loading) {
@@ -174,8 +174,8 @@ function VarsTable({ vars, isCrashFrame, label, sessionId, frameIndex, note }: V
           </tr>
         </thead>
         <tbody className="divide-y divide-zinc-800/50">
-          {vars.map((v, i) => (
-            <VarRow key={i} v={v} isCrashFrame={isCrashFrame} depth={0}
+          {vars.map((v) => (
+            <VarRow key={`${frameIndex}-${v.name}`} v={v} isCrashFrame={isCrashFrame} depth={0}
                     sessionId={sessionId} frameIndex={frameIndex} />
           ))}
         </tbody>
@@ -253,8 +253,8 @@ function VarRow({ v, isCrashFrame, depth, sessionId, frameIndex }: {
           )}
         </td>
       </tr>
-      {expanded && children?.map((child, i) => (
-        <VarRow key={i} v={child} isCrashFrame={isCrashFrame} depth={depth + 1}
+      {expanded && children?.map((child) => (
+        <VarRow key={child.name} v={child} isCrashFrame={isCrashFrame} depth={depth + 1}
                 sessionId={sessionId} frameIndex={frameIndex} />
       ))}
       {expanded && hasMore && (

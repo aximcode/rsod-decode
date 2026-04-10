@@ -473,6 +473,15 @@ class DwarfInfo:
         # Capstone disassembler (cached)
         self._cs = Cs(self._cs_arch, self._cs_mode)
 
+        # Memory context for expand_type (not thread-safe)
+        self._mem_ctx: tuple[int, bytes, int] = (0, b'', 0)
+
+        # Cached CFI unwinder (lazily created by get_cfi_unwinder)
+        self._cfi_unwinder: CFIUnwinder | None = None
+
+        # Cache for _find_function_die lookups
+        self._func_die_cache: dict[int, DIE | None] = {}
+
         # Cache ELF sections for memory reads
         self._sections: list[tuple[int, bytes]] = []  # (base_addr, data)
         for name in ('.text', '.rodata', '.data'):
@@ -493,7 +502,9 @@ class DwarfInfo:
         return self._dwarf_prefix
 
     def get_cfi_unwinder(self) -> CFIUnwinder | None:
-        """Create a CFI unwinder from .eh_frame data, or None if unavailable."""
+        """Return a CFI unwinder from .eh_frame data (cached after first call)."""
+        if self._cfi_unwinder is not None:
+            return self._cfi_unwinder
         if not self._dwarf:
             return None
         try:
@@ -509,7 +520,8 @@ class DwarfInfo:
         else:
             reg_names = _X86_64_REG_NAMES
             callee_saved = _X86_64_CALLEE_SAVED
-        return CFIUnwinder(fdes, reg_names, callee_saved)
+        self._cfi_unwinder = CFIUnwinder(fdes, reg_names, callee_saved)
+        return self._cfi_unwinder
 
     # -----------------------------------------------------------------
     # Memory reading (ELF sections + external stack dump)
@@ -1200,14 +1212,18 @@ class DwarfInfo:
     # -----------------------------------------------------------------
 
     def _find_function_die(self, addr: int) -> DIE | None:
-        """Find the DW_TAG_subprogram DIE containing addr."""
+        """Find the DW_TAG_subprogram DIE containing addr (cached)."""
+        if addr in self._func_die_cache:
+            return self._func_die_cache[addr]
         cu = self._get_cu_for_addr(addr)
-        if not cu:
-            return None
-        for die in cu.iter_DIEs():
-            if die.tag == 'DW_TAG_subprogram' and _die_contains_addr(die, addr):
-                return die
-        return None
+        result = None
+        if cu:
+            for die in cu.iter_DIEs():
+                if die.tag == 'DW_TAG_subprogram' and _die_contains_addr(die, addr):
+                    result = die
+                    break
+        self._func_die_cache[addr] = result
+        return result
 
     # -----------------------------------------------------------------
     # Internal: variable extraction (shared by params, locals, globals)

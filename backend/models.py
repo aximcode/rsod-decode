@@ -195,8 +195,11 @@ def _build_file_index(repo_root: Path) -> None:
     _file_index = {}
     _file_index_root = root_str
     skip = {'.git', '__pycache__', 'node_modules', 'archive'}
+    src_exts = {'.c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.s', '.asm',
+                '.inc', '.inf', '.dsc', '.dec', '.py', '.rs'}
     for p in repo_root.rglob('*'):
-        if p.is_file() and not any(part.lower() in skip for part in p.parts):
+        if (p.is_file() and p.suffix.lower() in src_exts
+                and not any(part.lower() in skip for part in p.parts)):
             key = (root_str, p.name.lower())
             _file_index.setdefault(key, []).append(p)
 
