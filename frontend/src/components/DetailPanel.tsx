@@ -95,7 +95,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden">
+    <div className="h-full flex flex-col overflow-hidden">
       {/* Frame header */}
       <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/50 font-mono text-sm">
         <span className="text-zinc-500">#{frame.index}</span>{' '}
@@ -126,7 +126,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame }: 
       </div>
 
       {/* Tab content */}
-      <div className="flex-1 overflow-auto p-4">
+      <div className="flex-1 min-h-0 overflow-auto p-4">
         {activeTab === 'Params' && <VarsTable vars={filterVars(frame.params)} isCrashFrame={isCrashFrame} label="parameters" sessionId={sessionId} frameIndex={frame.index} />}
         {activeTab === 'Locals' && <VarsTable vars={filterVars(frame.locals)} isCrashFrame={isCrashFrame} label="local variables" sessionId={sessionId} frameIndex={frame.index} />}
         {activeTab === 'Globals' && <VarsTable vars={filterVars(frame.globals)} isCrashFrame={isCrashFrame} label="global variables" sessionId={sessionId} frameIndex={frame.index} note="Runtime values not available — expand structs to see initial values from the ELF image" />}

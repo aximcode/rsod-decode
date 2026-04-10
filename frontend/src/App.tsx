@@ -44,15 +44,15 @@ export function App() {
   return (
     <div className="flex flex-col h-screen">
       <CrashBanner crash={state.data.crash_summary} onNewAnalysis={reset} />
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         <BacktracePanel
           frames={state.data.frames}
           callVerified={state.data.call_verified}
           selectedIndex={state.selectedFrame}
           onSelect={selectFrame}
         />
-        <div className="flex flex-col flex-1 overflow-hidden">
-          <div className={`flex-1 overflow-hidden ${gdbOpen ? '' : 'flex-1'}`}>
+        <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+          <div className="flex-1 min-h-0 overflow-hidden">
             <DetailPanel
               sessionId={state.sessionId}
               frame={state.frameDetail}
