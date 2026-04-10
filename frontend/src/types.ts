@@ -78,15 +78,24 @@ export interface SourceLine {
   is_target: boolean
 }
 
+export interface ModuleInfo {
+  index: number
+  name: string
+  base: number
+  debug_path: string
+}
+
 export interface SessionData {
   crash_summary: CrashSummary
   frames: FrameSummary[]
   registers: Record<string, string>
+  v_registers: Record<string, string>
   format: string
   call_verified: Record<string, boolean>
   rsod_text: string
   backend: string
   gdb_available: boolean
+  modules: ModuleInfo[]
 }
 
 export interface CreateSessionResponse {

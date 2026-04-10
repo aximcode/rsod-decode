@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
-import type { FrameDetail, Instruction, SourceLine, VarInfo } from '../types'
+import type { FrameDetail, Instruction, ModuleInfo, SourceLine, VarInfo } from '../types'
 import { ExpressionEval } from './ExpressionEval'
 import { formatValueWithHex } from './HexAddress'
 import { MemoryView } from './MemoryView'
@@ -15,16 +15,18 @@ interface Props {
   memoryNav: { addr: number; id: number } | null
   onNavigateMemory: (addr: number) => void
   backend: string
+  rsodText?: string
+  modules?: ModuleInfo[]
 }
 
 function filterVars(vars: VarInfo[]): VarInfo[] {
   return vars.filter(v => v.name !== '???')
 }
 
-type TabId = 'Params' | 'Locals' | 'Globals' | 'Disassembly' | 'Source' | 'Memory'
-const TABS: TabId[] = ['Params', 'Locals', 'Globals', 'Disassembly', 'Source', 'Memory']
+type TabId = 'Params' | 'Locals' | 'Globals' | 'Disassembly' | 'Source' | 'Memory' | 'RSOD Log'
+const TABS: TabId[] = ['Params', 'Locals', 'Globals', 'Disassembly', 'Source', 'Memory', 'RSOD Log']
 
-export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, memoryNav, onNavigateMemory, backend }: Props) {
+export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, memoryNav, onNavigateMemory, backend, rsodText, modules }: Props) {
   const [evalOpen, setEvalOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('Params')
   const [disasm, setDisasm] = useState<Instruction[] | null>(null)
@@ -180,6 +182,7 @@ export function DetailPanel({ sessionId, frame, loading, error, isCrashFrame, me
         {activeTab === 'Disassembly' && <DisassemblyView instructions={disasm} loading={disasmLoading} />}
         {activeTab === 'Source' && <SourceView source={source} loading={sourceLoading} />}
         {activeTab === 'Memory' && <MemoryView sessionId={sessionId} address={memoryAddr} onNavigateMemory={handleNavigateMemory} />}
+        {activeTab === 'RSOD Log' && <RsodLogView rsodText={rsodText} modules={modules} />}
       </div>
     </div>
   )
@@ -424,6 +427,47 @@ function SourceView({ source, loading }: { source: { file: string; target_line: 
           <span className="whitespace-pre">{line.text}</span>
         </div>
       ))}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// RSOD Log + Module table
+// ---------------------------------------------------------------------------
+
+function RsodLogView({ rsodText, modules }: { rsodText?: string; modules?: ModuleInfo[] }) {
+  return (
+    <div className="font-mono text-xs">
+      {modules && modules.length > 0 && (
+        <div className="mb-4">
+          <div className="text-zinc-500 text-xs uppercase tracking-wider mb-1">Loaded Modules</div>
+          <table className="w-full">
+            <thead>
+              <tr className="text-left text-zinc-600">
+                <th className="pr-3 pb-1">#</th>
+                <th className="pr-3 pb-1">Module</th>
+                <th className="pr-3 pb-1">Base</th>
+                <th className="pb-1">Debug Path</th>
+              </tr>
+            </thead>
+            <tbody>
+              {modules.map(m => (
+                <tr key={m.index} className="text-zinc-400">
+                  <td className="pr-3 py-0.5 text-zinc-600">{m.index}</td>
+                  <td className="pr-3 py-0.5 text-zinc-300">{m.name}</td>
+                  <td className="pr-3 py-0.5 text-zinc-500">{m.base ? `0x${m.base.toString(16).toUpperCase()}` : ''}</td>
+                  <td className="py-0.5 text-zinc-600 truncate max-w-xs" title={m.debug_path}>{m.debug_path}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {rsodText ? (
+        <pre className="text-zinc-400 whitespace-pre-wrap break-all">{rsodText}</pre>
+      ) : (
+        <div className="text-zinc-600">No RSOD text available</div>
+      )}
     </div>
   )
 }

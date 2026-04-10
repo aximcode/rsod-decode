@@ -37,6 +37,10 @@ RE_EDK2_ARM64_PC_FRAME = re.compile(
 RE_EDK2_ARM64_REG = re.compile(
     r'(X\d+|FP|LR|SP|ELR|SPSR|FPSR|FAR|ESR)\s+0x([0-9A-Fa-f]+)')
 
+# "  V0 0xAFAFAFAFAFAFAFAF AFAFAFAFAFAFAFAF"
+RE_EDK2_ARM64_VREG = re.compile(
+    r'(V\d+)\s+0x([0-9A-Fa-f]{16})\s+([0-9A-Fa-f]{16})')
+
 # "[ 0] /home/.../CrashTest.dll"
 RE_EDK2_ARM64_MODULE = re.compile(r'^\[\s*(\d+)\]\s+(\S+)')
 
@@ -67,6 +71,8 @@ class Edk2Arm64Decoder(FormatDecoder):
     def __init__(self) -> None:
         # Populated during decode() — module index → debug path
         self.module_table: dict[int, str] = {}
+        # module index → (name, base_address)
+        self.module_bases: dict[int, tuple[str, int]] = {}
 
     @staticmethod
     def detect(lines: list[str]) -> bool:
@@ -91,6 +97,7 @@ class Edk2Arm64Decoder(FormatDecoder):
     ) -> CrashInfo:
         info = CrashInfo(fmt=self.name, image_base=table.preferred_base)
         regs: dict[str, int] = {}
+        v_regs: dict[str, str] = {}
 
         for line in lines:
             # Exception description: "Synchronous Exception at 0x..."
@@ -113,11 +120,16 @@ class Edk2Arm64Decoder(FormatDecoder):
                 if m:
                     info.crash_pc = int(m.group(1), 16)
 
-            # Registers
+            # GP Registers
             for reg, val in RE_EDK2_ARM64_REG.findall(line):
                 regs[reg] = int(val, 16)
 
+            # SIMD/FP V-registers (128-bit, stored as string)
+            for vreg, hi, lo in RE_EDK2_ARM64_VREG.findall(line):
+                v_regs[vreg] = f'0x{hi}_{lo}'
+
         info.registers = regs
+        info.v_registers = v_regs
         info.sp = regs.get('SP')
         info.esr = regs.get('ESR')
         info.far = regs.get('FAR')
@@ -187,7 +199,11 @@ class Edk2Arm64Decoder(FormatDecoder):
                 offset = int(m.group(3), 16)
                 mod_idx = int(m.group(4))
                 mod_name = m.group(5)
+                mod_base = int(m.group(2), 16)
                 mod_key = module_key(mod_name)
+
+                if mod_idx not in self.module_bases:
+                    self.module_bases[mod_idx] = (mod_name, mod_base)
 
                 src = (extra_sources or {}).get(mod_key)
                 is_primary = (mod_key == default_module_key)

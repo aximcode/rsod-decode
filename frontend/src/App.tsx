@@ -75,6 +75,8 @@ export function App() {
               memoryNav={memoryNav}
               onNavigateMemory={navigateToMemory}
               backend={state.data.backend}
+              rsodText={state.data.rsod_text}
+              modules={state.data.modules}
             />
           </div>
           <div
@@ -96,6 +98,7 @@ export function App() {
         </div>
         <RegisterPanel
           registers={state.data.registers}
+          vRegisters={state.data.v_registers}
           format={state.data.format}
           onNavigateMemory={navigateToMemory}
           frameRegisters={state.frameDetail?.frame_registers}

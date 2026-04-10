@@ -311,6 +311,26 @@ class AnalysisResult:
         default_factory=dict)
     stack_base: int = 0
     stack_mem: bytes = b''
+    modules: list[dict] = field(default_factory=list)  # [{index, name, base, debug_path}]
+
+
+def _build_module_list(decoder: object) -> list[dict]:
+    """Extract module table from decoder if available."""
+    modules: list[dict] = []
+    bases = getattr(decoder, 'module_bases', {})
+    table = getattr(decoder, 'module_table', {})
+    for idx in sorted(set(bases) | set(table)):
+        name, base = bases.get(idx, ('', 0))
+        debug_path = table.get(idx, '')
+        if not name and debug_path:
+            name = debug_path.rsplit('/', 1)[-1]
+        modules.append({
+            'index': idx,
+            'name': name,
+            'base': base,
+            'debug_path': debug_path,
+        })
+    return modules
 
 
 # =============================================================================
@@ -472,6 +492,7 @@ def analyze_rsod(
         line_info_by_module=line_info_by_module,
         stack_base=stack_base,
         stack_mem=stack_mem,
+        modules=_build_module_list(decoder),
     )
 
 

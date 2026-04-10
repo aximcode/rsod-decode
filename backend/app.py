@@ -432,11 +432,13 @@ def create_app(repo_root: Path | None = None,
             crash_summary=_crash_info_to_dict(r.crash_info),
             frames=[_frame_to_dict(f) for f in r.frames],
             registers=_registers_to_dict(r.crash_info.registers),
+            v_registers=r.crash_info.v_registers,
             format=r.rsod_format,
             call_verified={str(k): v for k, v in r.call_verified.items()},
             rsod_text=session.rsod_text,
             backend=session.backend,
             gdb_available=_gdb_available(),
+            modules=r.modules,
         )
 
     # -----------------------------------------------------------------

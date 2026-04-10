@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import { HexAddress } from './HexAddress'
 
 interface Props {
   registers: Record<string, string>
+  vRegisters?: Record<string, string>
   format: string
   onNavigateMemory?: (addr: number) => void
   frameRegisters?: Record<string, string>
@@ -52,8 +54,18 @@ function sortRegisters(regs: Record<string, string>, format: string): [string, s
   return [...general, ...special]
 }
 
-export function RegisterPanel({ registers, format, onNavigateMemory, frameRegisters }: Props) {
+function sortVRegs(regs: Record<string, string>): [string, string][] {
+  return Object.entries(regs).sort((a, b) => {
+    const na = parseInt(a[0].slice(1))
+    const nb = parseInt(b[0].slice(1))
+    return na - nb
+  })
+}
+
+export function RegisterPanel({ registers, vRegisters, format, onNavigateMemory, frameRegisters }: Props) {
   const sorted = sortRegisters(registers, format)
+  const [simdOpen, setSimdOpen] = useState(false)
+  const vSorted = vRegisters ? sortVRegs(vRegisters) : []
   if (sorted.length === 0) return null
 
   return (
@@ -92,6 +104,22 @@ export function RegisterPanel({ registers, format, onNavigateMemory, frameRegist
             </div>
           )
         })}
+        {vSorted.length > 0 && (
+          <>
+            <button
+              onClick={() => setSimdOpen(!simdOpen)}
+              className="w-full text-left py-1 mt-1 text-zinc-600 hover:text-zinc-400 border-t border-zinc-800"
+            >
+              {simdOpen ? '\u25BE' : '\u25B8'} SIMD ({vSorted.length})
+            </button>
+            {simdOpen && vSorted.map(([name, value]) => (
+              <div key={name} className="flex justify-between py-0.5 text-zinc-500">
+                <span className="w-10 shrink-0 text-zinc-600">{name}</span>
+                <span className="text-right text-[10px] truncate" title={value}>{value}</span>
+              </div>
+            ))}
+          </>
+        )}
       </div>
     </div>
   )

@@ -87,6 +87,7 @@ class CrashInfo:
     image_name: str = ''
     image_base: int = 0
     registers: dict[str, int] = field(default_factory=dict)
+    v_registers: dict[str, str] = field(default_factory=dict)  # SIMD V0-V31 (128-bit hex strings)
     esr: int | None = None
     far: int | None = None
     sp: int | None = None
