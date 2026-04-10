@@ -474,12 +474,18 @@ def create_app(repo_root: Path | None = None,
                     if p['value'] is not None:
                         break
 
-            # Always use pyelftools for globals (GDB can't reliably
-            # filter CU-scope vars; globals come from ELF sections anyway)
+            # Globals: pyelftools discovers CU-scope names, GDB backend
+            # evaluates values (if available) for runtime-accurate data.
             pyelf_dwarf = dwarf_for_frame(
                 frame, session.source, session.extra_sources)
             if pyelf_dwarf:
                 globals_ = pyelf_dwarf.get_globals(frame.address)
+                # If GDB backend is active, evaluate globals through GDB
+                # for runtime values instead of ELF initializers
+                if session.backend == 'gdb' and session.gdb_dwarf:
+                    from .gdb_backend import GdbBackend
+                    if isinstance(session.gdb_dwarf, GdbBackend):
+                        globals_ = session.gdb_dwarf.evaluate_globals(globals_)
             else:
                 globals_ = dwarf.get_globals(frame.address)
             result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
@@ -694,6 +700,8 @@ def create_app(repo_root: Path | None = None,
                 if not session.temp_dir:
                     session.temp_dir = core_dir
                 core_path = core_dir / 'crash.core'
+                frame_data = [(f.frame_fp, f.address)
+                              for f in session.result.frames if f.frame_fp]
                 write_corefile(
                     session.result.crash_info.registers,
                     session.result.crash_info.crash_pc,
@@ -702,6 +710,7 @@ def create_app(repo_root: Path | None = None,
                     session.elf_path,
                     core_path,
                     image_base=session.img_base,
+                    frames=frame_data,
                 )
                 session.gdb = GdbSession(
                     session.elf_path, core_path, session.img_base)

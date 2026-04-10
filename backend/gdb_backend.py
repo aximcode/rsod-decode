@@ -68,18 +68,20 @@ class GdbBackend:
         stack_base: int,
         stack_mem: bytes,
         image_base: int,
+        frames: list[tuple[int, int]] | None = None,
     ) -> None:
         self._elf_path = elf_path
         self._image_base = image_base
         self._frame_map: dict[int, int] = {}  # our addr → GDB frame index
         self._var_objects: set[str] = set()  # track created var objects
 
-        # Generate core file
+        # Generate core file with synthetic FP chain for frames
+        # beyond the stack dump
         self._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_gdb_'))
         core_path = self._tmpdir / 'crash.core'
         write_corefile(
             registers, crash_pc, stack_base, stack_mem,
-            elf_path, core_path, image_base)
+            elf_path, core_path, image_base, frames=frames)
 
         # Launch GDB
         self._gdb = GdbController(
@@ -157,11 +159,48 @@ class GdbBackend:
         return [self._mi_var_to_varinfo(v, addr) for v in payload.get('locals', [])]
 
     def get_globals(self, addr: int) -> list[VarInfo]:
-        # Delegate to pyelftools backend — GDB's info variables is
-        # unreliable for CU-scope filtering.  Globals come from ELF
-        # sections anyway (not runtime memory), so pyelftools is the
-        # right tool.
+        # GDB can't discover CU-scope globals via MI.  Returns empty;
+        # app.py uses pyelftools for discovery and calls
+        # evaluate_globals() to fill in GDB-resolved values.
         return []
+
+    def evaluate_globals(self, names: list[VarInfo]) -> list[VarInfo]:
+        """Evaluate global variables by name using GDB.
+
+        Takes VarInfo list from pyelftools (with names/types) and returns
+        new VarInfo list with GDB-resolved values.
+        """
+        results: list[VarInfo] = []
+        for v in names:
+            p = self._result(f'-data-evaluate-expression {v.name}')
+            val_str = p.get('value', '')
+            var = VarInfo(name=v.name, type_name=v.type_name)
+            var.value = _parse_int(val_str)
+            var.string_preview = _extract_string_preview(val_str)
+            # Enum resolution
+            if var.value is None and val_str and re.match(r'^[A-Za-z_]\w*$', val_str):
+                var.string_preview = val_str
+                p2 = self._result(f'-data-evaluate-expression (int){v.name}')
+                var.value = _parse_int(p2.get('value', ''))
+            # Struct/array: try variable object
+            if val_str.startswith('{') or val_str == '':
+                try:
+                    vk = f'g_{v.name}'
+                    if vk in self._var_objects:
+                        self._cmd(f'-var-delete {vk}')
+                    p3 = self._result(f'-var-create {vk} * {v.name}')
+                    nc = int(p3.get('numchild', '0'))
+                    if nc > 0 or p3.get('value', '') == '{...}':
+                        var.is_expandable = True
+                        var.var_key = vk
+                        self._var_objects.add(vk)
+                        # Get address for expand_addr
+                        pa = self._result(f'-data-evaluate-expression &{v.name}')
+                        var.expand_addr = _parse_int(pa.get('value', ''))
+                except Exception:
+                    pass
+            results.append(var)
+        return results
 
     def _mi_var_to_varinfo(self, mi_var: dict, addr: int) -> VarInfo:
         """Convert a GDB/MI variable dict to VarInfo."""

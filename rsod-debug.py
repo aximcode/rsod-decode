@@ -158,12 +158,16 @@ def main() -> None:
         if use_gdb:
             try:
                 from backend.gdb_backend import GdbBackend
+                # Build frame list for synthetic FP chain in core file
+                frame_data = [(f.frame_fp, f.address)
+                              for f in result.frames if f.frame_fp]
                 sess.gdb_dwarf = GdbBackend(
                     args.symbol_file.resolve(),
                     result.crash_info.registers,
                     result.crash_info.crash_pc,
                     result.stack_base, result.stack_mem,
                     sess.img_base,
+                    frames=frame_data,
                 )
                 sess.backend = 'gdb'
                 _log(f"Using GDB backend")
