@@ -144,8 +144,17 @@ class GitRef:
 # =============================================================================
 
 def module_key(mod_name: str) -> str:
-    """Normalize module name to lookup key (e.g. 'CrashTest.dll' -> 'crashtest')."""
-    return re.sub(r'\.(dll|efi|debug|so)$', '', mod_name, flags=re.IGNORECASE).lower()
+    """Normalize module name to lookup key (e.g. 'CrashTest.dll' -> 'crashtest').
+
+    Handles double extensions like 'CrashTest.efi.efi' from Dell RSOD.
+    """
+    key = mod_name
+    while True:
+        stripped = re.sub(r'\.(dll|efi|debug|so)$', '', key, flags=re.IGNORECASE)
+        if stripped == key:
+            break
+        key = stripped
+    return key.lower()
 
 
 def dwarf_for_frame(
