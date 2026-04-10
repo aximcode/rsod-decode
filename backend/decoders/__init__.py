@@ -17,8 +17,8 @@ __all__ = ['FormatDecoder', 'detect_format']
 _DECODERS: list[type[FormatDecoder]] = [
     Edk2X64Decoder,       # "!!!! X64 Exception" is unambiguous
     Edk2Arm64Decoder,     # "Synchronous Exception at 0x" + "PC 0x...(0x...+0x...)"
-    UefiArm64Decoder,     # "-->PC" or "sNN ... .efi +OFFSET"
-    UefiX86Decoder,       # "-->RIP" or fallback default
+    UefiX86Decoder,       # "-->RIP" — must be before UefiArm64 (both have sNN frames)
+    UefiArm64Decoder,     # "-->PC" or X0= registers
 ]
 
 

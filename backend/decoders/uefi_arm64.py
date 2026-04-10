@@ -27,6 +27,8 @@ RE_ARM64_FRAME = re.compile(
 RE_ARM64_REG = re.compile(
     r'(X\d+|FP|LR|SP|ELR|SPSR|FPSR|FAR|PC|ESR)=(?:0x)?([0-9A-Fa-f]+)')
 RE_UEFI_ARM64_TYPE = re.compile(r'^Type:\s*(.+)', re.IGNORECASE)
+RE_UEFI_ARM64_VREG = re.compile(
+    r'(V\d+)=0x([0-9A-Fa-f]{16})\s+([0-9A-Fa-f]{16})')
 
 
 # =============================================================================
@@ -38,6 +40,10 @@ class UefiArm64Decoder(FormatDecoder):
 
     name: ClassVar[str] = 'uefi_arm64'
     insn_size: ClassVar[int] = 4
+
+    def __init__(self) -> None:
+        self.module_bases: dict[int, tuple[str, int]] = {}
+        self.module_table: dict[int, str] = {}
 
     @staticmethod
     def detect(lines: list[str]) -> bool:
@@ -65,6 +71,7 @@ class UefiArm64Decoder(FormatDecoder):
     ) -> CrashInfo:
         info = CrashInfo(fmt=self.name, image_base=table.preferred_base)
         regs: dict[str, int] = {}
+        v_regs: dict[str, str] = {}
 
         for line in lines:
             if not info.exception_desc:
@@ -79,7 +86,11 @@ class UefiArm64Decoder(FormatDecoder):
             for reg, val in RE_ARM64_REG.findall(line):
                 regs[reg] = int(val, 16)
 
+            for vreg, hi, lo in RE_UEFI_ARM64_VREG.findall(line):
+                v_regs[vreg] = f'0x{hi}_{lo}'
+
         info.registers = regs
+        info.v_registers = v_regs
         info.sp = regs.get('SP')
         info.esr = regs.get('ESR')
         info.far = regs.get('FAR')
@@ -136,6 +147,7 @@ class UefiArm64Decoder(FormatDecoder):
         out: list[str] = []
         frames: list[FrameInfo] = []
         frame_idx = 0
+        self._seen_modules: dict[str, int] = {}
 
         default_info = line_info_by_module.get(default_module_key, {})
 
@@ -160,9 +172,16 @@ class UefiArm64Decoder(FormatDecoder):
             fm = RE_ARM64_FRAME.match(line)
             if fm:
                 module = fm.group(3)
+                abs_addr = int(fm.group(2), 16)
                 offset_in_module = int(fm.group(4), 16)
+                mod_base = abs_addr - offset_in_module
 
                 mod_key = module_key(module)
+                # Track module bases (use frame_idx as module index)
+                if mod_key not in self._seen_modules:
+                    idx = len(self.module_bases)
+                    self.module_bases[idx] = (module, mod_base)
+                    self._seen_modules[mod_key] = idx
                 src = (extra_sources or {}).get(mod_key)
                 # Only use primary table for the primary module;
                 # don't resolve other modules against wrong symbols

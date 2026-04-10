@@ -35,6 +35,10 @@ class UefiX86Decoder(FormatDecoder):
     name: ClassVar[str] = 'uefi_x86'
     insn_size: ClassVar[int] = 1
 
+    def __init__(self) -> None:
+        self.module_bases: dict[int, tuple[str, int]] = {}
+        self.module_table: dict[int, str] = {}
+
     @staticmethod
     def detect(lines: list[str]) -> bool:
         for line in lines:
