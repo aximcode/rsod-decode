@@ -9,7 +9,7 @@ from typing import ClassVar
 
 from ..models import (
     CrashInfo, FrameInfo, MapSymbol, SymbolSource, SymbolTable,
-    clean_path,
+    clean_path, module_key,
 )
 from ..dwarf_info import DwarfInfo
 
@@ -204,6 +204,150 @@ def resolve_addresses_dwarf(
         if pairs:
             result[addr] = pairs
     return result
+
+
+# =============================================================================
+# Shared Dell UEFI decode + collect (uefi_arm64 + uefi_x86)
+# =============================================================================
+
+def collect_per_module(
+    lines: list[str], source: SymbolSource,
+    extra_sources: dict[str, SymbolSource],
+    base_delta: int, log: Callable[[str], None],
+    frame_pattern: re.Pattern[str],
+    pc_pattern: re.Pattern[str] | None,
+) -> dict[str, dict[int, list[tuple[str, str]]]]:
+    """Collect addresses per-module from sNN frame + PC/RIP lines, then DWARF-resolve."""
+    default_key = source.name.lower()
+    line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]] = {}
+
+    module_addrs: dict[str, list[int]] = {}
+    for line in lines:
+        fm = frame_pattern.match(line)
+        if fm:
+            mk = module_key(fm.group(3))
+            module_addrs.setdefault(mk, []).append(int(fm.group(4), 16))
+        if pc_pattern:
+            pc = pc_pattern.match(line)
+            if pc:
+                module_addrs.setdefault(default_key, []).append(
+                    int(pc.group(1), 16))
+
+    dedicated: dict[str, SymbolSource] = {
+        k: v for k, v in extra_sources.items() if v.has_debug_info()}
+    for mk, addrs in module_addrs.items():
+        mod_src = dedicated.get(mk, source)
+        if mod_src.has_debug_info() and mod_src.dwarf:
+            src_key = mk if mk in dedicated else default_key
+            info = resolve_addresses_dwarf(mod_src.dwarf, addrs)
+            if info:
+                line_info_by_module.setdefault(src_key, {}).update(info)
+                log(f"resolve [{mk}]: {len(info)}/{len(addrs)} resolved")
+
+    return line_info_by_module
+
+
+def decode_dell_common(
+    lines: list[str], table: SymbolTable, base_delta: int,
+    line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]],
+    extra_sources: dict[str, SymbolSource] | None,
+    default_module_key: str,
+    pc_pattern: re.Pattern[str],
+    frame_pattern: re.Pattern[str],
+    reg_patterns: list[re.Pattern[str]],
+    decoder: object,
+) -> tuple[list[str], int, list[FrameInfo]]:
+    """Shared Dell UEFI decode for both ARM64 and x86 sNN-format RSODs."""
+    resolved = 0
+    out: list[str] = []
+    frames: list[FrameInfo] = []
+    frame_idx = 0
+    seen_modules: dict[str, int] = {}
+
+    default_info = line_info_by_module.get(default_module_key, {})
+
+    for line in lines:
+        # --> PC/RIP line
+        pc_match = pc_pattern.match(line)
+        if pc_match:
+            if frames:
+                break
+            addr = int(pc_match.group(1), 16)
+            ann = lookup_and_annotate(
+                addr - base_delta, table, default_info)
+            if ann:
+                out.append(f"{line} {ann}")
+                resolved += 1
+            else:
+                out.append(line)
+            continue
+
+        # sNN frame lines
+        fm = frame_pattern.match(line)
+        if fm:
+            module = fm.group(3)
+            abs_addr = int(fm.group(2), 16)
+            offset_in_module = int(fm.group(4), 16)
+            mod_base = abs_addr - offset_in_module
+
+            mk = module_key(module)
+            if mk not in seen_modules:
+                idx = len(getattr(decoder, 'module_bases', {}))
+                decoder.module_bases[idx] = (module, mod_base)
+                seen_modules[mk] = idx
+
+            src = (extra_sources or {}).get(mk)
+            if src:
+                use_table = src.table
+            elif mk == default_module_key:
+                use_table = table
+            else:
+                use_table = None
+            use_info = line_info_by_module.get(
+                mk, line_info_by_module.get(
+                    default_module_key, {}))
+
+            result = None
+            if use_table:
+                if use_table.preferred_base == 0:
+                    lookup_addr = offset_in_module
+                else:
+                    lookup_addr = use_table.preferred_base + offset_in_module
+                result = use_table.lookup(lookup_addr)
+
+            if result:
+                sym, off = result
+                loc = source_loc(use_info, offset_in_module)
+                out.append(
+                    f"{line}  {format_annotation(sym, off, loc)}")
+                resolved += 1
+                frames.append(make_frame(
+                    frame_idx, offset_in_module, module,
+                    sym, off, use_info, offset_in_module))
+                frame_idx += 1
+            else:
+                out.append(line)
+                frames.append(FrameInfo(
+                    index=frame_idx, address=offset_in_module,
+                    module=module))
+                frame_idx += 1
+            continue
+
+        # Register lines
+        if any(pat.search(line) for pat in reg_patterns):
+            out.append(annotate_regs(line, reg_patterns, table, base_delta))
+            continue
+
+        out.append(line)
+
+    # Parse image table if present
+    img_table = parse_image_table(lines)
+    if img_table:
+        decoder.module_bases = {
+            i: (name, base) for i, (name, base, _) in img_table.items()}
+        decoder.image_table = img_table
+
+    return out, resolved, frames
 
 
 # =============================================================================
