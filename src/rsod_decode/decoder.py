@@ -558,8 +558,15 @@ def decode_rsod(
     dwarf_prefix: str | None = None,
 ) -> None:
     """Read RSOD log + symbol file, write annotated + enhanced output."""
+    # MSVC/EPSA pairing: if an extra is the .efi companion of a primary
+    # .map (or vice versa), fold it into the primary loader instead of
+    # adding it as a separate module.
+    from .app import _pair_map_with_pe
+    companion, extra_sym_paths = _pair_map_with_pe(sym_path, list(extra_sym_paths))
+
     source = load_symbols(sym_path, dwarf_prefix=dwarf_prefix,
-                          repo_root=repo_root)
+                          repo_root=repo_root,
+                          companion_path=companion)
 
     extra_sources: dict[str, SymbolSource] = {}
     for p in extra_sym_paths:

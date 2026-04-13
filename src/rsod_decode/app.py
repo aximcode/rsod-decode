@@ -25,7 +25,38 @@ from .session import (
     Session, cleanup_session, gdb_available, get_session, pop_session,
     register_session, store_session,
 )
-from .symbols import SymbolLoadError, load_symbols
+from .symbols import SymbolLoadError, is_pe, load_symbols
+
+
+def _pair_map_with_pe(
+    primary: Path, extras: list[Path],
+) -> tuple[Path | None, list[Path]]:
+    """Return (companion, filtered_extras) if primary has a paired PE/.map
+    companion in extras, else (None, extras) unchanged.
+
+    MSVC EPSA commonly names the map file `psa.efi.map`, so we also match
+    by full-name suffix in addition to stem equality.
+    """
+    prim_name = primary.name.lower()
+    prim_stem = primary.stem.lower()
+    prim_is_pe = is_pe(primary)
+    prim_is_map = prim_name.endswith('.map')
+    if not (prim_is_pe or prim_is_map):
+        return None, extras
+
+    for i, ex in enumerate(extras):
+        ex_name = ex.name.lower()
+        ex_stem = ex.stem.lower()
+        ex_is_pe = is_pe(ex)
+        ex_is_map = ex_name.endswith('.map')
+        same_stem = ex_stem == prim_stem
+        map_for_pe = ex_name == f"{prim_name}.map"  # psa.efi + psa.efi.map
+        pe_for_map = prim_name == f"{ex_name}.map"  # psa.efi.map + psa.efi
+        if prim_is_pe and ex_is_map and (same_stem or map_for_pe):
+            return ex, extras[:i] + extras[i + 1:]
+        if prim_is_map and ex_is_pe and (same_stem or pe_for_map):
+            return ex, extras[:i] + extras[i + 1:]
+    return None, extras
 
 
 def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
@@ -77,11 +108,18 @@ def create_app(repo_root: Path | None = None,
             f.save(str(p))
             extra_paths.append(p)
 
+        # Detect a MAP+EFI pair for MSVC builds: if the primary or one of
+        # the extras is the PE companion of the other, fold it into the
+        # loader as companion_path instead of treating it as a separate
+        # module.
+        companion, extra_paths = _pair_map_with_pe(sym_path, extra_paths)
+
         # Load symbols
         try:
             source = load_symbols(sym_path,
                                   dwarf_prefix=app.config['DWARF_PREFIX'],
-                                  repo_root=app.config['REPO_ROOT'])
+                                  repo_root=app.config['REPO_ROOT'],
+                                  companion_path=companion)
         except SymbolLoadError as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return jsonify(error=str(e)), 400

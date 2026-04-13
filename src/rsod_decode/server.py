@@ -122,15 +122,21 @@ def main() -> None:
     if args.rsod_log and args.symbol_file:
         _log(f"Loading {args.rsod_log.name} + {args.symbol_file.name}...")
 
+        # MSVC/EPSA: detect a MAP+EFI companion pair in the extra files.
+        from .app import _pair_map_with_pe
+        sym_extras = list(args.sym)
+        companion, sym_extras = _pair_map_with_pe(args.symbol_file, sym_extras)
+
         try:
             source = load_symbols(args.symbol_file,
                                   dwarf_prefix=args.dwarf_prefix,
-                                  repo_root=repo_root)
+                                  repo_root=repo_root,
+                                  companion_path=companion)
         except SymbolLoadError as e:
             sys.exit(f"Error: {e}")
 
         extra_sources = {}
-        for p in args.sym:
+        for p in sym_extras:
             try:
                 s = load_symbols(p, dwarf_prefix=args.dwarf_prefix,
                                  repo_root=repo_root)

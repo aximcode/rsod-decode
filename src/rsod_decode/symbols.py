@@ -79,24 +79,50 @@ def is_elf(path: Path) -> bool:
         return False
 
 
+def is_pe(path: Path) -> bool:
+    """Check if a file is a PE/COFF binary (MZ header + PE signature)."""
+    try:
+        with path.open('rb') as f:
+            if f.read(2) != b'MZ':
+                return False
+            f.seek(0x3c)
+            pe_off = int.from_bytes(f.read(4), 'little')
+            if pe_off <= 0 or pe_off > 0x10000:
+                return False
+            f.seek(pe_off)
+            return f.read(4) == b'PE\x00\x00'
+    except OSError:
+        return False
+
+
 def load_symbols(path: Path, log: Callable[[str], None] | None = None,
                  dwarf_prefix: str | None = None,
-                 repo_root: Path | None = None) -> SymbolSource:
+                 repo_root: Path | None = None,
+                 companion_path: Path | None = None) -> SymbolSource:
     """Auto-detect symbol file format and load.
 
     Args:
-        path: Path to the symbol file (.map or ELF).
+        path: Path to the primary symbol file: ELF (`.so`/`.debug`/`.elf`),
+            MSVC `.map`, or PE (`.efi`).
         log: Optional callable(str) for status messages.
              Defaults to printing to stderr.
         dwarf_prefix: Optional prefix to strip from DWARF paths.
         repo_root: Optional repo root for auto-detecting dwarf_prefix.
+        companion_path: Optional second file providing disassembly when
+            the primary doesn't have it. Meaningful combinations:
+              - primary=.map, companion=.efi (MSVC: .map has symbols,
+                .efi has .text bytes)
+              - primary=.efi, companion=.map (same pairing, reversed order)
+            For ELF primary, companion_path is ignored.
     """
     if log is None:
         def log(msg: str) -> None:
             print(msg, file=sys.stderr)
 
     elf_path: Path | None = None
-    dwarf_info: DwarfInfo | None = None
+    # Holds either DwarfInfo or PEBinary; models.BinaryBackend is a
+    # TYPE_CHECKING-only alias so we can't annotate this at runtime.
+    binary: object | None = None
 
     if is_elf(path):
         elf_path = path
@@ -108,10 +134,35 @@ def load_symbols(path: Path, log: Callable[[str], None] | None = None,
             raise SymbolLoadError(f"failed to read ELF {path}: {e}") from e
         table = SymbolTable()
         _build_table(table, [MapSymbol(a, n, '', f) for a, n, f in raw])
+        binary = dwarf_info
         src = 'ELF+DWARF'
+    elif is_pe(path):
+        # Primary is .efi: the PE provides .text bytes; companion (if any)
+        # is a .map supplying symbols.
+        try:
+            from .pe_backend import PEBinary, PELoadError
+            binary = PEBinary(path, log=log)
+        except Exception as e:
+            raise SymbolLoadError(f"failed to read PE {path}: {e}") from e
+        if companion_path is not None and not is_elf(companion_path) and not is_pe(companion_path):
+            table = parse_map_file(companion_path)
+            log(f"Paired with symbol map {companion_path.name}")
+        else:
+            table = SymbolTable()
+        src = 'PE'
     else:
+        # Assume .map. Companion (if any) is a .efi for disassembly.
         table = parse_map_file(path)
         src = 'MAP'
+        if companion_path is not None and is_pe(companion_path):
+            try:
+                from .pe_backend import PEBinary
+                binary = PEBinary(companion_path, log=log)
+            except Exception as e:
+                raise SymbolLoadError(
+                    f"failed to read PE companion {companion_path}: {e}"
+                ) from e
+            src = 'MAP+PE'
 
     func_count = sum(1 for s in table.symbols if s.is_function)
     data_count = len(table.symbols) - func_count
@@ -122,10 +173,12 @@ def load_symbols(path: Path, log: Callable[[str], None] | None = None,
     if table.symbols:
         log(f"Symbol range: 0x{table.addresses[0]:X} - "
             f"0x{table.addresses[-1]:X}")
-    if dwarf_info:
-        log("DWARF debug info via pyelftools (native)")
-        if dwarf_info.dwarf_prefix:
-            log(f"DWARF prefix: {dwarf_info.dwarf_prefix}")
+    # Import DwarfInfo lazily for isinstance check (avoids top-level cycle)
+    if binary is not None:
+        if isinstance(binary, DwarfInfo):
+            log("DWARF debug info via pyelftools (native)")
+            if binary.dwarf_prefix:
+                log(f"DWARF prefix: {binary.dwarf_prefix}")
 
     return SymbolSource(table=table, elf_path=elf_path,
-                        name=path.stem, binary=dwarf_info)
+                        name=path.stem, binary=binary)
