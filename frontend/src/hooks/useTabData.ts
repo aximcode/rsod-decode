@@ -26,16 +26,19 @@ export function useTabData<T>(
     }
   }) // intentionally no dep array — runs every render to compare
 
-  // Fetch when tab becomes active and data hasn't been loaded yet
+  // Fetch when tab becomes active and data hasn't been loaded yet.
+  // `loading` is intentionally NOT in the dep array: setting it here
+  // would re-run this effect, fire the cleanup, set stale=true, and
+  // silently drop the in-flight fetch's result.
   useEffect(() => {
-    if (!active || data !== null || loading) return
+    if (!active || data !== null) return
     let stale = false
     setLoading(true)
     fetcher()
       .then(r => { if (!stale) { setData(r); setLoading(false) } })
       .catch(() => { if (!stale) { setData(fallback); setLoading(false) } })
     return () => { stale = true }
-  }, [active, data, loading]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [active, data]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return { data, loading }
 }
