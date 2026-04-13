@@ -10,7 +10,9 @@ import re
 from pathlib import Path
 
 import cxxfilt
-from capstone import CS_ARCH_ARM64, CS_ARCH_X86, CS_MODE_ARM, CS_MODE_64, Cs
+from capstone import CS_ARCH_ARM64, CS_ARCH_X86, CS_MODE_ARM, CS_MODE_64
+
+from . import disasm
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.die import DIE
 from elftools.dwarf.compileunit import CompileUnit
@@ -454,14 +456,17 @@ class DwarfInfo:
         if arch == 'AArch64':
             self._cs_arch = CS_ARCH_ARM64
             self._cs_mode = CS_MODE_ARM
+            self._arch_name = 'aarch64'
             set_global_machine_arch('AArch64')
         elif arch in ('x64', 'x86'):
             self._cs_arch = CS_ARCH_X86
             self._cs_mode = CS_MODE_64
+            self._arch_name = 'x86_64'
             set_global_machine_arch('x64')
         else:
             self._cs_arch = CS_ARCH_ARM64
             self._cs_mode = CS_MODE_ARM
+            self._arch_name = 'aarch64'
             set_global_machine_arch('AArch64')
 
         # DWARF expression parser (for location decoding)
@@ -471,7 +476,7 @@ class DwarfInfo:
             self._expr_parser = None
 
         # Capstone disassembler (cached)
-        self._cs = Cs(self._cs_arch, self._cs_mode)
+        self._cs = disasm.make_capstone(self._arch_name)
 
         # Memory context for expand_type (not thread-safe)
         self._mem_ctx: tuple[int, bytes, int] = (0, b'', 0)
@@ -969,44 +974,14 @@ class DwarfInfo:
                            ) -> list[tuple[int, str, str]]:
         """Disassemble instructions around addr using capstone.
         Returns [(addr, mnemonic, op_str), ...]."""
-        if not self._text_data:
-            return []
-
-        start = max(self._text_addr, addr - context)
-        # Align to 4-byte boundary for ARM64
-        if self._cs_arch == CS_ARCH_ARM64:
-            start = start & ~3
-        end = addr + context
-
-        offset = start - self._text_addr
-        end_offset = end - self._text_addr
-        if offset < 0 or offset >= len(self._text_data):
-            return []
-        end_offset = min(end_offset, len(self._text_data))
-        code = self._text_data[offset:end_offset]
-
-        result: list[tuple[int, str, str]] = []
-        for insn in self._cs.disasm(code, start):
-            result.append((insn.address, insn.mnemonic, insn.op_str))
-        return result
+        return disasm.disassemble_around(
+            self._cs, self._text_data, self._text_addr, addr, context)
 
     def is_call_before(self, addr: int) -> bool:
         """Check if there's a call/bl/blr instruction in the 8 bytes
         immediately before addr."""
-        check_start = addr - 8
-        if check_start < self._text_addr:
-            return False
-        offset = check_start - self._text_addr
-        end_offset = addr - self._text_addr
-        if offset < 0 or end_offset > len(self._text_data):
-            return False
-        code = self._text_data[offset:end_offset]
-
-        insns = list(self._cs.disasm(code, check_start))
-        if not insns:
-            return False
-        last = insns[-1]
-        return last.mnemonic in ('call', 'bl', 'blr', 'blx')
+        return disasm.is_call_before(
+            self._cs, self._text_data, self._text_addr, addr)
 
     def source_lines_for_addrs(self, addrs: list[int]) -> dict[int, str]:
         """Batch-resolve instruction addresses to cleaned source locations.
