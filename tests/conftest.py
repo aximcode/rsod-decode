@@ -29,10 +29,14 @@ def _build_dataset_run(key: str) -> DatasetRun:
 
     if not spec.symbol_path.exists():
         pytest.skip(f"Required symbol file not found: {spec.symbol_path}")
+    if spec.companion_path is not None and not spec.companion_path.exists():
+        pytest.skip(f"Required companion file not found: {spec.companion_path}")
 
     rsod_text = rsod_path.read_text(encoding="utf-8", errors="replace")
-    source = load_symbols(spec.symbol_path, dwarf_prefix=None, repo_root=REPO_ROOT)
-    result = analyze_rsod(rsod_text, source)
+    source = load_symbols(
+        spec.symbol_path, dwarf_prefix=None, repo_root=REPO_ROOT,
+        companion_path=spec.companion_path)
+    result = analyze_rsod(rsod_text, source, base_override=spec.base_override)
     return DatasetRun(spec=spec, rsod_text=rsod_text, source=source, result=result)
 
 

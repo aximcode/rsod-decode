@@ -31,6 +31,8 @@ class DatasetSpec:
     expected_stack_size: int
     expected_lbr: int
     expected_image_base: int | None = None
+    companion_path: Path | None = None
+    base_override: int | None = None
 
 
 @dataclass
@@ -78,5 +80,23 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         expected_vregs=0,
         expected_stack_size=4096,
         expected_lbr=2,
+    ),
+    # Real Dell EPSA x86-64 crash: PE (.efi) + MSVC .map. Exercises the
+    # PEBinary path (no DWARF). Frame count is 0 because this particular
+    # RSOD's "Stack trace not available" blocks frame extraction; the
+    # value here is PE parse + symbol lookup + disassembly-readiness.
+    "psa_x64": DatasetSpec(
+        key="psa_x64",
+        rsod_file="psa/rsod_psa_x64.txt",
+        symbol_path=FIXTURES_DIR / "psa" / "psa_x64.map",
+        companion_path=FIXTURES_DIR / "psa" / "psa_x64.efi",
+        base_override=0x1000000,
+        expected_format="uefi_x86",
+        expected_frames=0,
+        expected_resolved=1,
+        expected_modules=299,
+        expected_vregs=0,
+        expected_stack_size=4096,
+        expected_lbr=0,
     ),
 }
