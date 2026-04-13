@@ -4,11 +4,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .dwarf_backend import DwarfInfo, _strip_qualifiers, _is_string_type
+from typing import TYPE_CHECKING
+
+from .dwarf_backend import _strip_qualifiers, _is_string_type
 from .models import (
-    CrashInfo, FrameInfo, SymbolSource, VarInfo, dwarf_for_frame,
+    CrashInfo, FrameInfo, SymbolSource, VarInfo, binary_for_frame,
 )
 from .session import Session
+
+if TYPE_CHECKING:
+    from .models import BinaryBackend
 
 
 # Pattern for indirect memory locations: [REG+N] or [REG-N] or [REG]
@@ -32,7 +37,7 @@ class _FrameCtx:
     is_crash_frame: bool
     has_unwound_regs: bool = False
     frame_cfa: int = 0
-    dwarf: DwarfInfo | None = None
+    binary: BinaryBackend | None = None
     image_base: int = 0
 
 
@@ -58,17 +63,17 @@ def _build_frame_ctx(
         is_crash_frame=frame.is_crash_frame,
         has_unwound_regs=has_unwound,
         frame_cfa=frame.frame_cfa,
-        dwarf=dwarf_for_frame(
+        binary=binary_for_frame(
             frame, session.source, session.extra_sources),
         image_base=img_base,
     )
 
 
-def dwarf_for_session(session: Session, frame: FrameInfo) -> object | None:
-    """Get the DWARF backend for a frame, respecting session backend choice."""
+def binary_for_session(session: Session, frame: FrameInfo) -> object | None:
+    """Get the binary backend for a frame, respecting session backend choice."""
     if session.backend == 'gdb' and session.gdb_dwarf:
         return session.gdb_dwarf
-    return dwarf_for_frame(frame, session.source, session.extra_sources)
+    return binary_for_frame(frame, session.source, session.extra_sources)
 
 
 def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
@@ -108,14 +113,14 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
             value = ctx.registers[reg]
     # DW_OP_addr — absolute address (global/static variables).
     # Values are ELF initializers, not runtime state — mark approximate.
-    elif (m := _RE_ADDR_LOC.match(v.location)) and ctx.dwarf:
+    elif (m := _RE_ADDR_LOC.match(v.location)) and ctx.binary:
         elf_addr = int(m.group(1), 16)
         runtime_addr = elf_addr + ctx.image_base
         mem_addr = runtime_addr
         approximate = True
         size = v.byte_size or 8
         if size <= 8:
-            value = ctx.dwarf.read_int(
+            value = ctx.binary.read_int(
                 runtime_addr, size,
                 ctx.stack_base, ctx.stack_mem, ctx.image_base)
         else:
@@ -147,8 +152,8 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
     string_preview = None
     expand_type_offset = v.type_offset
     expand_cu_offset = v.cu_offset
-    if ctx.dwarf and v.type_offset:
-        type_die = ctx.dwarf.get_type_die(v.cu_offset, v.type_offset)
+    if ctx.binary and v.type_offset:
+        type_die = ctx.binary.get_type_die(v.cu_offset, v.type_offset)
         if type_die:
             real = _strip_qualifiers(type_die)
             if real:
@@ -168,7 +173,7 @@ def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:
                         expand_cu_offset = target.cu.cu_offset
                 # String preview for char pointers
                 if is_pointer and value and _is_string_type(v.type_name):
-                    string_preview = ctx.dwarf.read_string(
+                    string_preview = ctx.binary.read_string(
                         value, ctx.stack_base, ctx.stack_mem,
                         ctx.image_base, max_len=64)
 

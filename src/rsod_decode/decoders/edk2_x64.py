@@ -96,11 +96,11 @@ class Edk2X64Decoder(FormatDecoder):
         default_key = source.name.lower()
         line_info_by_module: dict[str, dict[int, list[tuple[str, str]]]] = {}
 
-        if source.has_debug_info() and source.dwarf:
+        if source.has_debug_info() and source.binary:
             addrs = collect_x86_addrs(
                 lines, source.table, base_delta, _RIP_PATTERNS)
             if addrs:
-                info = resolve_addresses_dwarf(source.dwarf, addrs)
+                info = resolve_addresses_dwarf(source.binary, addrs)
                 if info:
                     line_info_by_module[default_key] = info
                     log(f"resolve: {len(info)}/{len(addrs)} addresses")

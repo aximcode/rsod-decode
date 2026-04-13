@@ -169,8 +169,8 @@ class Edk2Arm64Decoder(FormatDecoder):
             else:
                 # No symbols for this module — skip resolution
                 continue
-            if mod_src.has_debug_info() and mod_src.dwarf:
-                info = resolve_addresses_dwarf(mod_src.dwarf, addrs)
+            if mod_src.has_debug_info() and mod_src.binary:
+                info = resolve_addresses_dwarf(mod_src.binary, addrs)
                 if info:
                     line_info_by_module.setdefault(mod_key, {}).update(info)
                     log(f"resolve [{mod_key}]: "

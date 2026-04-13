@@ -17,13 +17,17 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from .models import (
     CrashInfo, FrameInfo, GitRef, MapSymbol, SymbolSource, SymbolTable,
-    VarInfo, clean_path, dwarf_for_frame, find_source_file, module_key,
+    VarInfo, clean_path, binary_for_frame, find_source_file, module_key,
 )
-from .dwarf_backend import DwarfInfo
 from .esr import format_esr
 from .symbols import load_symbols
+
+if TYPE_CHECKING:
+    from .models import BinaryBackend
 from .decoders import FormatDecoder, detect_format
 from .decoders.base import (
     parse_stack_dump,
@@ -111,21 +115,21 @@ def _format_vars(
 
 
 def format_params(
-    dwarf_info: DwarfInfo, crash_pc: int, registers: dict[str, int],
+    binary: BinaryBackend, crash_pc: int, registers: dict[str, int],
     frame: FrameInfo,
 ) -> list[str]:
     """Format parameters using real DWARF names and PC-accurate locations."""
     return _format_vars(
-        dwarf_info.get_params(crash_pc), registers, frame, 'Parameters')
+        binary.get_params(crash_pc), registers, frame, 'Parameters')
 
 
 def format_locals(
-    dwarf_info: DwarfInfo, crash_pc: int, registers: dict[str, int],
+    binary: BinaryBackend, crash_pc: int, registers: dict[str, int],
     frame: FrameInfo,
 ) -> list[str]:
     """Format local variables using DWARF info."""
     return _format_vars(
-        dwarf_info.get_locals(crash_pc), registers, frame, 'Locals')
+        binary.get_locals(crash_pc), registers, frame, 'Locals')
 
 
 # =============================================================================
@@ -133,15 +137,15 @@ def format_locals(
 # =============================================================================
 
 def format_disassembly(
-    dwarf: DwarfInfo, address: int, context: int = 24,
+    binary: BinaryBackend, address: int, context: int = 24,
 ) -> list[str]:
-    """Disassemble around an address using DwarfInfo, marking the target with >."""
-    insns = dwarf.disassemble_around(address, context)
+    """Disassemble around an address, marking the target with >."""
+    insns = binary.disassemble_around(address, context)
     if not insns:
         return []
 
     # Batch-resolve source lines for all instruction addresses
-    src_map = dwarf.source_lines_for_addrs([a for a, _, _ in insns])
+    src_map = binary.source_lines_for_addrs([a for a, _, _ in insns])
 
     lines = [f'--- Disassembly (0x{address:X}) ---']
     prev_src: str = ''
@@ -215,12 +219,12 @@ def format_source_context(
 # =============================================================================
 
 def verify_call_sites(
-    dwarf: DwarfInfo, addresses: list[int],
+    binary: BinaryBackend, addresses: list[int],
 ) -> dict[int, bool]:
     """Check if return addresses have a preceding call instruction."""
     verified: dict[int, bool] = {}
     for addr in addresses:
-        verified[addr] = dwarf.is_call_before(addr)
+        verified[addr] = binary.is_call_before(addr)
     return verified
 
 
@@ -445,16 +449,16 @@ def analyze_rsod(
     # 7. Call-site verification via capstone — batch per module
     call_verified: dict[int, bool] = {}
     if frames:
-        by_dwarf: dict[int, tuple[DwarfInfo, list[int]]] = {}
+        by_binary: dict[int, tuple[BinaryBackend, list[int]]] = {}
         for f in frames:
-            dwarf = dwarf_for_frame(f, source, extra_sources)
-            if dwarf:
-                key = id(dwarf)
-                if key not in by_dwarf:
-                    by_dwarf[key] = (dwarf, [])
-                by_dwarf[key][1].append(f.address)
-        for dwarf, addrs in by_dwarf.values():
-            call_verified.update(verify_call_sites(dwarf, addrs))
+            binary = binary_for_frame(f, source, extra_sources)
+            if binary:
+                key = id(binary)
+                if key not in by_binary:
+                    by_binary[key] = (binary, [])
+                by_binary[key][1].append(f.address)
+        for binary, addrs in by_binary.values():
+            call_verified.update(verify_call_sites(binary, addrs))
 
     # 8. Compute call_addr and frame_fp for each frame
     insn_size = decoder.insn_size
@@ -484,10 +488,10 @@ def analyze_rsod(
             prev = frames[i - 1]
             if not prev.frame_registers:
                 break
-            dwarf = dwarf_for_frame(prev, source, extra_sources)
-            if not dwarf:
+            binary = binary_for_frame(prev, source, extra_sources)
+            if not binary:
                 break
-            unwinder = dwarf.get_cfi_unwinder()
+            unwinder = binary.get_cfi_unwinder()
             if not unwinder:
                 break
             caller_regs = unwinder.unwind_frame(
@@ -499,29 +503,29 @@ def analyze_rsod(
     # 8c. Compute CFA for each frame (needed for DW_OP_fbreg variables)
     for f in frames:
         if f.frame_registers:
-            dwarf = dwarf_for_frame(f, source, extra_sources)
-            if dwarf:
-                unwinder = dwarf.get_cfi_unwinder()
+            binary = binary_for_frame(f, source, extra_sources)
+            if binary:
+                unwinder = binary.get_cfi_unwinder()
                 if unwinder:
                     f.frame_cfa = unwinder.compute_cfa(
                         f.address, f.frame_registers)
 
     # 9. Re-resolve source_loc at call_addr — batch per module
     if frames:
-        by_dwarf2: dict[int, tuple[DwarfInfo, list[FrameInfo]]] = {}
+        by_binary2: dict[int, tuple[BinaryBackend, list[FrameInfo]]] = {}
         for f in frames:
             if f.is_crash_frame:
                 continue
-            dwarf = dwarf_for_frame(f, source, extra_sources)
-            if not dwarf:
+            binary = binary_for_frame(f, source, extra_sources)
+            if not binary:
                 continue
-            key = id(dwarf)
-            if key not in by_dwarf2:
-                by_dwarf2[key] = (dwarf, [])
-            by_dwarf2[key][1].append(f)
-        for dwarf, flist in by_dwarf2.values():
+            key = id(binary)
+            if key not in by_binary2:
+                by_binary2[key] = (binary, [])
+            by_binary2[key][1].append(f)
+        for binary, flist in by_binary2.values():
             call_info = resolve_addresses_dwarf(
-                dwarf, [f.call_addr for f in flist])
+                binary, [f.call_addr for f in flist])
             for f in flist:
                 entry = call_info.get(f.call_addr)
                 if entry:
@@ -577,21 +581,21 @@ def decode_rsod(
     if verbose and result.frames:
         f0 = result.frames[0]
 
-        if source.dwarf:
+        if source.binary:
             params = format_params(
-                source.dwarf, f0.address, result.crash_info.registers, f0)
+                source.binary, f0.address, result.crash_info.registers, f0)
             if params:
                 out.append('')
                 out.extend(params)
 
             locals_ = format_locals(
-                source.dwarf, f0.address, result.crash_info.registers, f0)
+                source.binary, f0.address, result.crash_info.registers, f0)
             if locals_:
                 out.append('')
                 out.extend(locals_)
 
             if f0.address:
-                disasm = format_disassembly(source.dwarf, f0.address)
+                disasm = format_disassembly(source.binary, f0.address)
                 if disasm:
                     out.append('')
                     out.extend(disasm)

@@ -128,4 +128,4 @@ def load_symbols(path: Path, log: Callable[[str], None] | None = None,
             log(f"DWARF prefix: {dwarf_info.dwarf_prefix}")
 
     return SymbolSource(table=table, elf_path=elf_path,
-                        name=path.stem, dwarf=dwarf_info)
+                        name=path.stem, binary=dwarf_info)

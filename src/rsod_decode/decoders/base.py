@@ -7,11 +7,15 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import ClassVar
 
+from typing import TYPE_CHECKING
+
 from ..models import (
     CrashInfo, FrameInfo, MapSymbol, SymbolSource, SymbolTable,
     clean_path, module_key,
 )
-from ..dwarf_backend import DwarfInfo
+
+if TYPE_CHECKING:
+    from ..models import BinaryBackend
 
 # Re-export from submodules for backward compatibility
 from .annotations import (  # noqa: F401
@@ -141,13 +145,14 @@ def extract_addr_from_line(
 # =============================================================================
 
 def resolve_addresses_dwarf(
-    dwarf_info: DwarfInfo, addresses: list[int],
+    binary: BinaryBackend, addresses: list[int],
 ) -> dict[int, list[tuple[str, str]]]:
-    """Resolve addresses via DwarfInfo.
+    """Resolve addresses via a binary backend.
 
     Returns {addr: [(func, file:line), ...]} for the line_info dict format.
+    For PE backends (no DWARF), this returns an empty dict.
     """
-    resolved_raw = dwarf_info.resolve_addresses(addresses)
+    resolved_raw = binary.resolve_addresses(addresses)
     result: dict[int, list[tuple[str, str]]] = {}
     for addr, info in resolved_raw.items():
         pairs: list[tuple[str, str]] = []
@@ -191,9 +196,9 @@ def collect_per_module(
         k: v for k, v in extra_sources.items() if v.has_debug_info()}
     for mk, addrs in module_addrs.items():
         mod_src = dedicated.get(mk, source)
-        if mod_src.has_debug_info() and mod_src.dwarf:
+        if mod_src.has_debug_info() and mod_src.binary:
             src_key = mk if mk in dedicated else default_key
-            info = resolve_addresses_dwarf(mod_src.dwarf, addrs)
+            info = resolve_addresses_dwarf(mod_src.binary, addrs)
             if info:
                 line_info_by_module.setdefault(src_key, {}).update(info)
                 log(f"resolve [{mk}]: {len(info)}/{len(addrs)} resolved")

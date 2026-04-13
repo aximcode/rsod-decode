@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .dwarf_backend import DwarfInfo
+    from .pe_backend import PEBinary
+
+    BinaryBackend = DwarfInfo | PEBinary
 
 
 # =============================================================================
@@ -46,14 +49,19 @@ class SymbolTable:
 
 @dataclass
 class SymbolSource:
-    """Loaded symbols plus metadata."""
+    """Loaded symbols plus metadata.
+
+    `binary` holds a disassembly/lookup backend: DwarfInfo for ELF+DWARF,
+    PEBinary for PE/COFF (MSVC). The old field name `dwarf` was renamed
+    because PEBinary has no DWARF — all call sites use `.binary` now.
+    """
     table: SymbolTable
     elf_path: Path | None = None
     name: str = ''
-    dwarf: DwarfInfo | None = None
+    binary: BinaryBackend | None = None
 
     def has_debug_info(self) -> bool:
-        return self.dwarf is not None
+        return self.binary is not None
 
 
 # =============================================================================
@@ -158,12 +166,12 @@ def module_key(mod_name: str) -> str:
     return key.lower()
 
 
-def dwarf_for_frame(
+def binary_for_frame(
     frame: FrameInfo,
     primary: SymbolSource,
     extra_sources: dict[str, SymbolSource],
-) -> DwarfInfo | None:
-    """Get the correct DwarfInfo for a frame's module.
+) -> BinaryBackend | None:
+    """Get the correct binary backend for a frame's module.
 
     Returns None for modules without dedicated symbols to avoid
     cross-module misresolution.
@@ -171,12 +179,12 @@ def dwarf_for_frame(
     if frame.module:
         mk = module_key(frame.module)
         extra = extra_sources.get(mk)
-        if extra and extra.dwarf:
-            return extra.dwarf
+        if extra and extra.binary:
+            return extra.binary
         if mk == primary.name.lower():
-            return primary.dwarf
+            return primary.binary
         return None
-    return primary.dwarf
+    return primary.binary
 
 
 # =============================================================================

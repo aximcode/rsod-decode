@@ -90,10 +90,10 @@ def cleanup_session(session: Session) -> None:
     if session.gdb:
         session.gdb.close()
         session.gdb = None
-    if session.source.dwarf:
-        session.source.dwarf.close()
+    if session.source.binary:
+        session.source.binary.close()
     for src in session.extra_sources.values():
-        if src.dwarf:
-            src.dwarf.close()
+        if src.binary:
+            src.binary.close()
     if session.temp_dir and session.temp_dir.exists():
         shutil.rmtree(session.temp_dir, ignore_errors=True)

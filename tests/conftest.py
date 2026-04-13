@@ -46,8 +46,8 @@ def dataset_runs() -> Iterator[dict[str, DatasetRun]]:
             continue
     yield runs
     for run in runs.values():
-        if run.source.dwarf:
-            run.source.dwarf.close()
+        if run.source.binary:
+            run.source.binary.close()
 
 
 @pytest.fixture(scope="session")

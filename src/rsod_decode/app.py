@@ -13,13 +13,13 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from werkzeug.utils import secure_filename
 
-from .models import SymbolSource, clean_path, dwarf_for_frame, find_source_file
+from .models import SymbolSource, clean_path, binary_for_frame, find_source_file
 from .corefile import write_corefile
 from .decoder import analyze_rsod
 from .gdb_bridge import GdbSession
 from .serializers import (
     _RE_MEM_LOC, _build_frame_ctx, _var_to_dict,
-    crash_info_to_dict, dwarf_for_session, frame_to_dict, registers_to_dict,
+    crash_info_to_dict, binary_for_session, frame_to_dict, registers_to_dict,
 )
 from .session import (
     Session, cleanup_session, gdb_available, get_session, pop_session,
@@ -191,9 +191,9 @@ def create_app(repo_root: Path | None = None,
         frame = session.result.frames[frame_index]
         result: dict = frame_to_dict(frame)
 
-        dwarf = dwarf_for_session(session, frame)
+        binary = binary_for_session(session, frame)
         img_base = session.img_base
-        if dwarf and frame.address:
+        if binary and frame.address:
             ctx = _build_frame_ctx(frame, session, img_base)
             # For non-crash frames, use call_addr - 1 for DWARF location
             # lookup.  The return address lands in DW_OP_entry_value ranges
@@ -203,8 +203,8 @@ def create_app(repo_root: Path | None = None,
             lookup_pc = frame.address
             if not frame.is_crash_frame and frame.call_addr:
                 lookup_pc = frame.call_addr - 1
-            params = dwarf.get_params(lookup_pc)
-            locals_ = dwarf.get_locals(lookup_pc)
+            params = binary.get_params(lookup_pc)
+            locals_ = binary.get_locals(lookup_pc)
             result['params'] = [_var_to_dict(v, ctx) for v in params]
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
 
@@ -219,16 +219,16 @@ def create_app(repo_root: Path | None = None,
                     for anc_idx in range(frame_index + 1,
                                          len(session.result.frames)):
                         anc = session.result.frames[anc_idx]
-                        anc_dwarf = dwarf_for_frame(
+                        anc_binary = binary_for_frame(
                             anc, session.source, session.extra_sources)
-                        if not anc_dwarf or not anc.address:
+                        if not anc_binary or not anc.address:
                             continue
                         anc_pc = anc.address
                         if not anc.is_crash_frame and anc.call_addr:
                             anc_pc = anc.call_addr - 1
                         anc_ctx = _build_frame_ctx(anc, session, img_base)
-                        for var in (*anc_dwarf.get_params(anc_pc),
-                                    *anc_dwarf.get_locals(anc_pc)):
+                        for var in (*anc_binary.get_params(anc_pc),
+                                    *anc_binary.get_locals(anc_pc)):
                             if var.name != p['name']:
                                 continue
                             d = _var_to_dict(var, anc_ctx)
@@ -243,10 +243,10 @@ def create_app(repo_root: Path | None = None,
 
             # Globals: pyelftools discovers CU-scope names, GDB backend
             # evaluates values (if available) for runtime-accurate data.
-            pyelf_dwarf = dwarf_for_frame(
+            pyelf_binary = binary_for_frame(
                 frame, session.source, session.extra_sources)
-            if pyelf_dwarf:
-                globals_ = pyelf_dwarf.get_globals(frame.address)
+            if pyelf_binary:
+                globals_ = pyelf_binary.get_globals(frame.address)
                 # If GDB backend is active, evaluate globals through GDB
                 # for runtime values instead of ELF initializers
                 if session.backend == 'gdb' and session.gdb_dwarf:
@@ -254,7 +254,7 @@ def create_app(repo_root: Path | None = None,
                     if isinstance(session.gdb_dwarf, GdbBackend):
                         globals_ = session.gdb_dwarf.evaluate_globals(globals_)
             else:
-                globals_ = dwarf.get_globals(frame.address)
+                globals_ = binary.get_globals(frame.address)
             result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
         else:
             result['params'] = []
@@ -288,24 +288,24 @@ def create_app(repo_root: Path | None = None,
         count = request.args.get('count', default=32, type=int)
 
         frame = session.result.frames[frame_index]
-        dwarf = dwarf_for_session(session, frame)
-        if not dwarf:
+        binary = binary_for_session(session, frame)
+        if not binary:
             return jsonify(fields=[], total_count=0)
 
         # GDB backend: use var_key for expansion
         if var_key:
-            fields, total_count = dwarf.expand_type(
+            fields, total_count = binary.expand_type(
                 var_key, addr,
                 session.result.stack_base, session.result.stack_mem,
                 session.img_base, offset, count)
             return jsonify(fields=fields, total_count=total_count)
 
         # pyelftools backend: use type DIE
-        type_die = dwarf.get_type_die(cu_offset, type_offset)
+        type_die = binary.get_type_die(cu_offset, type_offset)
         if not type_die:
             return jsonify(fields=[], total_count=0)
 
-        fields, total_count = dwarf.expand_type(
+        fields, total_count = binary.expand_type(
             type_die, addr,
             session.result.stack_base, session.result.stack_mem,
             session.img_base, offset, count)
@@ -326,12 +326,12 @@ def create_app(repo_root: Path | None = None,
             return jsonify(error='addr required'), 400
 
         # Pick a backend for memory reads (frame-independent)
-        dwarf = None
+        binary = None
         if session.backend == 'gdb' and session.gdb_dwarf:
-            dwarf = session.gdb_dwarf
-        elif session.source.dwarf:
-            dwarf = session.source.dwarf
-        if not dwarf:
+            binary = session.gdb_dwarf
+        elif session.source.binary:
+            binary = session.source.binary
+        if not binary:
             return jsonify(address=addr, bytes=[])
 
         sb = session.result.stack_base
@@ -339,12 +339,12 @@ def create_app(repo_root: Path | None = None,
         ib = session.img_base
 
         # GDB backend: use read_memory_partial for per-byte N/A handling
-        if hasattr(dwarf, 'read_memory_partial'):
-            result_bytes = dwarf.read_memory_partial(addr, size, sb, sm, ib)
+        if hasattr(binary, 'read_memory_partial'):
+            result_bytes = binary.read_memory_partial(addr, size, sb, sm, ib)
             return jsonify(address=addr, bytes=result_bytes)
 
         # pyelftools: try full-block read first
-        data = dwarf.read_memory(addr, size, sb, sm, ib)
+        data = binary.read_memory(addr, size, sb, sm, ib)
         if data is not None:
             return jsonify(address=addr, bytes=list(data))
 
@@ -352,7 +352,7 @@ def create_app(repo_root: Path | None = None,
         result_bytes: list[int | None] = []
         for off in range(0, size, 16):
             chunk_size = min(16, size - off)
-            chunk = dwarf.read_memory(addr + off, chunk_size, sb, sm, ib)
+            chunk = binary.read_memory(addr + off, chunk_size, sb, sm, ib)
             if chunk:
                 result_bytes.extend(chunk)
             else:
@@ -407,13 +407,13 @@ def create_app(repo_root: Path | None = None,
                 'size': len(sm),
             })
 
-        # ELF sections at runtime addresses
+        # Binary sections at runtime addresses (ELF/DWARF or PE)
         ib = session.img_base
-        if session.source.dwarf:
-            for sec_addr, sec_data in session.source.dwarf._sections:
+        if session.source.binary:
+            for sec_addr, sec_data in session.source.binary._sections:
                 rt_start = sec_addr + ib
                 regions.append({
-                    'name': session.source.dwarf._section_names.get(
+                    'name': session.source.binary._section_names.get(
                         sec_addr, f'0x{sec_addr:X}'),
                     'start': rt_start,
                     'size': len(sec_data),
@@ -434,15 +434,15 @@ def create_app(repo_root: Path | None = None,
             return jsonify(error='frame index out of range'), 404
 
         frame = session.result.frames[frame_index]
-        dwarf = dwarf_for_session(session, frame)
+        binary = binary_for_session(session, frame)
         # Use call_addr for disassembly center and target highlight
         target_addr = frame.call_addr or frame.address
-        if not dwarf or not target_addr:
+        if not binary or not target_addr:
             return jsonify(instructions=[])
 
         context = min(request.args.get('context', 24, type=int), 200)
-        insns = dwarf.disassemble_around(target_addr, context)
-        src_map = dwarf.source_lines_for_addrs([a for a, _, _ in insns])
+        insns = binary.disassemble_around(target_addr, context)
+        src_map = binary.source_lines_for_addrs([a for a, _, _ in insns])
 
         instructions = []
         for addr, mnemonic, op_str in insns:
@@ -540,10 +540,10 @@ def create_app(repo_root: Path | None = None,
             'is_function': sym.is_function,
         }
 
-        # DWARF source location if available
-        dwarf = session.source.dwarf
-        if dwarf:
-            addr_info = dwarf.resolve_address(addr)
+        # Source location from DWARF (if available)
+        binary = session.source.binary
+        if binary:
+            addr_info = binary.resolve_address(addr)
             if addr_info:
                 response['source_loc'] = clean_path(addr_info.source_loc) if addr_info.source_loc else ''
                 response['function'] = addr_info.function
