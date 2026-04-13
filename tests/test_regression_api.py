@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import DATASET_SPECS, DatasetSpec
+from ._datasets import DATASET_SPECS, DatasetSpec
 
 
 pytestmark = [pytest.mark.api]
@@ -24,12 +24,14 @@ def _create_session(client, spec: DatasetSpec) -> ApiSessionContext:
     if not spec.symbol_path.exists():
         pytest.skip(f"Required symbol file not found: {spec.symbol_path}")
 
-    data = {
-        "rsod_log": (io.BytesIO(rsod_path.read_bytes()), spec.rsod_file),
-        "symbol_file": (open(spec.symbol_path, "rb"), spec.symbol_path.name),
-    }
-    response = client.post("/api/session", data=data, content_type="multipart/form-data")
-    data["symbol_file"][0].close()
+    with spec.symbol_path.open("rb") as symbol_fp:
+        data = {
+            "rsod_log": (io.BytesIO(rsod_path.read_bytes()), spec.rsod_file),
+            "symbol_file": (symbol_fp, spec.symbol_path.name),
+        }
+        response = client.post(
+            "/api/session", data=data, content_type="multipart/form-data"
+        )
 
     assert response.status_code == 201, response.get_json()
     body = response.get_json()

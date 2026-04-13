@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import DatasetRun
+from ._datasets import DatasetRun
 
 
 pytestmark = [pytest.mark.parser]
