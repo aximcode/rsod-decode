@@ -278,8 +278,7 @@ def find_source_file(
     if len(valid) == 1:
         return valid[0]
 
-    # Multiple valid matches — score by path component overlap,
-    # prefer source/src/ paths over others
+    # Multiple valid matches — score by path component overlap
     dwarf_parts = [p.lower() for p in dwarf_path.split('/')]
     best: Path | None = None
     best_score = -1
@@ -287,9 +286,6 @@ def find_source_file(
         rel = m.relative_to(repo_root).as_posix()
         rel_parts = [p.lower() for p in rel.split('/')]
         score = sum(1 for p in dwarf_parts if p in rel_parts)
-        # Prefer source/src/ paths
-        if rel.lower().startswith('source/src/'):
-            score += 10
         if score > best_score:
             best_score = score
             best = m

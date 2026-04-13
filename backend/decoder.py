@@ -251,7 +251,7 @@ def _read_source_from_git(
     git_ref: GitRef, file_path: str, repo_root: Path,
 ) -> list[str] | None:
     """Read source file at a specific git commit."""
-    for prefix in ('source/src/', ''):
+    for prefix in ('',):
         git_path = f"{prefix}{file_path}"
         lines = _git_show(git_ref.commit, git_path, repo_root)
         if lines is not None:
