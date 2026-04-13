@@ -22,10 +22,10 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-from backend.app import create_app
-from backend.session import Session, register_session
-from backend.decoder import analyze_rsod
-from backend.symbols import SymbolLoadError, load_symbols
+from .app import create_app
+from .session import Session, register_session
+from .decoder import analyze_rsod
+from .symbols import SymbolLoadError, load_symbols
 
 
 def _log(msg: str) -> None:
@@ -36,7 +36,7 @@ def _try_gdb_backend() -> bool:
     """Check if GDB and pygdbmi are available."""
     try:
         import shutil
-        from backend.gdb_bridge import find_gdb
+        from .gdb_bridge import find_gdb
         if not find_gdb():
             return False
         import pygdbmi  # noqa: F401
@@ -101,7 +101,7 @@ def main() -> None:
     # Create Flask app with static file serving
     app = create_app(repo_root=repo_root, dwarf_prefix=args.dwarf_prefix,
                      symbol_search_paths=args.symbol_paths or None)
-    dist_dir = Path(__file__).resolve().parent / 'frontend' / 'dist'
+    dist_dir = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
 
     if dist_dir.is_dir():
         from flask import send_from_directory
@@ -165,7 +165,7 @@ def main() -> None:
         use_gdb = args.backend == 'gdb' or (args.backend == 'auto' and _try_gdb_backend())
         if use_gdb:
             try:
-                from backend.gdb_backend import GdbBackend
+                from .gdb_backend import GdbBackend
                 # Build frame list for synthetic FP chain in core file
                 # Include ALL frames (even FP=0) so the synthetic builder
                 # can write return addresses for frames beyond the dump

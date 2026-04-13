@@ -7,10 +7,10 @@ from typing import Iterator
 
 import pytest
 
-from backend.app import create_app
-from backend.decoder import AnalysisResult, analyze_rsod
-from backend.models import SymbolSource
-from backend.symbols import load_symbols
+from rsod_decode.app import create_app
+from rsod_decode.decoder import AnalysisResult, analyze_rsod
+from rsod_decode.models import SymbolSource
+from rsod_decode.symbols import load_symbols
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

@@ -20,9 +20,9 @@ import argparse
 import sys
 from pathlib import Path
 
-from backend.decoder import decode_rsod, resolve_git_ref
-from backend.models import GitRef
-from backend.symbols import SymbolLoadError
+from .decoder import decode_rsod, resolve_git_ref
+from .models import GitRef
+from .symbols import SymbolLoadError
 
 
 def _log(msg: str) -> None:

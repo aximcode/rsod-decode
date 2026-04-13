@@ -483,7 +483,7 @@ def create_app(repo_root: Path | None = None,
         if abs_path.is_absolute() and abs_path.is_file():
             src_path = abs_path
         else:
-            root = app.config['REPO_ROOT'] or Path(__file__).resolve().parents[4]
+            root = app.config['REPO_ROOT'] or Path(__file__).resolve().parents[2]
             src_path = find_source_file(root, file_part, target_line)
         if not src_path:
             return jsonify(file=file_part, target_line=target_line, lines=[])

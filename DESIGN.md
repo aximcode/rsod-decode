@@ -312,15 +312,18 @@ analyses between team members without sharing symbol files.
 
 ```
 rsod-decode/
-├── backend/
+├── pyproject.toml          — Packaging, deps, pytest config
+├── src/rsod_decode/
 │   ├── __init__.py
+│   ├── server.py           — rsod-debug entry point (Flask launcher + CLI pre-load)
+│   ├── cli.py              — rsod-decode entry point (text-only)
 │   ├── app.py              — Flask app, routes, session management
 │   ├── decoder.py          — RSOD text parsing, format detection
-│   ├── dwarf_info.py       — DwarfInfo class (pyelftools + capstone)
+│   ├── dwarf_backend.py    — DwarfInfo class (pyelftools + capstone)
+│   ├── gdb_backend.py      — GDB/MI DWARF backend
 │   ├── symbols.py          — SymbolTable, MapSymbol, map file parser
 │   ├── esr.py              — ARM64 ESR decode tables
-│   ├── models.py           — Shared dataclasses (CrashInfo, FrameInfo, etc.)
-│   └── requirements.txt    — Flask, pyelftools, capstone, cxxfilt
+│   └── models.py           — Shared dataclasses (CrashInfo, FrameInfo, etc.)
 ├── frontend/
 │   ├── src/
 │   │   ├── App.tsx         — Main layout + routing
@@ -346,8 +349,7 @@ rsod-decode/
 │   ├── tsconfig.json
 │   ├── tailwind.config.js
 │   └── vite.config.ts      — Proxy /api to Flask in dev mode
-├── rsod-decode.py          — CLI entry point (imports backend/)
-├── rsod-debug.py           — Web UI entry point (Flask + pywebview)
+├── tests/                  — Regression tests (parser + Flask API)
 ├── build_pyz.py            — Package as .pyzw zipapp
 ├── README.md               — User-facing docs
 └── DESIGN.md               — This file
@@ -410,9 +412,9 @@ Three-tier approach for maximum compatibility:
 
 Launch:
 ```
-python rsod-debug.py                     # native window (pywebview)
-RSOD_NO_WEBVIEW=1 python rsod-debug.py   # force browser mode
-python rsod-debug.py --port 9090         # custom port
+rsod-debug                     # native window (pywebview)
+RSOD_NO_WEBVIEW=1 rsod-debug   # force browser mode
+rsod-debug --port 9090         # custom port
 ```
 
 ## .pyzw Packaging
@@ -518,9 +520,9 @@ distribution.
 The CLI tool continues to work standalone:
 
 ```
-python rsod-decode.py putty.txt app.efi.map        # text output
-python rsod-debug.py putty.txt app.efi.map          # opens web UI
-python rsod-debug.py                               # opens UI, upload via browser
+rsod-decode putty.txt app.efi.map        # text output
+rsod-debug  putty.txt app.efi.map        # opens web UI
+rsod-debug                               # opens UI, upload via browser
 ```
 
-Both share the same backend modules.
+Both share the same `rsod_decode` package modules.

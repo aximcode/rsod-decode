@@ -20,8 +20,12 @@ dependencies = [
 gdb = ["pygdbmi>=0.11"]
 dev = ["pytest>=8.0"]
 
-[tool.setuptools]
-packages = ["backend", "backend.decoders"]
+[project.scripts]
+rsod-decode = "rsod_decode.cli:main"
+rsod-debug = "rsod_decode.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 markers = [

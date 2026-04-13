@@ -1,4 +1,4 @@
-# rsod-decode.py — UEFI RSOD Stack Dump Decoder
+# rsod-decode — UEFI RSOD Stack Dump Decoder
 
 Resolves raw addresses in UEFI RSOD (Red Screen of Death) stack dumps to
 function names, source files, and line numbers.  Works with any UEFI
@@ -7,28 +7,28 @@ application crash on x86-64 or ARM64.
 ## Quick Start
 
 ```
-python3 rsod-decode.py <rsod-log> <symbol-file> [-o output] [-v] [--base HEX]
+rsod-decode <rsod-log> <symbol-file> [-o output] [-v] [--base HEX]
 ```
 
 **x86-64 example** (MSVC `.map` file):
 ```
-python3 rsod-decode.py putty.txt app.efi.map
+rsod-decode putty.txt app.efi.map
 ```
 
 **ARM64 example** (GCC `.so` file with debug symbols):
 ```
-python3 rsod-decode.py rsod.txt app.efi.so
+rsod-decode rsod.txt app.efi.so
 ```
 
 **ARM64 verbose** (adds disassembly, source context, parameters):
 ```
-python3 rsod-decode.py rsod.txt app.efi.so -v
+rsod-decode rsod.txt app.efi.so -v
 ```
 
 **With git-pinned source** (reads source at a specific tag or commit):
 ```
-python3 rsod-decode.py rsod.txt app.efi.so -v --tag v1.0.3
-python3 rsod-decode.py rsod.txt app.efi.so -v --commit 6f3b70ec
+rsod-decode rsod.txt app.efi.so -v --tag v1.0.3
+rsod-decode rsod.txt app.efi.so -v --commit 6f3b70ec
 ```
 
 Output is written to `<log>_decode.txt` by default (override with `-o`).
@@ -182,7 +182,7 @@ Shell.efi).  Provide additional symbol files to resolve frames from
 other modules:
 
 ```
-python3 rsod-decode.py rsod.txt app.efi.so -s DxeCore.debug -s Shell.debug
+rsod-decode rsod.txt app.efi.so -s DxeCore.debug -s Shell.debug
 ```
 
 Module names are matched from the `sNN ADDR module.efi +OFFSET` lines.
@@ -193,7 +193,7 @@ When a UEFI application is loaded at a different address than the preferred
 base (e.g., 0x180000000 for x86), use `--base`:
 
 ```
-python3 rsod-decode.py putty.txt app.efi.map --base 5948A000
+rsod-decode putty.txt app.efi.map --base 5948A000
 ```
 
 The tool automatically detects EDK2-format ImageBase lines when present.
@@ -205,8 +205,8 @@ By default, source context reads from the working tree.  Use `--tag` or
 working tree doesn't match the build that produced the crash:
 
 ```
-python3 rsod-decode.py rsod.txt app.efi.so -v --tag v1.0.3
-python3 rsod-decode.py rsod.txt app.efi.so -v --commit abc1234
+rsod-decode rsod.txt app.efi.so -v --tag v1.0.3
+rsod-decode rsod.txt app.efi.so -v --commit abc1234
 ```
 
 The resolved commit is shown in the crash summary and source headers.
