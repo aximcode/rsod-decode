@@ -278,7 +278,8 @@ def write_corefile(
         ei_class,          # EI_CLASS = ELFCLASS64
         1,                 # EI_DATA = ELFDATA2LSB
         1,                 # EI_VERSION
-        0,                 # EI_OSABI = ELFOSABI_NONE
+        # LLDB rejects cores with ELFOSABI_NONE; ELFOSABI_LINUX is accepted by both LLDB and GDB.
+        3,                 # EI_OSABI = ELFOSABI_LINUX
         0,                 # EI_ABIVERSION
         b'\x00' * 7,      # EI_PAD
         ET_CORE,           # e_type

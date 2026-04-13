@@ -33,5 +33,6 @@ markers = [
   "parser: parser/analyze_rsod regression tests",
   "api: Flask API regression tests",
   "gdb: Tests that require GDB backend support",
+  "lldb: Tests that require the lldb Python module",
 ]
 testpaths = ["tests"]
