@@ -88,8 +88,9 @@ def test_api_session_get(api_session: ApiSessionContext, client) -> None:
     body = response.get_json()
     assert body["format"] == api_session.spec.expected_format
     assert len(body["frames"]) == api_session.spec.expected_frames
-    assert body["backend"] in ("pyelftools", "gdb")
+    assert body["backend"] in ("pyelftools", "gdb", "lldb")
     assert body["gdb_available"] in (True, False)
+    assert body["lldb_available"] in (True, False)
 
 
 def test_api_frame_and_expand(api_session: ApiSessionContext, client) -> None:
@@ -201,6 +202,28 @@ def test_frame0_parity_pyelftools_vs_gdb(api_session: ApiSessionContext, client)
     assert len(gdb_frame["params"]) == len(pyelf_frame["params"])
     assert len(gdb_frame["locals"]) == len(pyelf_frame["locals"])
     assert len(gdb_frame["globals"]) == len(pyelf_frame["globals"])
+
+
+@pytest.mark.lldb
+def test_frame0_parity_pyelftools_vs_lldb(api_session: ApiSessionContext, client) -> None:
+    if api_session.spec.expected_frames == 0:
+        pytest.skip("fixture has no frames")
+    session_meta = client.get(f"/api/session/{api_session.session_id}").get_json()
+    if not session_meta["lldb_available"]:
+        pytest.skip("LLDB backend not available")
+
+    _switch_backend_or_skip(client, api_session.session_id, "pyelftools")
+    pyelf_frame = _get_frame0(client, api_session.session_id)
+
+    _switch_backend_or_skip(client, api_session.session_id, "lldb")
+    lldb_frame = _get_frame0(client, api_session.session_id)
+
+    assert lldb_frame["index"] == pyelf_frame["index"]
+    assert lldb_frame["address"] == pyelf_frame["address"]
+    assert lldb_frame["symbol"] == pyelf_frame["symbol"]
+    assert len(lldb_frame["params"]) == len(pyelf_frame["params"])
+    assert len(lldb_frame["locals"]) == len(pyelf_frame["locals"])
+    assert len(lldb_frame["globals"]) == len(pyelf_frame["globals"])
 
 
 @pytest.mark.gdb

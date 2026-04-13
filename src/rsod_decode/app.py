@@ -22,8 +22,8 @@ from .serializers import (
     crash_info_to_dict, binary_for_session, frame_to_dict, registers_to_dict,
 )
 from .session import (
-    Session, cleanup_session, gdb_available, get_session, pop_session,
-    register_session, store_session,
+    Session, cleanup_session, gdb_available, get_session, lldb_available,
+    pop_session, register_session, store_session,
 )
 from .symbols import SymbolLoadError, is_pe, load_symbols
 
@@ -165,12 +165,24 @@ def create_app(repo_root: Path | None = None,
             elf_path=sym_path,
         )
 
-        # Auto-initialize GDB backend if available
-        if gdb_available():
+        # Auto-initialize a richer backend if available. Preference
+        # order: lldb → gdb → pyelftools. Both richer backends require
+        # an ELF so PE (MSVC EPSA) sessions silently fall back.
+        frame_data = [(f.frame_fp, f.address) for f in analysis.frames]
+        if lldb_available():
+            try:
+                from .lldb_backend import LldbBackend
+                session.lldb_dwarf = LldbBackend(
+                    sym_path, analysis.crash_info.registers,
+                    analysis.crash_info.crash_pc,
+                    analysis.stack_base, analysis.stack_mem,
+                    session.img_base, frames=frame_data)
+                session.backend = 'lldb'
+            except Exception:
+                pass
+        if session.backend == 'pyelftools' and gdb_available():
             try:
                 from .gdb_backend import GdbBackend
-                frame_data = [(f.frame_fp, f.address)
-                              for f in analysis.frames]
                 session.gdb_dwarf = GdbBackend(
                     sym_path, analysis.crash_info.registers,
                     analysis.crash_info.crash_pc,
@@ -207,6 +219,7 @@ def create_app(repo_root: Path | None = None,
             rsod_text=session.rsod_text,
             backend=session.backend,
             gdb_available=gdb_available(),
+            lldb_available=lldb_available(),
             modules=r.modules,
             lbr=r.crash_info.lbr,
         )
@@ -247,8 +260,8 @@ def create_app(repo_root: Path | None = None,
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
 
             # Infer unresolved params from ancestor frames (pyelftools only).
-            # GDB backend resolves entry_values itself, so skip this.
-            if session.backend != 'gdb':
+            # GDB/LLDB backends resolve entry_values themselves.
+            if session.backend not in ('gdb', 'lldb'):
                 for p in result['params']:
                     if p['value'] is not None:
                         continue
@@ -285,12 +298,17 @@ def create_app(repo_root: Path | None = None,
                 frame, session.source, session.extra_sources)
             if pyelf_binary:
                 globals_ = pyelf_binary.get_globals(frame.address)
-                # If GDB backend is active, evaluate globals through GDB
-                # for runtime values instead of ELF initializers
+                # Richer backends (GDB/LLDB) resolve globals to runtime
+                # values instead of ELF initializers. evaluate_globals()
+                # takes the pyelftools-discovered list as its input.
                 if session.backend == 'gdb' and session.gdb_dwarf:
                     from .gdb_backend import GdbBackend
                     if isinstance(session.gdb_dwarf, GdbBackend):
                         globals_ = session.gdb_dwarf.evaluate_globals(globals_)
+                elif session.backend == 'lldb' and session.lldb_dwarf:
+                    from .lldb_backend import LldbBackend
+                    if isinstance(session.lldb_dwarf, LldbBackend):
+                        globals_ = session.lldb_dwarf.evaluate_globals(globals_)
             else:
                 globals_ = binary.get_globals(frame.address)
             result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
@@ -365,7 +383,9 @@ def create_app(repo_root: Path | None = None,
 
         # Pick a backend for memory reads (frame-independent)
         binary = None
-        if session.backend == 'gdb' and session.gdb_dwarf:
+        if session.backend == 'lldb' and session.lldb_dwarf:
+            binary = session.lldb_dwarf
+        elif session.backend == 'gdb' and session.gdb_dwarf:
             binary = session.gdb_dwarf
         elif session.source.binary:
             binary = session.source.binary
@@ -409,8 +429,9 @@ def create_app(repo_root: Path | None = None,
         if frame_index < 0 or frame_index >= len(session.result.frames):
             return jsonify(error='frame index out of range'), 404
 
-        if session.backend != 'gdb' or not session.gdb_dwarf:
-            return jsonify(error='Expression evaluation requires GDB backend'), 400
+        if session.backend not in ('gdb', 'lldb'):
+            return jsonify(
+                error='Expression evaluation requires GDB or LLDB backend'), 400
 
         data = request.get_json(silent=True) or {}
         expr = data.get('expr', '').strip()
@@ -418,13 +439,20 @@ def create_app(repo_root: Path | None = None,
             return jsonify(error='expr required'), 400
 
         frame = session.result.frames[frame_index]
-        from .gdb_backend import GdbBackend
-        if isinstance(session.gdb_dwarf, GdbBackend):
-            result = session.gdb_dwarf.evaluate_expression(
-                frame.address, expr)
-            return jsonify(result)
+        if session.backend == 'lldb' and session.lldb_dwarf:
+            from .lldb_backend import LldbBackend
+            if isinstance(session.lldb_dwarf, LldbBackend):
+                result = session.lldb_dwarf.evaluate_expression(
+                    frame.address, expr)
+                return jsonify(result)
+        if session.backend == 'gdb' and session.gdb_dwarf:
+            from .gdb_backend import GdbBackend
+            if isinstance(session.gdb_dwarf, GdbBackend):
+                result = session.gdb_dwarf.evaluate_expression(
+                    frame.address, expr)
+                return jsonify(result)
 
-        return jsonify(error='GDB backend not available'), 400
+        return jsonify(error='Backend not available'), 400
 
     # -----------------------------------------------------------------
     # GET /api/regions/<session_id> — known memory regions
@@ -599,8 +627,9 @@ def create_app(repo_root: Path | None = None,
 
         data = request.get_json(silent=True) or {}
         target = data.get('backend', '')
-        if target not in ('pyelftools', 'gdb'):
-            return jsonify(error='backend must be "pyelftools" or "gdb"'), 400
+        if target not in ('pyelftools', 'gdb', 'lldb'):
+            return jsonify(
+                error='backend must be "pyelftools", "gdb", or "lldb"'), 400
 
         if target == session.backend:
             return jsonify(backend=session.backend)
@@ -624,6 +653,26 @@ def create_app(repo_root: Path | None = None,
                     )
                 except Exception as e:
                     return jsonify(error=f'Failed to start GDB backend: {e}'), 500
+
+        if target == 'lldb':
+            if not lldb_available():
+                return jsonify(error='lldb Python module not available'), 400
+            if not session.lldb_dwarf:
+                try:
+                    from .lldb_backend import LldbBackend
+                    frame_data = [(f.frame_fp, f.address)
+                                  for f in session.result.frames]
+                    session.lldb_dwarf = LldbBackend(
+                        session.elf_path,
+                        session.result.crash_info.registers,
+                        session.result.crash_info.crash_pc,
+                        session.result.stack_base,
+                        session.result.stack_mem,
+                        session.img_base,
+                        frames=frame_data,
+                    )
+                except Exception as e:
+                    return jsonify(error=f'Failed to start LLDB backend: {e}'), 500
 
         session.backend = target
         session.frame_cache.clear()

@@ -71,6 +71,8 @@ def _build_frame_ctx(
 
 def binary_for_session(session: Session, frame: FrameInfo) -> object | None:
     """Get the binary backend for a frame, respecting session backend choice."""
+    if session.backend == 'lldb' and session.lldb_dwarf:
+        return session.lldb_dwarf
     if session.backend == 'gdb' and session.gdb_dwarf:
         return session.gdb_dwarf
     return binary_for_frame(frame, session.source, session.extra_sources)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .decoder import AnalysisResult
 from .gdb_bridge import GdbSession, find_gdb
+from .lldb_loader import import_lldb
 from .models import SymbolSource
 
 
@@ -27,7 +28,8 @@ class Session:
     elf_path: Path | None = None
     gdb: GdbSession | None = None
     gdb_dwarf: object | None = None  # GdbBackend instance (alternative DWARF backend)
-    backend: str = 'pyelftools'  # 'pyelftools' or 'gdb'
+    lldb_dwarf: object | None = None  # LldbBackend instance (alternative DWARF backend)
+    backend: str = 'pyelftools'  # 'pyelftools', 'gdb', or 'lldb'
     frame_cache: dict[int, dict] = field(default_factory=dict)
 
     @property
@@ -67,6 +69,11 @@ def gdb_available() -> bool:
         return False
 
 
+def lldb_available() -> bool:
+    """Check if the system-installed lldb Python module is importable."""
+    return import_lldb() is not None
+
+
 def get_session(session_id: str) -> Session | None:
     """Look up a session by ID, returning None if not found."""
     return _sessions.get(session_id)
@@ -90,6 +97,22 @@ def cleanup_session(session: Session) -> None:
     if session.gdb:
         session.gdb.close()
         session.gdb = None
+    if session.gdb_dwarf is not None:
+        close = getattr(session.gdb_dwarf, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        session.gdb_dwarf = None
+    if session.lldb_dwarf is not None:
+        close = getattr(session.lldb_dwarf, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        session.lldb_dwarf = None
     if session.source.binary:
         session.source.binary.close()
     for src in session.extra_sources.values():
