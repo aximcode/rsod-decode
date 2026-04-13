@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import struct
+from collections.abc import Callable
 
 
 # Regex patterns for stack dump parsing
@@ -106,3 +107,36 @@ def walk_rbp_chain(
         cur_rbp = saved_rbp
 
     return frames
+
+
+def scan_stack_for_returns(
+    stack_memory: bytes, stack_base: int,
+    image_lo: int, image_hi: int,
+    is_call_before: Callable[[int], bool] | None = None,
+) -> list[int]:
+    """Scan a raw stack dump for in-image return addresses.
+
+    For every 8-byte value V in the stack where `image_lo <= V < image_hi`,
+    this emits V as a candidate return address if `is_call_before(V)` is
+    true (or if the callback is None, all in-range values qualify).
+
+    This is the fallback used for Dell x86 RSODs that contain only a raw
+    stack dump ("Stack trace not available") — the same trick
+    processRSOD.pl uses to produce a backtrace by consulting the MSVC map.
+
+    Returned addresses are in the order they appear on the stack (deepest
+    frame first), de-duplicated consecutively to avoid padding noise.
+    """
+    results: list[int] = []
+    last: int | None = None
+    for offset in range(0, len(stack_memory) - 7, 8):
+        val = struct.unpack_from('<Q', stack_memory, offset)[0]
+        if val < image_lo or val >= image_hi:
+            continue
+        if is_call_before is not None and not is_call_before(val):
+            continue
+        if val == last:
+            continue
+        results.append(val)
+        last = val
+    return results

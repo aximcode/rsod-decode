@@ -82,18 +82,19 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         expected_lbr=2,
     ),
     # Real Dell EPSA x86-64 crash: PE (.efi) + MSVC .map. Exercises the
-    # PEBinary path (no DWARF). Frame count is 0 because this particular
-    # RSOD's "Stack trace not available" blocks frame extraction; the
-    # value here is PE parse + symbol lookup + disassembly-readiness.
+    # full MAP+PE path: symbols from .map, disassembly from .efi via
+    # PEBinary, and stack-dump return-address reconstruction because the
+    # RSOD text says "Stack trace not available". Frames 1-13 are real
+    # EPSA C++ functions resolved by walking the raw stack dump through
+    # capstone call-site verification.
     "psa_x64": DatasetSpec(
         key="psa_x64",
         rsod_file="psa/rsod_psa_x64.txt",
         symbol_path=FIXTURES_DIR / "psa" / "psa_x64.map",
         companion_path=FIXTURES_DIR / "psa" / "psa_x64.efi",
-        base_override=0x1000000,
         expected_format="uefi_x86",
-        expected_frames=0,
-        expected_resolved=1,
+        expected_frames=14,
+        expected_resolved=0,
         expected_modules=299,
         expected_vregs=0,
         expected_stack_size=4096,

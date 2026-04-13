@@ -446,6 +446,44 @@ def analyze_rsod(
                 fp_unwound = True
                 log(f"RBP chain: {len(chain)} frames unwound from stack dump")
 
+    # 6c. Stack-dump return-address scan: Dell x86 RSODs often say
+    # "Stack trace not available" and ship only a raw stack dump.  If the
+    # decoder couldn't extract any sNN frames, scan the stack for 8-byte
+    # values that land inside the primary module and pass the binary's
+    # call-site verifier — matching processRSOD.pl's rtnToCall approach.
+    if (not frames and stack_mem and source.binary is not None
+            and source.table.preferred_base > 0
+            and getattr(decoder, 'supports_rbp_chain', lambda: False)()):
+        from .decoders.unwinding import scan_stack_for_returns
+        scanned = scan_stack_for_returns(
+            stack_mem, stack_base,
+            source.table.preferred_base,
+            source.table.image_end or (source.table.preferred_base + (1 << 32)),
+            is_call_before=source.binary.is_call_before,
+        )
+        if scanned:
+            log(f"Stack scan: {len(scanned)} return addresses in "
+                f"{source.name}")
+            mod_name = (source.name + '.efi'
+                        if not source.name.endswith('.efi') else source.name)
+            # Frame 0 is the crash PC (may be out-of-image), then each
+            # scanned return address becomes a caller frame.
+            frames.append(FrameInfo(
+                index=0,
+                address=crash_info.crash_pc or 0,
+                module=mod_name,
+            ))
+            for i, ret_addr in enumerate(scanned, start=1):
+                result = source.table.lookup(ret_addr)
+                sym, sym_off = (result if result else (None, 0))
+                frames.append(FrameInfo(
+                    index=i,
+                    address=ret_addr,
+                    module=mod_name,
+                    symbol=sym,
+                    sym_offset=sym_off,
+                ))
+
     # 7. Call-site verification via capstone — batch per module
     call_verified: dict[int, bool] = {}
     if frames:
