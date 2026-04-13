@@ -72,3 +72,46 @@ def test_psa_x64_pe_backend_ready(load_dataset_run) -> None:
     # 0x180031ba1 is taken from the stack dump and is known to satisfy
     # is_call_before() for this build.
     assert binary.is_call_before(0x180031BA1) is True
+
+
+def test_pe_backend_arm64() -> None:
+    """Smoke test PEBinary against an ARM64 PE file from uefi-devkit's
+    CrashTest. Exercises the aarch64 capstone path through the shared
+    disasm helpers so both x86-64 and ARM64 stay regression-covered."""
+    from rsod_decode.pe_backend import PEBinary
+    from ._datasets import FIXTURES_DIR
+
+    pe_path = FIXTURES_DIR / "pe_aa64_crashtest.efi"
+    binary = PEBinary(pe_path)
+    try:
+        assert binary.arch == "aarch64"
+        # EDK2 AArch64 builds set ImageBase=0; .text starts after the
+        # PE headers (~0x4000 for this toolchain).
+        assert binary.image_base == 0
+        assert len(binary._text_data) > 0
+        assert binary._text_addr > 0
+
+        # Disassemble a window inside .text and confirm capstone emits
+        # valid ARM64 instructions (4-byte fixed length).
+        probe_addr = binary._text_addr + 0x200
+        insns = binary.disassemble_around(probe_addr, context=16)
+        assert len(insns) > 0
+        for addr, mnemonic, _ in insns:
+            assert mnemonic, f"empty mnemonic at 0x{addr:x}"
+            assert addr % 4 == 0, (
+                f"ARM64 instructions must be 4-byte aligned; got 0x{addr:x}")
+
+        # Find at least one bl/blr in .text and verify is_call_before()
+        # returns True for the address right after it.
+        call_mnems = {"bl", "blr"}
+        found_call = False
+        for insn in binary._cs.disasm(
+                binary._text_data[:0x4000], binary._text_addr):
+            if insn.mnemonic in call_mnems:
+                after_call = insn.address + insn.size
+                assert binary.is_call_before(after_call) is True
+                found_call = True
+                break
+        assert found_call, "no call instruction found in first 16 KB of .text"
+    finally:
+        binary.close()
