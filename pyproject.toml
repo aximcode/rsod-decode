@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsod-decode"
+version = "0.1.0"
+description = "UEFI RSOD crash dump debugger"
+requires-python = ">=3.11"
+dependencies = [
+  "flask>=3.0",
+  "flask-sock>=0.7",
+  "simple-websocket>=1.0",
+  "pyelftools>=0.30",
+  "capstone>=5.0",
+  "cxxfilt>=0.3",
+]
+
+[project.optional-dependencies]
+gdb = ["pygdbmi>=0.11"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+packages = ["backend", "backend.decoders"]
+
+[tool.pytest.ini_options]
+markers = [
+  "parser: parser/analyze_rsod regression tests",
+  "api: Flask API regression tests",
+  "gdb: Tests that require GDB backend support",
+]
+testpaths = ["tests"]
