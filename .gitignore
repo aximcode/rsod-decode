@@ -26,3 +26,8 @@ Thumbs.db
 *.tmp
 *.bak
 CLAUDE.md
+
+# Large binary fixture artifacts. PDB is 10 MB and regeneratable from the
+# delldiags source tree via the SYMBOLS=YES build flag — see the fixture's
+# BUILD.md for the exact commands.
+tests/fixtures/psa_x64_forcecrash/*.pdb

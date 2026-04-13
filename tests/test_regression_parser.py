@@ -115,3 +115,74 @@ def test_pe_backend_arm64() -> None:
         assert found_call, "no call instruction found in first 16 KB of .text"
     finally:
         binary.close()
+
+
+def test_psa_x64_forcecrash_ground_truth(load_dataset_run) -> None:
+    """Strict assertions against the deterministic EPSA forcecrash fixture.
+
+    Source-level ground-truth values come from
+    tests/fixtures/psa_x64_forcecrash/BUILD.md — the -forcecrash hook in
+    PsaEntry.c and the adapted crashtest.c generator set every struct
+    field to a known magic value, so the decoded backtrace, LBR, and
+    image base can be pinned exactly without worrying about build drift.
+    """
+    run = load_dataset_run("psa_x64_forcecrash")
+    result = run.result
+    crash = result.crash_info
+
+    # Exception kind: #GP (13) from -forcecrash gp
+    assert "General Protection Fault" in crash.exception_desc
+    assert "13" in crash.exception_desc
+
+    # Faulting PC must resolve to trigger_gp_fault. The actual fault is
+    # at +2 (the store to the non-canonical address) — we care about
+    # the function name, not the exact offset.
+    assert crash.crash_symbol == "trigger_gp_fault"
+    assert crash.crash_pc == 0x18000618A
+
+    # No relocation for this build — linked base == load base.
+    assert crash.image_base == 0x180000000
+
+    # The LBR one-frame hint pairs the last branch source and target.
+    # Source lives inside dispatch_crash (the tail-call jmp to
+    # trigger_gp_fault) and target lands on trigger_gp_fault's entry.
+    lbr_by_type = {e["type"]: e for e in crash.lbr}
+    assert "LBRfr0" in lbr_by_type, f"LBR missing LBRfr0: {crash.lbr}"
+    assert "LBRto0" in lbr_by_type, f"LBR missing LBRto0: {crash.lbr}"
+
+    lbr_from = run.source.table.lookup(lbr_by_type["LBRfr0"]["addr"])
+    assert lbr_from is not None
+    assert lbr_from[0].name == "dispatch_crash"
+
+    lbr_to = run.source.table.lookup(lbr_by_type["LBRto0"]["addr"])
+    assert lbr_to is not None
+    assert lbr_to[0].name == "trigger_gp_fault"
+
+    # Walked stack: at least one frame must resolve to initialize_test
+    # (it owns `CrashContext ctx` so MSVC can't tail-call it) and at
+    # least one must resolve to fForceCrashIfRequested (the EPSA entry
+    # gate for -forcecrash). Tail-called functions (prepare_crash_context,
+    # validate_environment, dispatch_crash) won't appear as frames.
+    frame_syms = {
+        f.symbol.name for f in result.frames if f.symbol is not None
+    }
+    assert "initialize_test" in frame_syms, f"frames: {frame_syms}"
+    assert "fForceCrashIfRequested" in frame_syms, f"frames: {frame_syms}"
+
+    # TODO: enable once a PDB backend lands in rsod-decode.
+    #
+    # Ground-truth CrashTestConfig / CrashContext struct values (from
+    # BUILD.md, set by initialize_test() in PsaEntry.c):
+    #   config.session_id = 0xDEAD0000CAFE0000
+    #   config.flags      = 0x1234
+    #   config.version    = 3
+    #   config.mode       = 1          (CRASH_MODE_GP)
+    #   config.origin.x   = 100 (0x64)
+    #   config.origin.y   = 200 (0xC8)
+    #   ctx.depth         = 1
+    #   ctx.cookie        = session_id ^ 0xDEFFBABECAFE0000
+    #   ctx.tag           = "crashtest-v3"  (rdata string)
+    #   ctx.attempts[1]   = 1
+    # When /api/expand supports PDB-driven struct expansion for PE
+    # sessions, assert these via the expand endpoint against the
+    # CrashContext* pointer held in initialize_test's frame.

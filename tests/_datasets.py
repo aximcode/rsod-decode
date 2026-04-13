@@ -100,4 +100,25 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         expected_stack_size=4096,
         expected_lbr=0,
     ),
+    # Deterministic EPSA crash from the -forcecrash hook (see
+    # tests/fixtures/psa_x64_forcecrash/BUILD.md for the build procedure
+    # and ground-truth value table). Same MAP+PE load path as psa_x64
+    # but with known call chain and known struct values so the
+    # corresponding ground-truth test can make strict assertions. No
+    # base_override — this build is not relocated at load time
+    # (image_base == preferred_base == 0x180000000).
+    "psa_x64_forcecrash": DatasetSpec(
+        key="psa_x64_forcecrash",
+        rsod_file="psa_x64_forcecrash/rsod_psa_x64.txt",
+        symbol_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.map",
+        companion_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.efi",
+        expected_format="uefi_x86",
+        expected_frames=4,
+        expected_resolved=1,
+        expected_modules=316,
+        expected_vregs=0,
+        expected_stack_size=4096,
+        expected_lbr=2,
+        expected_image_base=0x180000000,
+    ),
 }
