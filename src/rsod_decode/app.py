@@ -59,6 +59,21 @@ def _pair_map_with_pe(
     return None, extras
 
 
+def _pop_pdb_for(stem: str, extras: list[Path]) -> tuple[Path | None, list[Path]]:
+    """Pull a `<stem>.pdb` out of extras if one is present.
+
+    Returned (pdb, remaining). Stem match is case-insensitive, and we
+    strip one trailing extension from each candidate so `psa.efi.pdb`
+    pairs with `psa.efi` as well as `psa.pdb` pairing with `psa`.
+    """
+    stem_l = stem.lower()
+    for i, ex in enumerate(extras):
+        if ex.name.lower().endswith('.pdb') and \
+                ex.stem.lower() == stem_l:
+            return ex, extras[:i] + extras[i + 1:]
+    return None, extras
+
+
 def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
     """Look up a session by ID, returning (session, None) or (None, 404-response)."""
     session = get_session(session_id)
@@ -111,8 +126,14 @@ def create_app(repo_root: Path | None = None,
         # Detect a MAP+EFI pair for MSVC builds: if the primary or one of
         # the extras is the PE companion of the other, fold it into the
         # loader as companion_path instead of treating it as a separate
-        # module.
+        # module. Also pick up a matching .pdb for PDB-backed LLDB.
         companion, extra_paths = _pair_map_with_pe(sym_path, extra_paths)
+        pe_for_pdb = companion if companion and is_pe(companion) else (
+            sym_path if is_pe(sym_path) else None)
+        pdb_path: Path | None = None
+        if pe_for_pdb is not None:
+            pdb_path, extra_paths = _pop_pdb_for(
+                pe_for_pdb.stem, extra_paths)
 
         # Load symbols
         try:
@@ -163,21 +184,33 @@ def create_app(repo_root: Path | None = None,
             created_at=datetime.now(timezone.utc).isoformat(),
             temp_dir=temp_dir,
             elf_path=sym_path,
+            pe_path=pe_for_pdb,
+            pdb_path=pdb_path,
         )
 
         # Auto-initialize a richer backend if available. Preference
-        # order: lldb → gdb → pyelftools. Both richer backends require
-        # an ELF so PE (MSVC EPSA) sessions silently fall back.
+        # order: lldb (ELF corefile or PE+PDB) → gdb (ELF only) →
+        # pyelftools. PE+PDB needs both .efi and .pdb; plain PE sessions
+        # without a PDB silently fall back to pyelftools/PEBinary.
         frame_data = [(f.frame_fp, f.address) for f in analysis.frames]
         if lldb_available():
             try:
                 from .lldb_backend import LldbBackend
-                session.lldb_dwarf = LldbBackend(
-                    sym_path, analysis.crash_info.registers,
-                    analysis.crash_info.crash_pc,
-                    analysis.stack_base, analysis.stack_mem,
-                    session.img_base, frames=frame_data)
-                session.backend = 'lldb'
+                if pe_for_pdb is not None and pdb_path is not None:
+                    session.lldb_dwarf = LldbBackend.from_pe_pdb(
+                        pe_for_pdb, pdb_path,
+                        analysis.crash_info.registers,
+                        analysis.crash_info.crash_pc,
+                        analysis.stack_base, analysis.stack_mem,
+                        session.img_base, frames=frame_data)
+                    session.backend = 'lldb'
+                elif pe_for_pdb is None:
+                    session.lldb_dwarf = LldbBackend(
+                        sym_path, analysis.crash_info.registers,
+                        analysis.crash_info.crash_pc,
+                        analysis.stack_base, analysis.stack_mem,
+                        session.img_base, frames=frame_data)
+                    session.backend = 'lldb'
             except Exception:
                 pass
         if session.backend == 'pyelftools' and gdb_available():
@@ -662,15 +695,28 @@ def create_app(repo_root: Path | None = None,
                     from .lldb_backend import LldbBackend
                     frame_data = [(f.frame_fp, f.address)
                                   for f in session.result.frames]
-                    session.lldb_dwarf = LldbBackend(
-                        session.elf_path,
-                        session.result.crash_info.registers,
-                        session.result.crash_info.crash_pc,
-                        session.result.stack_base,
-                        session.result.stack_mem,
-                        session.img_base,
-                        frames=frame_data,
-                    )
+                    if session.pe_path is not None and \
+                            session.pdb_path is not None:
+                        session.lldb_dwarf = LldbBackend.from_pe_pdb(
+                            session.pe_path,
+                            session.pdb_path,
+                            session.result.crash_info.registers,
+                            session.result.crash_info.crash_pc,
+                            session.result.stack_base,
+                            session.result.stack_mem,
+                            session.img_base,
+                            frames=frame_data,
+                        )
+                    else:
+                        session.lldb_dwarf = LldbBackend(
+                            session.elf_path,
+                            session.result.crash_info.registers,
+                            session.result.crash_info.crash_pc,
+                            session.result.stack_base,
+                            session.result.stack_mem,
+                            session.img_base,
+                            frames=frame_data,
+                        )
                 except Exception as e:
                     return jsonify(error=f'Failed to start LLDB backend: {e}'), 500
 

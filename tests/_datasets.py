@@ -32,6 +32,7 @@ class DatasetSpec:
     expected_lbr: int
     expected_image_base: int | None = None
     companion_path: Path | None = None
+    pdb_path: Path | None = None
     base_override: int | None = None
 
 
@@ -112,6 +113,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         rsod_file="psa_x64_forcecrash/rsod_psa_x64.txt",
         symbol_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.map",
         companion_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.efi",
+        pdb_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.pdb",
         expected_format="uefi_x86",
         expected_frames=4,
         expected_resolved=1,

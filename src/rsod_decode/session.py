@@ -26,6 +26,8 @@ class Session:
     created_at: str = ''
     temp_dir: Path | None = None
     elf_path: Path | None = None
+    pe_path: Path | None = None  # MSVC .efi when session is PE+PDB
+    pdb_path: Path | None = None  # MSVC .pdb when paired with a PE
     gdb: GdbSession | None = None
     gdb_dwarf: object | None = None  # GdbBackend instance (alternative DWARF backend)
     lldb_dwarf: object | None = None  # LldbBackend instance (alternative DWARF backend)

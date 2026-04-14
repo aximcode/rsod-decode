@@ -25,7 +25,7 @@ export function UploadForm({ onUpload, uploading, error }: Props) {
     const files = Array.from(e.dataTransfer.files)
     for (const f of files) {
       const name = f.name.toLowerCase()
-      if (name.endsWith('.map') || name.endsWith('.efi') || name.endsWith('.so') || name.endsWith('.debug')) {
+      if (name.endsWith('.map') || name.endsWith('.efi') || name.endsWith('.so') || name.endsWith('.debug') || name.endsWith('.pdb')) {
         if (!symFile) {
           setSymFile(f)
         } else {
@@ -83,7 +83,7 @@ export function UploadForm({ onUpload, uploading, error }: Props) {
             Drop RSOD log and symbol files here
           </p>
           <p className="text-zinc-500 text-sm">
-            .txt/.log for RSOD capture, .map/.efi/.so/.debug for symbols
+            .txt/.log for RSOD capture, .map/.efi/.so/.debug/.pdb for symbols
           </p>
           {(rsodFile ?? symFile) && (
             <div className="mt-4 text-left space-y-1">
@@ -124,7 +124,7 @@ export function UploadForm({ onUpload, uploading, error }: Props) {
             <span className="text-sm text-zinc-400">Symbol file</span>
             <input
               type="file"
-              accept=".map,.efi,.so,.debug,.elf"
+              accept=".map,.efi,.so,.debug,.elf,.pdb"
               onChange={e => setSymFile(e.target.files?.[0] ?? null)}
               className="mt-1 block w-full text-sm text-zinc-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-zinc-700 file:text-zinc-200 hover:file:bg-zinc-600 file:cursor-pointer"
             />

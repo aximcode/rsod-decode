@@ -169,20 +169,8 @@ def test_psa_x64_forcecrash_ground_truth(load_dataset_run) -> None:
     assert "initialize_test" in frame_syms, f"frames: {frame_syms}"
     assert "fForceCrashIfRequested" in frame_syms, f"frames: {frame_syms}"
 
-    # TODO: enable once a PDB backend lands in rsod-decode.
-    #
-    # Ground-truth CrashTestConfig / CrashContext struct values (from
-    # BUILD.md, set by initialize_test() in PsaEntry.c):
-    #   config.session_id = 0xDEAD0000CAFE0000
-    #   config.flags      = 0x1234
-    #   config.version    = 3
-    #   config.mode       = 1          (CRASH_MODE_GP)
-    #   config.origin.x   = 100 (0x64)
-    #   config.origin.y   = 200 (0xC8)
-    #   ctx.depth         = 1
-    #   ctx.cookie        = session_id ^ 0xDEFFBABECAFE0000
-    #   ctx.tag           = "crashtest-v3"  (rdata string)
-    #   ctx.attempts[1]   = 1
-    # When /api/expand supports PDB-driven struct expansion for PE
-    # sessions, assert these via the expand endpoint against the
-    # CrashContext* pointer held in initialize_test's frame.
+    # Ground-truth CrashContext/CrashTestConfig struct values are
+    # asserted through the public /api/expand endpoint in
+    # tests/test_regression_api.py::test_psa_x64_forcecrash_ground_truth_via_api
+    # — keeping the parser-level assertions (above) separate from the
+    # PDB-backed LLDB path which requires the lldb Python module.

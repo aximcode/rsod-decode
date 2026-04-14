@@ -70,6 +70,12 @@ class LldbBackend:
         self._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_'))
         self._var_objects: dict[str, Any] = {}
         self._globals_cache: list[VarInfo] | None = None
+        self._mode: str = 'corefile'
+        # PE+PDB mode stashes stack/registers for manual memory reads
+        # since no SBProcess is available. Set in from_pe_pdb().
+        self._crash_registers: dict[str, int] = registers
+        self._stack_base: int = stack_base
+        self._stack_mem: bytes = stack_mem
 
         core_path = self._tmpdir / 'crash.core'
         write_corefile(
@@ -138,6 +144,8 @@ class LldbBackend:
         return None
 
     def _frame_for(self, addr: int) -> Any | None:
+        if self._mode == 'pe_pdb':
+            return None
         idx = self._resolve_frame_idx(addr)
         if idx is None:
             return None
@@ -213,6 +221,10 @@ class LldbBackend:
         return []
 
     def evaluate_globals(self, names: list[VarInfo]) -> list[VarInfo]:
+        if self._mode == 'pe_pdb':
+            # No SBProcess — can't evaluate runtime globals. Return the
+            # pyelftools-discovered list untouched.
+            return list(names)
         if self._globals_cache is not None:
             return self._globals_cache
         results: list[VarInfo] = []
@@ -274,6 +286,14 @@ class LldbBackend:
         offset: int = 0, count: int = 32,
     ) -> tuple[list[dict], int]:
         var_key = type_die if isinstance(type_die, str) else ''
+        # PE+PDB mode: var_key encodes a type name, e.g. "pe_type:CrashContext".
+        # Look the type up via SBModule.FindTypes, read the struct bytes at
+        # the given address, and emit one field dict per member.
+        if var_key.startswith('pe_type:'):
+            type_name = var_key[len('pe_type:'):]
+            return self._expand_pe_type(
+                type_name, addr, offset, count)
+
         sv = self._var_objects.get(var_key)
         if sv is None:
             return [], 0
@@ -343,6 +363,8 @@ class LldbBackend:
         stack_base: int = 0, stack_mem: bytes = b'',
         image_base: int = 0,
     ) -> bytes | None:
+        if self._mode == 'pe_pdb':
+            return self._read_memory_static(addr, size)
         if not self._has_memory(addr, size):
             return None
         err = self._lldb.SBError()
@@ -381,7 +403,14 @@ class LldbBackend:
         stack_base: int = 0, stack_mem: bytes = b'',
         image_base: int = 0,
     ) -> list[int | None]:
-        result: list[int | None] = [None] * size
+        if self._mode == 'pe_pdb':
+            result: list[int | None] = [None] * size
+            for i in range(size):
+                b = self._read_memory_static(addr + i, 1)
+                if b is not None and len(b) == 1:
+                    result[i] = b[0]
+            return result
+        result = [None] * size
         i = 0
         while i < size:
             if not self._has_memory(addr + i):
@@ -405,6 +434,8 @@ class LldbBackend:
     def disassemble_around(
         self, addr: int, context: int = 24,
     ) -> list[tuple[int, str, str]]:
+        if self._mode == 'pe_pdb':
+            return []
         runtime = addr + self._image_base
         # Read a generous window of instructions centered on addr; the
         # exact byte size depends on the ISA so we read count*3 and
@@ -427,6 +458,8 @@ class LldbBackend:
         return insns
 
     def is_call_before(self, addr: int) -> bool:
+        if self._mode == 'pe_pdb':
+            return False
         runtime = addr + self._image_base
         sb_addr = self._lldb.SBAddress(runtime - 8, self._target)
         instructions = self._target.ReadInstructions(sb_addr, 2)
@@ -497,3 +530,229 @@ class LldbBackend:
         except Exception:
             pass
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # =================================================================
+    # PE+PDB mode — static type lookup + direct memory reads.
+    # No SBProcess exists, so get_params/get_locals return [] and
+    # variable values come from ground-truth addresses computed by the
+    # caller (test or frontend) and passed to /api/expand.
+    # =================================================================
+
+    @classmethod
+    def from_pe_pdb(
+        cls,
+        pe_path: Path,
+        pdb_path: Path,
+        registers: dict[str, int],
+        crash_pc: int | None,
+        stack_base: int,
+        stack_mem: bytes,
+        image_base: int,
+        frames: list[tuple[int, int]] | None = None,
+    ) -> LldbBackend:
+        """Alternate constructor for a statically-loaded PE+PDB target.
+
+        Builds an LldbBackend that holds a PE target with its PDB loaded
+        as a symbol source, but no SBProcess. Variable values come from
+        the RSOD registers + stack dump that get stashed on the instance,
+        and struct expansion uses SBType layouts from the PDB.
+        """
+        lldb = import_lldb()
+        if lldb is None:
+            raise RuntimeError('lldb Python module not available')
+        instance = cls.__new__(cls)
+        instance._lldb = lldb
+        instance._elf_path = pe_path
+        instance._image_base = image_base
+        instance._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_pe_'))
+        instance._var_objects = {}
+        instance._globals_cache = None
+        instance._mode = 'pe_pdb'
+        instance._crash_registers = registers
+        instance._stack_base = stack_base
+        instance._stack_mem = stack_mem
+        instance._valid_ranges = []
+
+        instance._debugger = lldb.SBDebugger.Create()
+        instance._debugger.SetAsync(False)
+        ci = instance._debugger.GetCommandInterpreter()
+        ro = lldb.SBCommandReturnObject()
+        ci.HandleCommand(
+            f'target create --arch x86_64 {pe_path}', ro)
+        if not ro.Succeeded():
+            lldb.SBDebugger.Destroy(instance._debugger)
+            raise RuntimeError(
+                f'target create failed: {ro.GetError().strip()}')
+        ci.HandleCommand(f'target symbols add {pdb_path}', ro)
+        if not ro.Succeeded():
+            lldb.SBDebugger.Destroy(instance._debugger)
+            raise RuntimeError(
+                f'target symbols add failed: {ro.GetError().strip()}')
+
+        instance._target = instance._debugger.GetSelectedTarget()
+        if not instance._target.IsValid():
+            lldb.SBDebugger.Destroy(instance._debugger)
+            raise RuntimeError('PE+PDB target invalid after creation')
+
+        # Cache module sections with their file addresses (no slide
+        # — PE files link with ImageBase baked into section addresses).
+        instance._pe_sections: list[tuple[int, int, Any]] = []
+        if instance._target.GetNumModules() > 0:
+            module = instance._target.GetModuleAtIndex(0)
+            for i in range(module.GetNumSections()):
+                sec = module.GetSectionAtIndex(i)
+                file_addr = sec.GetFileAddress()
+                size = sec.GetByteSize()
+                if size > 0 and file_addr != \
+                        lldb.LLDB_INVALID_ADDRESS:
+                    instance._pe_sections.append((file_addr, size, sec))
+        return instance
+
+    def _read_memory_static(self, addr: int, size: int) -> bytes | None:
+        """PE+PDB mode memory read: stack dump first, then PE sections."""
+        if self._stack_mem:
+            off = addr - self._stack_base
+            if 0 <= off <= len(self._stack_mem) - size:
+                return self._stack_mem[off:off + size]
+        for file_addr, sec_size, sec in self._pe_sections:
+            off = addr - file_addr
+            if 0 <= off <= sec_size - size:
+                err = self._lldb.SBError()
+                data = sec.GetSectionData().ReadRawData(err, off, size)
+                if err.Success() and data is not None:
+                    return bytes(data)
+                return None
+        return None
+
+    def _read_cstring_static(
+        self, addr: int, max_len: int = 256,
+    ) -> str | None:
+        """Read a NUL-terminated UTF-8 string from PE sections or stack."""
+        for length in (max_len, 64, 16, 1):
+            data = self._read_memory_static(addr, length)
+            if data is not None:
+                nul = data.find(b'\x00')
+                if nul >= 0:
+                    data = data[:nul]
+                return data.decode('utf-8', errors='replace')
+        return None
+
+    def _find_pe_type(self, type_name: str) -> Any | None:
+        """Look up a type by name via SBModule.FindTypes."""
+        if self._target.GetNumModules() == 0:
+            return None
+        module = self._target.GetModuleAtIndex(0)
+        matches = module.FindTypes(type_name)
+        if matches.GetSize() == 0:
+            # FindFirstType handles typedefs better than FindTypes in
+            # some lldb builds; try it as a fallback.
+            t = module.FindFirstType(type_name)
+            return t if t and t.IsValid() else None
+        return matches.GetTypeAtIndex(0)
+
+    def _expand_pe_type(
+        self, type_name: str, addr: int,
+        offset: int, count: int,
+    ) -> tuple[list[dict], int]:
+        sb_type = self._find_pe_type(type_name)
+        if sb_type is None:
+            return [], 0
+        total = sb_type.GetNumberOfFields()
+        fields: list[dict] = []
+        for i in range(offset, min(offset + count, total)):
+            field = sb_type.GetFieldAtIndex(i)
+            fields.append(self._pe_field_to_dict(field, addr))
+        return fields, total
+
+    def _pe_field_to_dict(self, field: Any, struct_addr: int) -> dict:
+        """Turn one SBTypeMember into the /api/expand field dict format."""
+        name = field.GetName() or '?'
+        field_type = field.GetType()
+        type_name = field_type.GetName() or '?'
+        field_off = field.GetOffsetInBytes()
+        field_addr = struct_addr + field_off
+        field_size = field_type.GetByteSize()
+
+        is_pointer = field_type.IsPointerType()
+        is_array = field_type.IsArrayType()
+        # Struct/class detection via type class
+        type_class = field_type.GetTypeClass()
+        is_struct = type_class in (
+            self._lldb.eTypeClassStruct,
+            self._lldb.eTypeClassClass,
+            self._lldb.eTypeClassUnion,
+        )
+        is_expandable = is_pointer or is_array or is_struct
+
+        value: int | None = None
+        string_preview: str | None = None
+        expand_addr: int | None = None
+        var_key_out = ''
+
+        if is_pointer:
+            raw = self._read_memory_static(field_addr, 8)
+            if raw is not None:
+                value = int.from_bytes(raw, 'little')
+            if value:
+                pointee = field_type.GetPointeeType()
+                pointee_name = pointee.GetName() or ''
+                if 'char' in pointee_name:
+                    string_preview = self._read_cstring_static(value, 256)
+                # Pointer to struct → expand the pointee at the pointer value
+                pointee_class = pointee.GetTypeClass()
+                if pointee_class in (
+                    self._lldb.eTypeClassStruct,
+                    self._lldb.eTypeClassClass,
+                    self._lldb.eTypeClassUnion,
+                ):
+                    expand_addr = value
+                    pointee_base = pointee_name.split('::')[-1]
+                    var_key_out = f'pe_type:{pointee_base}'
+        elif is_array:
+            # Array element expansion: child fields are synthesized per
+            # element. We don't wire up indexed expansion here; just
+            # report the array as expandable pointing at its own address.
+            expand_addr = field_addr
+            elem_type = field_type.GetArrayElementType()
+            elem_name = elem_type.GetName() or ''
+            var_key_out = f'pe_array:{elem_name}:{field_type.GetByteSize()}'
+            # For small integer arrays, show a preview by reading each
+            # element. Not expandable further in this minimal path.
+            raw = self._read_memory_static(field_addr, field_size)
+            if raw is not None and elem_type.IsValid() and \
+                    elem_type.GetByteSize() in (1, 2, 4, 8):
+                try:
+                    n_elems = field_size // elem_type.GetByteSize()
+                    elem_size = elem_type.GetByteSize()
+                    parts = [
+                        int.from_bytes(
+                            raw[j * elem_size:(j + 1) * elem_size],
+                            'little')
+                        for j in range(n_elems)
+                    ]
+                    string_preview = '[' + ', '.join(str(p) for p in parts) + ']'
+                except Exception:
+                    pass
+        elif is_struct:
+            expand_addr = field_addr
+            nested = type_name.split('::')[-1]
+            var_key_out = f'pe_type:{nested}'
+        else:
+            # Scalar — read field_size bytes, interpret as little-endian.
+            if field_size in (1, 2, 4, 8):
+                raw = self._read_memory_static(field_addr, field_size)
+                if raw is not None:
+                    value = int.from_bytes(raw, 'little')
+
+        return {
+            'name': name,
+            'type': type_name,
+            'value': value,
+            'byte_size': field_size,
+            'is_expandable': is_expandable,
+            'expand_addr': expand_addr,
+            'string_preview': string_preview,
+            'type_offset': 0,
+            'cu_offset': 0,
+            'var_key': var_key_out,
+        }

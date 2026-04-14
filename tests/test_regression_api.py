@@ -31,13 +31,21 @@ def _create_session(client, spec: DatasetSpec) -> ApiSessionContext:
             "rsod_log": (io.BytesIO(rsod_path.read_bytes()), spec.rsod_file),
             "symbol_file": (symbol_fp, spec.symbol_path.name),
         }
-        # Upload companion binary (MSVC MAP+EFI pair) as an extra so the
-        # Flask side exercises the _pair_map_with_pe auto-detection path.
-        companion_fp = None
+        # Upload companion binary (MSVC MAP+EFI pair) and any .pdb for
+        # PDB-backed LLDB as extras so the Flask side exercises the
+        # _pair_map_with_pe + _pop_pdb_for auto-detection paths.
+        extra_fps: list = []
+        extras: list = []
         if spec.companion_path is not None:
-            companion_fp = spec.companion_path.open("rb")
-            data["extra_symbols[]"] = (
-                companion_fp, spec.companion_path.name)
+            fp = spec.companion_path.open("rb")
+            extra_fps.append(fp)
+            extras.append((fp, spec.companion_path.name))
+        if spec.pdb_path is not None and spec.pdb_path.exists():
+            fp = spec.pdb_path.open("rb")
+            extra_fps.append(fp)
+            extras.append((fp, spec.pdb_path.name))
+        if extras:
+            data["extra_symbols[]"] = extras if len(extras) > 1 else extras[0]
         if spec.base_override is not None:
             data["base"] = f"{spec.base_override:X}"
         try:
@@ -45,8 +53,8 @@ def _create_session(client, spec: DatasetSpec) -> ApiSessionContext:
                 "/api/session", data=data, content_type="multipart/form-data"
             )
         finally:
-            if companion_fp is not None:
-                companion_fp.close()
+            for fp in extra_fps:
+                fp.close()
 
     assert response.status_code == 201, response.get_json()
     body = response.get_json()
@@ -242,6 +250,68 @@ def test_api_eval_ctx_pointer_with_gdb(api_session: ApiSessionContext, client) -
     body = response.get_json()
     assert "error" not in body
     assert re.search(r"0x[0-9a-fA-F]+", body.get("value", ""))
+
+
+@pytest.mark.lldb
+def test_psa_x64_forcecrash_ground_truth_via_api(
+    api_session: ApiSessionContext, client,
+) -> None:
+    """PDB-backed struct expansion ground-truth.
+
+    Uploads psa_x64.efi + .map + .pdb and hits /api/expand with the
+    same `pe_type:` var_keys the frontend sends, asserting the
+    deterministic CrashContext/CrashTestConfig field values documented
+    in tests/fixtures/psa_x64_forcecrash/BUILD.md.
+
+    Struct addresses are computed relative to the crash RSP from the
+    BUILD.md stack offset table — no CFI unwinding involved.
+    """
+    if api_session.spec.key != "psa_x64_forcecrash":
+        pytest.skip("ground-truth assertions only for psa_x64_forcecrash")
+
+    meta = client.get(f"/api/session/{api_session.session_id}").get_json()
+    if not meta["lldb_available"]:
+        pytest.skip("LLDB backend not available")
+    if meta["backend"] != "lldb":
+        pytest.skip(f"session backend is {meta['backend']!r}, expected lldb")
+
+    rsp = int(meta["registers"]["RSP"], 16)
+    # BUILD.md: ctx.cookie partial at RSP+0x38, cookie@CrashContext+16 →
+    # ctx starts at RSP+0x28 (= RSP + 40).
+    ctx_addr = rsp + 40
+
+    def expand(addr: int, var_key: str) -> list[dict]:
+        resp = client.get(
+            f"/api/expand/{api_session.session_id}/0"
+            f"?addr=0x{addr:X}&var_key={var_key}&offset=0&count=32")
+        assert resp.status_code == 200, resp.get_json()
+        return resp.get_json()["fields"]
+
+    ctx_fields = {f["name"]: f for f in expand(ctx_addr, "pe_type:CrashContext")}
+    assert ctx_fields["depth"]["value"] == 1
+    assert ctx_fields["cookie"]["value"] == (
+        0xDEAD0000CAFE0000 ^ 0xDEFFBABECAFE0000)
+    assert ctx_fields["tag"]["string_preview"] == "crashtest-v3"
+    # attempts[1] was bumped by validate_environment before the tail-call
+    # chain continued — preview string lists the array contents.
+    assert ctx_fields["attempts"]["string_preview"] == "[0, 1, 0, 0]"
+
+    config_ptr = ctx_fields["config"]["expand_addr"]
+    config_key = ctx_fields["config"]["var_key"]
+    assert config_ptr is not None and config_key.startswith("pe_type:")
+
+    cfg_fields = {f["name"]: f for f in expand(config_ptr, config_key)}
+    assert cfg_fields["session_id"]["value"] == 0xDEAD0000CAFE0000
+    assert cfg_fields["flags"]["value"] == 0x1234
+    assert cfg_fields["version"]["value"] == 3
+    assert cfg_fields["mode"]["value"] == 1
+
+    origin_addr = cfg_fields["origin"]["expand_addr"]
+    origin_key = cfg_fields["origin"]["var_key"]
+    assert origin_addr is not None and origin_key.startswith("pe_type:")
+    pt_fields = {f["name"]: f for f in expand(origin_addr, origin_key)}
+    assert pt_fields["x"]["value"] == 100
+    assert pt_fields["y"]["value"] == 200
 
 
 def test_eval_rejected_without_gdb(api_session: ApiSessionContext, client) -> None:
