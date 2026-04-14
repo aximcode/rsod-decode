@@ -12,6 +12,7 @@ imported via rsod_decode.lldb_loader.import_lldb().
 """
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -41,6 +42,143 @@ def _is_expandable_type_name(type_name: str) -> bool:
 
 
 _CALL_MNEMONICS = ('bl', 'blr', 'blx', 'call', 'callq')
+
+
+# -----------------------------------------------------------------------
+# `image lookup -va` output parsing for PE+PDB per-frame variables.
+#
+# LLDB emits per-variable entries with DWARF-style location expressions,
+# e.g. "DW_OP_breg7 RSP+32" for stack locals and "DW_OP_reg2 RCX" for
+# register-held params. Entries may be range-scoped, meaning the
+# location only applies when the PC is inside [lo, hi). We dedupe by
+# name and pick the scope that covers the target PC.
+# -----------------------------------------------------------------------
+
+_RE_LOOKUP_VARIABLE = re.compile(
+    r'Variable: id = \{[^}]+\},\s*name = "([^"]*)",\s*type = "([^"]*)",'
+    r'.*?location = (.+?),\s*decl\s*=',
+    re.DOTALL,
+)
+_RE_LOOKUP_RANGED = re.compile(
+    r'^\s*\[0x([0-9a-fA-F]+),\s*0x([0-9a-fA-F]+)\)\s*->\s*(.+?)\s*$')
+_RE_DW_OP_REG = re.compile(r'^\s*DW_OP_reg\d+\s+(\w+)\s*$')
+_RE_DW_OP_BREG = re.compile(r'^\s*DW_OP_breg\d+\s+(\w+)([+-])(\d+)\s*$')
+_RE_LOOKUP_FUNCTYPE = re.compile(r'compiler_type = "([^"]*)"')
+
+
+def _count_func_params(sig: str) -> int:
+    """Count parameters in a C function type signature.
+
+    Uses the outermost parenthesized parameter list. Handles void and
+    empty lists; does not try to be clever about function-pointer
+    parameters, which could produce a low count in pathological cases.
+    """
+    depth = 0
+    start = -1
+    for i, ch in enumerate(sig):
+        if ch == '(':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                inner = sig[start + 1:i].strip()
+                if not inner or inner == 'void':
+                    return 0
+                # Count top-level commas only
+                d = 0
+                count = 1
+                for c in inner:
+                    if c == '(':
+                        d += 1
+                    elif c == ')':
+                        d -= 1
+                    elif c == ',' and d == 0:
+                        count += 1
+                return count
+    return 0
+
+
+def _parse_lookup_vars(
+    output: str, pc: int,
+) -> list[dict[str, Any]]:
+    """Parse Variable lines from `image lookup -va <pc>` text output.
+
+    Returns entries in first-seen order, one per (name, location-scope)
+    pair. Each entry: {name, type_name, kind, info, applies}, where
+    kind is 'reg' (info=reg_name) or 'stack' (info=(reg, offset)).
+    `applies` is True when the location covers `pc`.
+    """
+    entries: list[dict[str, Any]] = []
+    for m in _RE_LOOKUP_VARIABLE.finditer(output):
+        name = m.group(1)
+        type_name = m.group(2).strip()
+        raw_loc = m.group(3).strip()
+
+        ranged = _RE_LOOKUP_RANGED.match(raw_loc)
+        if ranged:
+            lo = int(ranged.group(1), 16)
+            hi = int(ranged.group(2), 16)
+            expr = ranged.group(3).strip()
+            applies = lo <= pc < hi
+            has_range = True
+        else:
+            expr = raw_loc
+            applies = True
+            has_range = False
+
+        reg_m = _RE_DW_OP_REG.match(expr)
+        breg_m = _RE_DW_OP_BREG.match(expr)
+        if reg_m:
+            kind = 'reg'
+            info: Any = reg_m.group(1).upper()
+        elif breg_m:
+            reg = breg_m.group(1).upper()
+            off = int(breg_m.group(3))
+            if breg_m.group(2) == '-':
+                off = -off
+            kind = 'stack'
+            info = (reg, off)
+        else:
+            continue
+
+        entries.append({
+            'name': name,
+            'type_name': type_name,
+            'kind': kind,
+            'info': info,
+            'applies': applies,
+            'ranged': has_range,
+        })
+    return entries
+
+
+def _dedupe_lookup_vars(
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pick one entry per name, preferring applicable scopes.
+
+    When both an applicable ranged location and an applicable block-
+    wide location exist for the same variable, the ranged entry wins
+    (tighter scope). Unapplicable entries are only kept as fallbacks.
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for e in entries:
+        name = e['name']
+        cur = by_name.get(name)
+        if cur is None:
+            by_name[name] = e
+            order.append(name)
+            continue
+        # Prefer applies=True, then prefer ranged (tighter scope).
+        if e['applies'] and not cur['applies']:
+            by_name[name] = e
+        elif e['applies'] and cur['applies'] and \
+                e['ranged'] and not cur['ranged']:
+            by_name[name] = e
+    return [by_name[n] for n in order]
 
 
 class LldbBackend:
@@ -199,6 +337,8 @@ class LldbBackend:
         return var
 
     def get_params(self, addr: int) -> list[VarInfo]:
+        if self._mode == 'pe_pdb':
+            return self._pe_get_variables(addr, args=True)
         frame = self._frame_for(addr)
         if frame is None:
             return []
@@ -207,6 +347,8 @@ class LldbBackend:
                 for i in range(values.GetSize())]
 
     def get_locals(self, addr: int) -> list[VarInfo]:
+        if self._mode == 'pe_pdb':
+            return self._pe_get_variables(addr, args=False)
         frame = self._frame_for(addr)
         if frame is None:
             return []
@@ -606,7 +748,56 @@ class LldbBackend:
                 if size > 0 and file_addr != \
                         lldb.LLDB_INVALID_ADDRESS:
                     instance._pe_sections.append((file_addr, size, sec))
+
+        # Per-frame post-prologue RSP map for DWARF [RSP+offset]
+        # resolution. The crash frame's RSP is the raw register value;
+        # each subsequent frame's RSP is derived from where its
+        # predecessor's return-address slot sits on the stack.
+        instance._pe_frame_rsps = instance._compute_pe_frame_rsps(
+            frames, stack_base, stack_mem,
+            registers.get('RSP', 0))
         return instance
+
+    def _compute_pe_frame_rsps(
+        self,
+        frames: list[tuple[int, int]] | None,
+        stack_base: int,
+        stack_mem: bytes,
+        crash_rsp: int,
+    ) -> dict[int, int]:
+        """Derive `{frame_return_addr: effective_rsp}` for PE mode.
+
+        MSVC x64 has no CFI we can use without a process, so we walk
+        the stack ourselves: each frame's return-address slot was
+        pushed by the caller's `call` instruction, so `slot_addr + 8`
+        is the caller's post-prologue RSP (MSVC doesn't mutate RSP
+        mid-body absent alloca).
+        """
+        result: dict[int, int] = {}
+        if not frames:
+            return result
+        # Frame 0 is the crash frame — its RSP is the registered value.
+        result[frames[0][1]] = crash_rsp
+
+        min_offset = 0
+        for i in range(1, len(frames)):
+            # Each frame's own return address was pushed by its caller's
+            # `call` instruction, so searching for it locates the slot
+            # at (frame_i_post_prologue_rsp - 8).
+            target = frames[i][1]
+            target_bytes = target.to_bytes(8, 'little', signed=False)
+            slot_offset: int | None = None
+            off = min_offset - (min_offset % 8)
+            while off <= len(stack_mem) - 8:
+                if stack_mem[off:off + 8] == target_bytes:
+                    slot_offset = off
+                    break
+                off += 8
+            if slot_offset is None:
+                continue
+            result[frames[i][1]] = stack_base + slot_offset + 8
+            min_offset = slot_offset + 8
+        return result
 
     def _read_memory_static(self, addr: int, size: int) -> bytes | None:
         """PE+PDB mode memory read: stack dump first, then PE sections."""
@@ -663,6 +854,210 @@ class LldbBackend:
             field = sb_type.GetFieldAtIndex(i)
             fields.append(self._pe_field_to_dict(field, addr))
         return fields, total
+
+    def _resolve_pe_frame_rsp(self, lookup_pc: int) -> int | None:
+        """Find the PE-mode RSP for a frame at or near `lookup_pc`.
+
+        Serializer passes either `frame.address` (crash frame) or
+        `frame.call_addr - 1` (non-crash) as `lookup_pc`, so we accept
+        anything within ~16 bytes of a known frame return address.
+        """
+        if lookup_pc in self._pe_frame_rsps:
+            return self._pe_frame_rsps[lookup_pc]
+        for key, rsp in self._pe_frame_rsps.items():
+            if abs(key - lookup_pc) <= 16:
+                return rsp
+        return None
+
+    def _pe_get_variables(
+        self, lookup_pc: int, args: bool,
+    ) -> list[VarInfo]:
+        """Pre-resolve params/locals for a PE+PDB frame at `lookup_pc`.
+
+        Parses `image lookup -va <lookup_pc>` output into a list of
+        variables with DWARF-style locations, deduplicates by name
+        (picking the scope that covers `lookup_pc`), splits into
+        args vs. locals using the function type signature, and
+        resolves values using the frame's computed RSP.
+        """
+        rsp = self._resolve_pe_frame_rsp(lookup_pc)
+        ci = self._debugger.GetCommandInterpreter()
+        ro = self._lldb.SBCommandReturnObject()
+        ci.HandleCommand(f'image lookup -va 0x{lookup_pc:x}', ro)
+        if not ro.Succeeded():
+            return []
+        output = ro.GetOutput()
+
+        parsed = _dedupe_lookup_vars(_parse_lookup_vars(output, lookup_pc))
+        if not parsed:
+            return []
+
+        ft_m = _RE_LOOKUP_FUNCTYPE.search(output)
+        param_count = _count_func_params(ft_m.group(1)) if ft_m else 0
+        chosen = parsed[:param_count] if args else parsed[param_count:]
+        return [self._pe_var_to_varinfo(v, lookup_pc, rsp) for v in chosen]
+
+    def _pe_var_to_varinfo(
+        self,
+        entry: dict[str, Any],
+        lookup_pc: int,
+        frame_rsp: int | None,
+    ) -> VarInfo:
+        """Turn one parsed image-lookup entry into a pre-resolved VarInfo.
+
+        Stack-based locations (`DW_OP_breg7 RSP+N`) are resolved via
+        the frame's effective RSP + stack_mem; register locations are
+        resolved from the crash registers only when the target frame
+        is the crash frame itself (callee-saved values aren't preserved
+        across non-tail calls and we have no CFI to unwind them).
+        """
+        name = entry['name']
+        type_name = entry['type_name']
+        kind = entry['kind']
+        info = entry['info']
+
+        var = VarInfo(name=name, type_name=type_name)
+        # Crash frame is the first entry in the RSP map (PE mode stores
+        # it keyed by `frames[0].address`, which equals the crash PC).
+        crash_pc = next(iter(self._pe_frame_rsps), None)
+        is_crash_frame = (crash_pc is not None
+                          and abs(lookup_pc - crash_pc) <= 16)
+
+        addr: int | None = None
+        if kind == 'reg':
+            reg_name = info
+            var.location = reg_name
+            if is_crash_frame and reg_name in self._crash_registers:
+                var.reg_name = reg_name
+                var.value = self._crash_registers[reg_name]
+            else:
+                # Non-crash frame: register values aren't preserved
+                # across intervening calls and we have no CFI to
+                # unwind them. Mark the var pre-resolved as None so
+                # the serializer doesn't read a wrong crash-RSP reg.
+                var.is_expandable = False
+            return var
+        # Stack-based location
+        reg_name, offset = info
+        if reg_name == 'RSP' and frame_rsp is not None:
+            addr = frame_rsp + offset
+        elif reg_name in self._crash_registers:
+            addr = self._crash_registers[reg_name] + offset
+        var.location = f'[{reg_name}{offset:+d}]'
+
+        # Type classification via SBType when the PDB defines the type.
+        sb_type = self._find_pe_type(self._canonical_type_name(type_name))
+        is_pointer = type_name.rstrip().endswith('*')
+        is_array = '[' in type_name and type_name.rstrip().endswith(']')
+        is_struct = False
+        byte_size = 0
+        if sb_type is not None:
+            byte_size = sb_type.GetByteSize() or 0
+            tc = sb_type.GetTypeClass()
+            is_struct = tc in (
+                self._lldb.eTypeClassStruct,
+                self._lldb.eTypeClassClass,
+                self._lldb.eTypeClassUnion,
+            )
+
+        if addr is None:
+            if var.value is not None:
+                var.is_expandable = False
+            return var
+
+        if is_pointer:
+            raw = self._read_memory_static(addr, 8)
+            if raw is not None:
+                var.value = int.from_bytes(raw, 'little')
+            pointee_name = type_name.rstrip()[:-1].strip()
+            pointee_base = self._canonical_type_name(pointee_name)
+            pointee_type = self._find_pe_type(pointee_base)
+            if var.value and pointee_type is not None:
+                tc = pointee_type.GetTypeClass()
+                if tc in (
+                    self._lldb.eTypeClassStruct,
+                    self._lldb.eTypeClassClass,
+                    self._lldb.eTypeClassUnion,
+                ):
+                    var.is_expandable = True
+                    var.expand_addr = var.value
+                    var.var_key = f'pe_type:{pointee_base}'
+                else:
+                    var.is_expandable = False
+            else:
+                var.is_expandable = False
+            # char* → try to read the pointed-to C string
+            if var.value and 'char' in type_name:
+                var.string_preview = self._read_cstring_static(var.value, 256)
+            return var
+
+        if is_struct:
+            var.is_expandable = True
+            var.expand_addr = addr
+            var.value = addr
+            var.var_key = f'pe_type:{self._canonical_type_name(type_name)}'
+            return var
+
+        if is_array:
+            var.is_expandable = True
+            var.expand_addr = addr
+            # Match the existing expand_type array preview shape.
+            if sb_type is not None and byte_size > 0:
+                raw = self._read_memory_static(addr, byte_size)
+                elem = sb_type.GetArrayElementType()
+                esize = elem.GetByteSize() if elem.IsValid() else 0
+                if raw is not None and esize in (1, 2, 4, 8):
+                    n = byte_size // esize
+                    parts = [
+                        int.from_bytes(
+                            raw[j * esize:(j + 1) * esize], 'little')
+                        for j in range(n)
+                    ]
+                    var.string_preview = (
+                        '[' + ', '.join(str(p) for p in parts) + ']')
+            return var
+
+        # Scalar: read the bytes and store as int.
+        size = byte_size if byte_size in (1, 2, 4, 8) else 0
+        if size == 0:
+            size = self._scalar_size(type_name)
+        if size in (1, 2, 4, 8):
+            raw = self._read_memory_static(addr, size)
+            if raw is not None:
+                var.value = int.from_bytes(raw, 'little')
+                var.is_expandable = False
+        return var
+
+    @staticmethod
+    def _canonical_type_name(type_name: str) -> str:
+        """Strip qualifiers/keywords to get a bare lookup name.
+
+        Handles 'const', 'volatile', and 'struct '/'class '/'union '
+        prefixes. Returns the innermost identifier for namespaced
+        types (C++ ::-separated paths).
+        """
+        t = type_name.strip().rstrip('*').strip()
+        for prefix in ('const ', 'volatile ', 'struct ', 'class ', 'union '):
+            while t.startswith(prefix):
+                t = t[len(prefix):].strip()
+        return t.split('::')[-1]
+
+    @staticmethod
+    def _scalar_size(type_name: str) -> int:
+        """Heuristic size for scalar type names when SBType isn't available."""
+        t = type_name.strip().replace('const ', '').replace('volatile ', '')
+        if t in ('char', 'signed char', 'unsigned char', 'int8_t', 'uint8_t', 'bool'):
+            return 1
+        if t in ('short', 'signed short', 'unsigned short', 'int16_t', 'uint16_t'):
+            return 2
+        if t in ('int', 'signed int', 'unsigned int', 'int32_t', 'uint32_t'):
+            return 4
+        if t in ('long long', 'signed long long', 'unsigned long long',
+                 'int64_t', 'uint64_t'):
+            return 8
+        if t.startswith('long'):
+            return 8  # MSVC long is 4, but long long is 8; be conservative.
+        return 0
 
     def _pe_field_to_dict(self, field: Any, struct_addr: int) -> dict:
         """Turn one SBTypeMember into the /api/expand field dict format."""

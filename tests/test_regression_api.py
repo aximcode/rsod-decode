@@ -216,6 +216,12 @@ def test_frame0_parity_pyelftools_vs_gdb(api_session: ApiSessionContext, client)
 def test_frame0_parity_pyelftools_vs_lldb(api_session: ApiSessionContext, client) -> None:
     if api_session.spec.expected_frames == 0:
         pytest.skip("fixture has no frames")
+    if api_session.spec.pdb_path is not None:
+        # PDB-backed PE sessions gain variable info pyelftools can't
+        # see (PE has no DWARF), so the "LLDB matches pyelftools"
+        # parity contract doesn't apply — covered by the dedicated
+        # ground-truth test below.
+        pytest.skip("PE+PDB session; parity not applicable")
     session_meta = client.get(f"/api/session/{api_session.session_id}").get_json()
     if not session_meta["lldb_available"]:
         pytest.skip("LLDB backend not available")
@@ -312,6 +318,59 @@ def test_psa_x64_forcecrash_ground_truth_via_api(
     pt_fields = {f["name"]: f for f in expand(origin_addr, origin_key)}
     assert pt_fields["x"]["value"] == 100
     assert pt_fields["y"]["value"] == 200
+
+
+@pytest.mark.lldb
+def test_psa_x64_forcecrash_frame1_locals_via_api(
+    api_session: ApiSessionContext, client,
+) -> None:
+    """Per-frame PDB variable listing for the initialize_test frame.
+
+    Exercises the full /api/frame -> get_locals -> pe_type: var_key
+    pipeline in PE+PDB mode: frame 1 (initialize_test) must return
+    `config` + `build_id` as params and `ctx` as a local with the
+    CrashContext var_key, and the round-trip /api/expand using that
+    var_key must resolve ctx.depth = 1.
+    """
+    if api_session.spec.key != "psa_x64_forcecrash":
+        pytest.skip("PE+PDB frame listing assertions only for forcecrash")
+
+    meta = client.get(f"/api/session/{api_session.session_id}").get_json()
+    if meta["backend"] != "lldb":
+        pytest.skip(f"session backend is {meta['backend']!r}, expected lldb")
+
+    # Find the initialize_test frame in the frame list.
+    frames = meta["frames"]
+    init_idx = next(
+        (i for i, f in enumerate(frames) if f["symbol"] == "initialize_test"),
+        None)
+    assert init_idx is not None, "initialize_test not in frame list"
+
+    frame_body = client.get(
+        f"/api/frame/{api_session.session_id}/{init_idx}").get_json()
+    params = {p["name"]: p for p in frame_body["params"]}
+    locals_ = {v["name"]: v for v in frame_body["locals"]}
+
+    assert "config" in params, f"params missing config: {list(params)}"
+    assert "build_id" in params, f"params missing build_id: {list(params)}"
+    assert params["config"]["type"] == "CrashTestConfig *"
+
+    assert "ctx" in locals_, f"locals missing ctx: {list(locals_)}"
+    ctx_var = locals_["ctx"]
+    assert ctx_var["type"] == "CrashContext"
+    assert ctx_var["is_expandable"] is True
+    assert ctx_var["var_key"] == "pe_type:CrashContext"
+    assert ctx_var["expand_addr"] is not None
+
+    # Round-trip through /api/expand to prove var_key wires correctly.
+    addr = ctx_var["expand_addr"]
+    vkey = ctx_var["var_key"]
+    resp = client.get(
+        f"/api/expand/{api_session.session_id}/{init_idx}"
+        f"?addr=0x{addr:X}&var_key={vkey}&offset=0&count=32")
+    assert resp.status_code == 200, resp.get_json()
+    fields = {f["name"]: f for f in resp.get_json()["fields"]}
+    assert fields["depth"]["value"] == 1
 
 
 def test_eval_rejected_without_gdb(api_session: ApiSessionContext, client) -> None:
