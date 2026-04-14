@@ -103,6 +103,7 @@ export interface SessionData {
   rsod_text: string
   backend: string
   gdb_available: boolean
+  lldb_available: boolean
   modules: ModuleInfo[]
   lbr: LbrEntry[]
 }

@@ -36,7 +36,7 @@ export function ExpressionEval({ sessionId, frameIndex, backend, onNavigateMemor
   useEffect(() => {
     if (frameIndex === prevFrame.current) return
     prevFrame.current = frameIndex
-    if (history.length === 0 || backend !== 'gdb') return
+    if (history.length === 0 || (backend !== 'gdb' && backend !== 'lldb')) return
 
     const exprs = history.map(h => h.expr)
     setHistory(exprs.map(expr => ({ expr, loading: true })))
@@ -82,10 +82,10 @@ export function ExpressionEval({ sessionId, frameIndex, backend, onNavigateMemor
       })
   }
 
-  if (backend !== 'gdb') {
+  if (backend !== 'gdb' && backend !== 'lldb') {
     return (
       <div className="text-xs text-zinc-600 italic px-1">
-        Expression evaluation requires GDB backend
+        Expression evaluation requires the LLDB backend
       </div>
     )
   }

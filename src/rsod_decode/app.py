@@ -809,8 +809,50 @@ def create_app(repo_root: Path | None = None,
                         gdb.write(data)
             except ConnectionClosed:
                 pass
+
+        @sock.route('/ws/lldb/<session_id>')
+        def lldb_terminal(ws, session_id: str):
+            session = get_session(session_id)
+            if not session:
+                ws.close(reason='session not found')
+                return
+            if not lldb_available():
+                ws.close(reason='lldb Python module not available')
+                return
+
+            from .lldb_bridge import LldbConsole
+            shared_debugger = None
+            if session.lldb_dwarf is not None:
+                shared_debugger = getattr(
+                    session.lldb_dwarf, '_debugger', None)
+            try:
+                console = LldbConsole(debugger=shared_debugger)
+            except RuntimeError as e:
+                ws.close(reason=str(e))
+                return
+
+            from simple_websocket import ConnectionClosed
+            try:
+                ws.send(console.banner())
+                while True:
+                    data = ws.receive(timeout=60)
+                    if data is None:
+                        continue
+                    if isinstance(data, str):
+                        data = data.encode('utf-8')
+                    # Ignore control frames (resize etc.) — LLDB is
+                    # in-process and doesn't care about terminal size.
+                    if len(data) >= 1 and data[0] == 0x01:
+                        continue
+                    out = console.handle_input(data)
+                    if out:
+                        ws.send(out)
+            except ConnectionClosed:
+                pass
+            finally:
+                console.close()
     except ImportError:
-        pass  # flask-sock not installed, GDB terminal disabled
+        pass  # flask-sock not installed, terminal bridges disabled
 
     return app
 

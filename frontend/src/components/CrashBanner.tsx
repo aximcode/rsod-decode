@@ -1,11 +1,14 @@
 import type { CrashSummary, LbrEntry } from '../types'
 
+type BackendId = 'pyelftools' | 'gdb' | 'lldb'
+
 interface Props {
   crash: CrashSummary
   onNewAnalysis: () => void
   backend: string
   gdbAvailable: boolean
-  onSwitchBackend: (backend: 'pyelftools' | 'gdb') => void
+  lldbAvailable: boolean
+  onSwitchBackend: (backend: BackendId) => void
   backendSwitching: boolean
   lbr?: LbrEntry[]
 }
@@ -14,9 +17,15 @@ function hex(n: number | null): string {
   return n !== null ? `0x${n.toString(16).toUpperCase()}` : '?'
 }
 
-export function CrashBanner({ crash, onNewAnalysis, backend, gdbAvailable, onSwitchBackend, backendSwitching, lbr }: Props) {
-  const otherBackend = backend === 'gdb' ? 'pyelftools' : 'gdb'
-  const canSwitch = backend === 'gdb' || gdbAvailable
+export function CrashBanner({
+  crash, onNewAnalysis, backend, gdbAvailable, lldbAvailable,
+  onSwitchBackend, backendSwitching, lbr,
+}: Props) {
+  const backends: { id: BackendId; label: string; enabled: boolean }[] = [
+    { id: 'pyelftools', label: 'pyelf', enabled: true },
+    { id: 'gdb',        label: 'gdb',   enabled: gdbAvailable  || backend === 'gdb'  },
+    { id: 'lldb',       label: 'lldb',  enabled: lldbAvailable || backend === 'lldb' },
+  ]
 
   return (
     <div className="bg-red-950 border-b border-red-900 px-4 py-3 font-mono text-sm shrink-0">
@@ -79,17 +88,31 @@ export function CrashBanner({ crash, onNewAnalysis, backend, gdbAvailable, onSwi
           >
             New Analysis
           </button>
-          <div className="flex items-center gap-1.5 text-xs">
-            <span className="text-zinc-600">{backend}</span>
-            {canSwitch && (
-              <button
-                onClick={() => onSwitchBackend(otherBackend as 'pyelftools' | 'gdb')}
-                disabled={backendSwitching}
-                className="text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-1.5 py-0.5 hover:border-zinc-500 transition-colors disabled:opacity-50 disabled:cursor-wait"
-              >
-                {backendSwitching ? 'switching...' : `switch to ${otherBackend}`}
-              </button>
-            )}
+          <div className="flex items-center gap-1 text-xs">
+            <span className="text-zinc-500 mr-1">backend:</span>
+            {backends.map(b => {
+              const current = backend === b.id
+              const clickable = b.enabled && !current && !backendSwitching
+              return (
+                <button
+                  key={b.id}
+                  onClick={clickable ? () => onSwitchBackend(b.id) : undefined}
+                  disabled={!clickable}
+                  className={[
+                    'border rounded px-1.5 py-0.5 transition-colors',
+                    current
+                      ? 'border-zinc-400 text-zinc-200 bg-zinc-800'
+                      : b.enabled
+                      ? 'border-zinc-700 text-zinc-500 hover:text-zinc-300 hover:border-zinc-500'
+                      : 'border-zinc-800 text-zinc-700 cursor-not-allowed',
+                    backendSwitching && !current ? 'opacity-50 cursor-wait' : '',
+                  ].join(' ')}
+                  title={b.enabled ? `switch to ${b.id}` : `${b.id} not available`}
+                >
+                  {b.label}
+                </button>
+              )
+            })}
           </div>
         </div>
       </div>

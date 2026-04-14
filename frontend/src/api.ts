@@ -123,7 +123,7 @@ export async function expandVar(
 
 export async function switchBackend(
   sessionId: string,
-  backend: 'pyelftools' | 'gdb',
+  backend: 'pyelftools' | 'gdb' | 'lldb',
 ): Promise<{ backend: string }> {
   return request(`/api/backend/${sessionId}`, {
     method: 'POST',

@@ -119,7 +119,7 @@ export function useSession() {
     }
   }, [])
 
-  const switchBackend = useCallback(async (backend: 'pyelftools' | 'gdb') => {
+  const switchBackend = useCallback(async (backend: 'pyelftools' | 'gdb' | 'lldb') => {
     const sid = sessionIdRef.current
     if (!sid) return
 
