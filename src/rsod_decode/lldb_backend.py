@@ -576,9 +576,21 @@ class LldbBackend:
     def disassemble_around(
         self, addr: int, context: int = 24,
     ) -> list[tuple[int, str, str]]:
+        """Disassemble a window centred on `addr`.
+
+        Corefile mode: `addr` is an ELF offset, converted to runtime via
+        the module slide and reported back in ELF-offset space so the
+        serializer can compare against frame.address.
+
+        PE+PDB mode: `addr` is already a runtime/file address (PE sections
+        link with ImageBase baked in, no slide), so we pass it through.
+        """
         if self._mode == 'pe_pdb':
-            return []
-        runtime = addr + self._image_base
+            runtime = addr
+            file_mode = True
+        else:
+            runtime = addr + self._image_base
+            file_mode = False
         # Read a generous window of instructions centered on addr; the
         # exact byte size depends on the ISA so we read count*3 and
         # filter by the expected address range below.
@@ -589,14 +601,21 @@ class LldbBackend:
         insns: list[tuple[int, str, str]] = []
         for i in range(instructions.GetSize()):
             insn = instructions.GetInstructionAtIndex(i)
-            load = insn.GetAddress().GetLoadAddress(self._target)
-            if load == self._lldb.LLDB_INVALID_ADDRESS:
-                continue
-            if load < start or load >= end:
+            lldb_addr = insn.GetAddress()
+            if file_mode:
+                use = lldb_addr.GetFileAddress()
+            else:
+                use = lldb_addr.GetLoadAddress(self._target)
+                if use == self._lldb.LLDB_INVALID_ADDRESS:
+                    continue
+            if use < start or use >= end:
                 continue
             mnemonic = insn.GetMnemonic(self._target) or ''
             operands = insn.GetOperands(self._target) or ''
-            insns.append((load - self._image_base, mnemonic, operands))
+            if file_mode:
+                insns.append((use, mnemonic, operands))
+            else:
+                insns.append((use - self._image_base, mnemonic, operands))
         return insns
 
     def is_call_before(self, addr: int) -> bool:
