@@ -47,6 +47,54 @@ def test_stack_and_sp_preconditions(dataset_run: DatasetRun) -> None:
     assert "SP" in regs or "RSP" in regs
 
 
+@pytest.mark.lldb
+def test_psa_x64_forcecrash_symbols_from_pdb_only() -> None:
+    """load_symbols(.efi, pdb_path=.pdb) — no .map.
+
+    Exercises the LLDB-driven PDB symbol enumerator in symbols.py so
+    users can upload just `.efi + .pdb` (no `.map`) and still get a
+    resolving backtrace. Asserts that the key forcecrash hook
+    functions are present and that analyze_rsod resolves frame 1 to
+    initialize_test using only the PDB-derived table.
+    """
+    from pathlib import Path
+    from rsod_decode.lldb_loader import import_lldb
+    from rsod_decode.symbols import load_symbols
+    from rsod_decode.decoder import analyze_rsod
+
+    if import_lldb() is None:
+        pytest.skip("lldb Python module not available")
+
+    base = Path(__file__).parent / "fixtures" / "psa_x64_forcecrash"
+    pe = base / "psa_x64.efi"
+    pdb = base / "psa_x64.pdb"
+    rsod = base / "rsod_psa_x64.txt"
+    if not pdb.exists():
+        pytest.skip("psa_x64_forcecrash.pdb not present")
+
+    source = load_symbols(pe, pdb_path=pdb)
+    # The PDB CU iteration should find several thousand functions.
+    assert len(source.table.symbols) >= 1000
+    assert source.table.preferred_base == 0x180000000
+
+    # Key functions the decoder needs for the forcecrash backtrace
+    for addr, expected in (
+        (0x18000618a, 'trigger_gp_fault'),
+        (0x180006100, 'initialize_test'),
+        (0x180005afc, 'fForceCrashIfRequested'),
+    ):
+        hit = source.table.lookup(addr)
+        assert hit is not None and hit[0].name == expected, \
+            f'lookup 0x{addr:x} -> {hit}'
+
+    # End-to-end: analyze_rsod should still find the real frames.
+    result = analyze_rsod(
+        rsod.read_text(encoding='utf-8', errors='replace'), source)
+    symbols = [f.symbol.name for f in result.frames if f.symbol is not None]
+    assert 'initialize_test' in symbols
+    assert 'fForceCrashIfRequested' in symbols
+
+
 def test_psa_x64_pe_backend_ready(load_dataset_run) -> None:
     """The MSVC/EPSA psa_x64 fixture should load via PEBinary + .map and
     expose a working disassembler + call-site checker, regardless of

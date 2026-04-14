@@ -135,12 +135,16 @@ def create_app(repo_root: Path | None = None,
             pdb_path, extra_paths = _pop_pdb_for(
                 pe_for_pdb.stem, extra_paths)
 
-        # Load symbols
+        # Load symbols. When we have a .efi primary + .pdb but no .map,
+        # load_symbols() will derive the symbol table from the PDB via
+        # a short-lived LLDB session.
         try:
-            source = load_symbols(sym_path,
-                                  dwarf_prefix=app.config['DWARF_PREFIX'],
-                                  repo_root=app.config['REPO_ROOT'],
-                                  companion_path=companion)
+            source = load_symbols(
+                sym_path,
+                dwarf_prefix=app.config['DWARF_PREFIX'],
+                repo_root=app.config['REPO_ROOT'],
+                companion_path=companion,
+                pdb_path=pdb_path if companion is None else None)
         except SymbolLoadError as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return jsonify(error=str(e)), 400

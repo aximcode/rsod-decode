@@ -35,7 +35,6 @@ def _log(msg: str) -> None:
 def _try_gdb_backend() -> bool:
     """Check if GDB and pygdbmi are available."""
     try:
-        import shutil
         from .gdb_bridge import find_gdb
         if not find_gdb():
             return False
@@ -43,6 +42,26 @@ def _try_gdb_backend() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _try_lldb_backend() -> bool:
+    """Check if the system lldb Python module is importable."""
+    from .lldb_loader import import_lldb
+    return import_lldb() is not None
+
+
+def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Poll a TCP port until it accepts connections (for browser open)."""
+    import socket as _socket
+    target = '127.0.0.1' if host in ('0.0.0.0', '') else host
+    deadline = __import__('time').monotonic() + timeout
+    while __import__('time').monotonic() < deadline:
+        try:
+            with _socket.create_connection((target, port), timeout=0.2):
+                return True
+        except OSError:
+            __import__('time').sleep(0.05)
+    return False
 
 
 def main() -> None:
@@ -70,9 +89,10 @@ def main() -> None:
                         help='Path prefix to strip from DWARF source paths '
                              '(auto-detected if not specified)')
     parser.add_argument('--backend', type=str, default='auto',
-                        choices=['auto', 'gdb', 'pyelftools'],
-                        help='DWARF backend: gdb (uses GDB/MI), '
-                             'pyelftools (standalone), auto (default)')
+                        choices=['auto', 'lldb', 'gdb', 'pyelftools'],
+                        help='DWARF backend: lldb (system lldb Python API), '
+                             'gdb (uses GDB/MI), pyelftools (standalone), '
+                             'auto (prefers lldb → gdb → pyelftools)')
     parser.add_argument('--symbol-path', type=Path, action='append',
                         default=[], dest='symbol_paths',
                         help='Directory to search for module symbol files '
@@ -122,16 +142,25 @@ def main() -> None:
     if args.rsod_log and args.symbol_file:
         _log(f"Loading {args.rsod_log.name} + {args.symbol_file.name}...")
 
-        # MSVC/EPSA: detect a MAP+EFI companion pair in the extra files.
-        from .app import _pair_map_with_pe
+        # MSVC/EPSA: detect a MAP+EFI companion pair in the extras, and
+        # pick up a matching .pdb for PDB-backed LLDB.
+        from .app import _pair_map_with_pe, _pop_pdb_for
+        from .symbols import is_pe
         sym_extras = list(args.sym)
         companion, sym_extras = _pair_map_with_pe(args.symbol_file, sym_extras)
+        pe_for_pdb = companion if companion and is_pe(companion) else (
+            args.symbol_file if is_pe(args.symbol_file) else None)
+        pdb_path: Path | None = None
+        if pe_for_pdb is not None:
+            pdb_path, sym_extras = _pop_pdb_for(pe_for_pdb.stem, sym_extras)
 
         try:
-            source = load_symbols(args.symbol_file,
-                                  dwarf_prefix=args.dwarf_prefix,
-                                  repo_root=repo_root,
-                                  companion_path=companion)
+            source = load_symbols(
+                args.symbol_file,
+                dwarf_prefix=args.dwarf_prefix,
+                repo_root=repo_root,
+                companion_path=companion,
+                pdb_path=pdb_path if companion is None else None)
         except SymbolLoadError as e:
             sys.exit(f"Error: {e}")
 
@@ -165,30 +194,61 @@ def main() -> None:
             rsod_text=rsod_text,
             created_at=datetime.now(timezone.utc).isoformat(),
             elf_path=args.symbol_file.resolve(),
+            pe_path=pe_for_pdb.resolve() if pe_for_pdb is not None else None,
+            pdb_path=pdb_path.resolve() if pdb_path is not None else None,
         )
 
-        # Initialize GDB backend if requested
-        use_gdb = args.backend == 'gdb' or (args.backend == 'auto' and _try_gdb_backend())
-        if use_gdb:
+        # Pick a richer backend. Preference order mirrors the POST
+        # /api/session path in app.py: lldb → gdb → pyelftools. Any
+        # explicit --backend choice overrides the auto-detect.
+        frame_data = [(f.frame_fp, f.address) for f in result.frames]
+        want = args.backend
+        lldb_ok = _try_lldb_backend()
+        gdb_ok = _try_gdb_backend()
+
+        if want == 'lldb' or (want == 'auto' and lldb_ok):
+            try:
+                from .lldb_backend import LldbBackend
+                if pe_for_pdb is not None and pdb_path is not None:
+                    sess.lldb_dwarf = LldbBackend.from_pe_pdb(
+                        pe_for_pdb.resolve(), pdb_path.resolve(),
+                        result.crash_info.registers,
+                        result.crash_info.crash_pc,
+                        result.stack_base, result.stack_mem,
+                        sess.img_base, frames=frame_data)
+                    sess.backend = 'lldb'
+                    _log('Using LLDB backend (PE+PDB)')
+                elif pe_for_pdb is None:
+                    sess.lldb_dwarf = LldbBackend(
+                        args.symbol_file.resolve(),
+                        result.crash_info.registers,
+                        result.crash_info.crash_pc,
+                        result.stack_base, result.stack_mem,
+                        sess.img_base, frames=frame_data)
+                    sess.backend = 'lldb'
+                    _log('Using LLDB backend (ELF+DWARF)')
+                else:
+                    _log('LLDB backend unavailable: PE without a matching .pdb')
+            except Exception as e:
+                _log(f"LLDB backend failed: {e}")
+
+        if sess.backend == 'pyelftools' and (
+                want == 'gdb' or (want == 'auto' and gdb_ok)):
             try:
                 from .gdb_backend import GdbBackend
-                # Build frame list for synthetic FP chain in core file
-                # Include ALL frames (even FP=0) so the synthetic builder
-                # can write return addresses for frames beyond the dump
-                frame_data = [(f.frame_fp, f.address)
-                              for f in result.frames]
                 sess.gdb_dwarf = GdbBackend(
                     args.symbol_file.resolve(),
                     result.crash_info.registers,
                     result.crash_info.crash_pc,
                     result.stack_base, result.stack_mem,
-                    sess.img_base,
-                    frames=frame_data,
-                )
+                    sess.img_base, frames=frame_data)
                 sess.backend = 'gdb'
-                _log(f"Using GDB backend")
+                _log('Using GDB backend')
             except Exception as e:
                 _log(f"GDB backend failed, falling back to pyelftools: {e}")
+
+        if sess.backend == 'pyelftools':
+            _log('Using pyelftools backend')
 
         register_session(sess)
 
@@ -228,9 +288,18 @@ def main() -> None:
         _log(f"  {u}")
     _log("Press Ctrl+C to stop\n")
 
-    # Open browser
+    # Open the browser on a background thread that waits for Flask to
+    # bind the socket before calling webbrowser.open. The prior code
+    # opened pre-bind, which broke text browsers like lynx that don't
+    # retry (graphical browsers hid it by spinning until connect).
     if not args.no_browser:
-        webbrowser.open(urls[0])
+        import threading
+
+        def _open_when_ready() -> None:
+            if _wait_for_port(args.host, args.port, timeout=5.0):
+                webbrowser.open(urls[0])
+
+        threading.Thread(target=_open_when_ready, daemon=True).start()
 
     # Run server
     app.run(host=args.host, port=args.port, debug=False)
