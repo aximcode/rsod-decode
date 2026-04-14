@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 gdb = ["pygdbmi>=0.11"]
 dev = ["pytest>=8.0"]
+browser = ["playwright>=1.40"]
 
 [project.scripts]
 rsod-decode = "rsod_decode.cli:main"
@@ -34,5 +35,6 @@ markers = [
   "api: Flask API regression tests",
   "gdb: Tests that require GDB backend support",
   "lldb: Tests that require the lldb Python module",
+  "playwright: Browser-driven end-to-end tests via Playwright",
 ]
 testpaths = ["tests"]

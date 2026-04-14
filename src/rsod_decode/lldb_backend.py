@@ -1130,6 +1130,7 @@ class LldbBackend:
                     pass
         elif is_struct:
             expand_addr = field_addr
+            value = field_addr
             nested = type_name.split('::')[-1]
             var_key_out = f'pe_type:{nested}'
         else:

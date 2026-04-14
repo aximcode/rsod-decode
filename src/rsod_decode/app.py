@@ -217,7 +217,10 @@ def create_app(repo_root: Path | None = None,
                     session.backend = 'lldb'
             except Exception:
                 pass
-        if session.backend == 'pyelftools' and gdb_available():
+        # GDB can only target ELF+DWARF; PE sessions are guaranteed to
+        # fail inside write_corefile/add-symbol-file, so don't even try.
+        if session.backend == 'pyelftools' and gdb_available() \
+                and pe_for_pdb is None:
             try:
                 from .gdb_backend import GdbBackend
                 session.gdb_dwarf = GdbBackend(
@@ -255,7 +258,10 @@ def create_app(repo_root: Path | None = None,
             call_verified={str(k): v for k, v in r.call_verified.items()},
             rsod_text=session.rsod_text,
             backend=session.backend,
-            gdb_available=gdb_available(),
+            # gdb_available reflects per-session usability: GDB is
+            # ELF-only so a PE-based session (pe_path set) reports
+            # False even when gdb is installed globally.
+            gdb_available=gdb_available() and session.pe_path is None,
             lldb_available=lldb_available(),
             modules=r.modules,
             lbr=r.crash_info.lbr,
@@ -674,6 +680,10 @@ def create_app(repo_root: Path | None = None,
         if target == 'gdb':
             if not gdb_available():
                 return jsonify(error='GDB/pygdbmi not available'), 400
+            if session.pe_path is not None:
+                return jsonify(
+                    error='GDB backend requires an ELF primary; '
+                          'this session is PE+PDB'), 400
             if not session.gdb_dwarf:
                 try:
                     from .gdb_backend import GdbBackend

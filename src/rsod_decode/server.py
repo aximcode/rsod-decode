@@ -232,7 +232,9 @@ def main() -> None:
             except Exception as e:
                 _log(f"LLDB backend failed: {e}")
 
-        if sess.backend == 'pyelftools' and (
+        # GDB is ELF-only — skip for PE sessions so the CLI doesn't
+        # report a spurious "Magic number does not match" error.
+        if sess.backend == 'pyelftools' and pe_for_pdb is None and (
                 want == 'gdb' or (want == 'auto' and gdb_ok)):
             try:
                 from .gdb_backend import GdbBackend
