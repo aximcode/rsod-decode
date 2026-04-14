@@ -43,12 +43,24 @@ class _Frame:
     `params`/`locals_` are lists of (name, type_contains) where
     type_contains is a substring match so minor backend-to-backend
     type-name variation doesn't break the test.
+
+    `expand_values` pins actual memory-read values for specific
+    fields of a struct param/local. Format:
+
+        {var_name: {field_path: expected_value}}
+
+    field_path is dot-separated so nested structs walk naturally
+    ('origin.x' first expands 'origin' then reads 'x'). expected
+    is an int for scalar comparison or str for string_preview
+    substring match (used for `char *` fields).
     """
     symbol: str | None = None
     source_file: str | None = None
     source_line: int | None = None
     params: tuple[tuple[str, str], ...] = ()
     locals_: tuple[tuple[str, str], ...] = ()
+    expand_values: dict[str, dict[str, int | str]] = field(
+        default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -75,6 +87,31 @@ class _ApiExpectations:
 # prepare_crash_context → validate_environment → dispatch_crash →
 # trigger_page_fault. For the EDK2 fixture the FP chain walks all the
 # way down to the leaf; dell_aa64's FP chain stops at dispatch_crash.
+# Values from crashtest.c's main() + initialize_test() that the
+# CrashTest ELF and PSA forcecrash hook all share verbatim:
+#   main:            config.version/flags/session_id/origin set
+#   initialize_test: ctx.depth=1, ctx.cookie, ctx.tag="crashtest-v3"
+# The mode field differs per fixture because it's parse_mode(argv[1]):
+#   "pf" -> 0 (CRASH_MODE_PF)
+#   "gp" -> 1 (CRASH_MODE_GP)
+_CTX_VALUES: dict[str, int | str] = {
+    "depth": 1,
+    "cookie": 0xDEAD0000CAFE0000 ^ 0xDEFFBABECAFE0000,  # 0x52BABE00000000
+    "tag": "crashtest-v3",
+}
+_CONFIG_BASE_VALUES: dict[str, int | str] = {
+    "version": 3,
+    "flags": 0x1234,
+    "session_id": 0xDEAD0000CAFE0000,
+    "origin.x": 100,
+    "origin.y": 200,
+}
+
+
+def _config_values(mode: int) -> dict[str, int | str]:
+    return {**_CONFIG_BASE_VALUES, "mode": mode}
+
+
 _CRASHTEST_FRAMES_EDK2 = {
     0: _Frame("trigger_page_fault", "crashtest.c", 78,
               params=(("addr", "void"),)),
@@ -88,13 +125,22 @@ _CRASHTEST_FRAMES_EDK2 = {
     4: _Frame("initialize_test", "crashtest.c", 186,
               params=(("config", "TestConfig"),
                       ("build_id", "char")),
-              locals_=(("ctx", "CrashContext"),)),
+              locals_=(("ctx", "CrashContext"),),
+              expand_values={
+                  "ctx": _CTX_VALUES,
+                  # edk2 fixture was invoked with "pf" (page fault
+                  # default branch of parse_mode) → mode = 0.
+                  "config": _config_values(mode=0),
+              }),
     5: _Frame("run_crashtest", "crashtest.c", 194,
               params=(("config", "TestConfig"),
                       ("argc", "int"))),
     6: _Frame("main", "crashtest.c", 252,
               params=(("argc", "int"), ("argv", "char")),
-              locals_=(("config", "TestConfig"),)),
+              locals_=(("config", "TestConfig"),),
+              expand_values={
+                  "config": _config_values(mode=0),
+              }),
     7: _Frame("_AxlEntry", "axl-crt0-native.c", 38,
               params=(("ImageHandle", "EFI_HANDLE"),
                       ("SystemTable", "EFI_SYSTEM_TABLE")),
@@ -113,13 +159,21 @@ _CRASHTEST_FRAMES_DELL_AA64 = {
     3: _Frame("initialize_test", "crashtest.c", 186,
               params=(("config", "TestConfig"),
                       ("build_id", "char")),
-              locals_=(("ctx", "CrashContext"),)),
+              locals_=(("ctx", "CrashContext"),),
+              expand_values={
+                  "ctx": _CTX_VALUES,
+                  # dell_aa64 fixture was invoked with "gp" → mode = 1.
+                  "config": _config_values(mode=1),
+              }),
     4: _Frame("run_crashtest", "crashtest.c", 194,
               params=(("config", "TestConfig"),
                       ("argc", "int"))),
     5: _Frame("main", "crashtest.c", 252,
               params=(("argc", "int"), ("argv", "char")),
-              locals_=(("config", "TestConfig"),)),
+              locals_=(("config", "TestConfig"),),
+              expand_values={
+                  "config": _config_values(mode=1),
+              }),
     6: _Frame("_AxlEntry", "axl-crt0-native.c", 38,
               params=(("ImageHandle", "EFI_HANDLE"),
                       ("SystemTable", "EFI_SYSTEM_TABLE")),
@@ -181,10 +235,24 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
             1: _Frame("initialize_test",
                       params=(("config", "CrashTestConfig"),
                               ("build_id", "char")),
-                      locals_=(("ctx", "CrashContext"),)),
+                      locals_=(("ctx", "CrashContext"),),
+                      # Only pin `ctx` here. initialize_test's `config`
+                      # param spill slot [RSP+96] gets reused by MSVC
+                      # after the initial read — the stored pointer
+                      # is stale garbage by the time we crash. The
+                      # genuine TestConfig struct still lives in
+                      # fForceCrashIfRequested's frame (see frame 2).
+                      expand_values={"ctx": _CTX_VALUES}),
             2: _Frame("fForceCrashIfRequested",
                       params=(("argc", "int"), ("argv", "char")),
-                      locals_=(("config", "CrashTestConfig"),)),
+                      locals_=(("config", "CrashTestConfig"),),
+                      # In PsaEntry.c's adapted hook fForceCrashIfRequested
+                      # holds the TestConfig as a LOCAL struct (not
+                      # a pointer), so [RSP+32] reads the exact same
+                      # values that main() sets in the ELF fixture.
+                      expand_values={
+                          "config": _config_values(mode=1),
+                      }),
             3: _Frame("fUEFIPSAEntry",
                       params=(("originalTxtAttr", "uint64_t"),
                               ("originalTxtMode", "uint64_t")),
@@ -334,6 +402,127 @@ def test_api_per_frame_variables(
             _collect_var_names(body["locals"]),
             fe.locals_,
         )
+    finally:
+        delete_api_session(client, ctx)
+
+
+# Parameterize over every (fixture, frame) that has value expectations
+_VALUE_TEST_CASES = [
+    (key, idx)
+    for key, exp in _EXPECTATIONS.items()
+    for idx, f in exp.frames.items()
+    if f.expand_values
+]
+_VALUE_TEST_IDS = [f"{k}-f{i}" for k, i in _VALUE_TEST_CASES]
+
+
+def _walk_expansion(
+    client, session_id: str, frame_idx: int,
+    start_var: dict, field_path: str,
+) -> dict:
+    """Walk /api/expand one or more levels deep to reach `field_path`.
+
+    `field_path` is dot-separated: 'origin.x' expands 'origin' first,
+    then finds 'x' in its children. Returns the final field dict.
+    """
+    parts = field_path.split(".")
+    current_addr = start_var["expand_addr"]
+    current_key = start_var.get("var_key", "") or ""
+    current_tof = start_var.get("type_offset", 0)
+    current_cuof = start_var.get("cu_offset", 0)
+
+    for i, part in enumerate(parts):
+        assert current_addr is not None, (
+            f"cannot expand {field_path!r}: addr is None at "
+            f"part {i}={part!r}")
+        query = f"addr=0x{current_addr:X}&offset=0&count=64"
+        if current_key:
+            query += f"&var_key={current_key}"
+        else:
+            query += (f"&type_offset={current_tof}"
+                      f"&cu_offset={current_cuof}")
+        resp = client.get(
+            f"/api/expand/{session_id}/{frame_idx}?{query}")
+        assert resp.status_code == 200, resp.get_json()
+        fields = resp.get_json()["fields"]
+        match = next((f for f in fields if f["name"] == part), None)
+        assert match is not None, (
+            f"field {part!r} not found in expansion of {field_path!r} "
+            f"at depth {i}; available: "
+            f"{[f['name'] for f in fields]}")
+
+        if i == len(parts) - 1:
+            return match
+
+        current_addr = match.get("expand_addr")
+        current_key = match.get("var_key", "") or ""
+        current_tof = match.get("type_offset", 0) or 0
+        current_cuof = match.get("cu_offset", 0) or 0
+
+    raise AssertionError("unreachable")
+
+
+@pytest.mark.parametrize(
+    "fixture_key,frame_idx",
+    _VALUE_TEST_CASES,
+    ids=_VALUE_TEST_IDS,
+)
+def test_api_per_frame_variable_values(
+    fixture_key: str, frame_idx: int, client,
+) -> None:
+    """Source-code-derived value pinning across the call chain.
+
+    For every (fixture, frame) with `expand_values`, re-creates a
+    session, fetches the frame detail, then walks /api/expand for
+    each pinned var/field pair to assert the decoded value matches
+    the CrashTest source-code ground truth:
+
+      main():       config.{version, flags, session_id, origin.x,
+                            origin.y, mode}
+      initialize_test(): ctx.{depth, cookie, tag}
+
+    A bug in stack walking, frame lookup, type resolution, memory
+    read, or expand-endpoint routing surfaces here at the specific
+    (fixture, frame, field) that regressed.
+    """
+    from .conftest import create_api_session, delete_api_session
+
+    spec = DATASET_SPECS[fixture_key]
+    ctx = create_api_session(client, spec)
+    try:
+        fe = _EXPECTATIONS[fixture_key].frames[frame_idx]
+        body = client.get(
+            f"/api/frame/{ctx.session_id}/{frame_idx}").get_json()
+        all_vars = {v["name"]: v for v in body["params"] + body["locals"]}
+
+        for var_name, field_map in fe.expand_values.items():
+            start_var = all_vars.get(var_name)
+            assert start_var is not None, (
+                f"variable {var_name!r} missing from frame "
+                f"{frame_idx}; present: {sorted(all_vars)}")
+            assert start_var.get("expand_addr") is not None, (
+                f"variable {var_name!r} is not expandable "
+                f"(expand_addr=None)")
+
+            for field_path, expected in field_map.items():
+                field = _walk_expansion(
+                    client, ctx.session_id, frame_idx,
+                    start_var, field_path)
+                if isinstance(expected, str):
+                    preview = field.get("string_preview") or ""
+                    assert expected in preview, (
+                        f"{var_name}.{field_path} string_preview "
+                        f"{preview!r} does not contain "
+                        f"{expected!r}")
+                else:
+                    got = field.get("value")
+                    assert got == expected, (
+                        f"{var_name}.{field_path}: expected "
+                        f"{expected} (0x{expected:X}), got "
+                        f"{got} (0x{got:X})"
+                        if got is not None
+                        else f"{var_name}.{field_path}: expected "
+                             f"{expected} (0x{expected:X}), got None")
     finally:
         delete_api_session(client, ctx)
 

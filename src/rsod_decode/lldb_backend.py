@@ -306,9 +306,21 @@ class LldbBackend:
         location = sv.GetLocation() or ''
         var = VarInfo(name=name, type_name=type_name, location=location)
 
+        # Resolve typedefs (e.g. `typedef struct { ... } CrashContext`)
+        # — LLDB reports the declared type's GetTypeClass() as
+        # eTypeClassTypedef until we call GetCanonicalType().
+        sb_type = sv.GetType().GetCanonicalType()
+        is_pointer = sb_type.IsPointerType()
+        type_class = sb_type.GetTypeClass()
+        is_aggregate = type_class in (
+            self._lldb.eTypeClassStruct,
+            self._lldb.eTypeClassClass,
+            self._lldb.eTypeClassUnion,
+            self._lldb.eTypeClassArray,
+        )
+
         err = self._lldb.SBError()
         unsigned = sv.GetValueAsUnsigned(err, 0)
-        is_pointer = type_name.rstrip().endswith('*')
         num_children = sv.GetNumChildren()
 
         # Scalars + pointers: trust GetValueAsUnsigned. For aggregates
@@ -317,7 +329,7 @@ class LldbBackend:
             if err.Success() and sv.GetValue() is not None:
                 var.value = unsigned
 
-        if _is_expandable_type_name(type_name) and num_children > 0:
+        if (is_aggregate or is_pointer) and num_children > 0:
             var.is_expandable = True
             load_addr = sv.GetLoadAddress()
             valid = load_addr != self._lldb.LLDB_INVALID_ADDRESS
@@ -380,7 +392,15 @@ class LldbBackend:
                 unsigned = sv.GetValueAsUnsigned(werr, 0)
                 if werr.Success() and sv.GetValue() is not None:
                     out.value = unsigned
-                if _is_expandable_type_name(v.type_name) \
+                sb_type = sv.GetType().GetCanonicalType()
+                tc = sb_type.GetTypeClass()
+                is_aggregate = tc in (
+                    self._lldb.eTypeClassStruct,
+                    self._lldb.eTypeClassClass,
+                    self._lldb.eTypeClassUnion,
+                    self._lldb.eTypeClassArray,
+                )
+                if (is_aggregate or sb_type.IsPointerType()) \
                         and sv.GetNumChildren() > 0:
                     out.is_expandable = True
                     load_addr = sv.GetLoadAddress()
@@ -454,10 +474,17 @@ class LldbBackend:
     def _child_to_dict(self, child: Any, parent_key: str, idx: int) -> dict:
         name = child.GetName() or '?'
         type_name = child.GetTypeName() or '?'
+        sb_type = child.GetType().GetCanonicalType()
         num_children = child.GetNumChildren()
-        is_pointer = type_name.rstrip().endswith('*')
-        is_expandable = (num_children > 0 and
-                         _is_expandable_type_name(type_name))
+        is_pointer = sb_type.IsPointerType()
+        type_class = sb_type.GetTypeClass()
+        is_aggregate = type_class in (
+            self._lldb.eTypeClassStruct,
+            self._lldb.eTypeClassClass,
+            self._lldb.eTypeClassUnion,
+            self._lldb.eTypeClassArray,
+        )
+        is_expandable = num_children > 0 and (is_aggregate or is_pointer)
 
         err = self._lldb.SBError()
         unsigned = child.GetValueAsUnsigned(err, 0)
