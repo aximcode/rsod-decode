@@ -1,80 +1,14 @@
 from __future__ import annotations
 
-import io
 import re
-from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 
-from ._datasets import DATASET_SPECS, DatasetSpec
+from ._datasets import DATASET_SPECS
+from .conftest import ApiSessionContext
 
 
 pytestmark = [pytest.mark.api]
-
-
-@dataclass
-class ApiSessionContext:
-    session_id: str
-    spec: DatasetSpec
-
-
-def _create_session(client, spec: DatasetSpec) -> ApiSessionContext:
-    rsod_path = Path(__file__).parent / "fixtures" / spec.rsod_file
-    if not spec.symbol_path.exists():
-        pytest.skip(f"Required symbol file not found: {spec.symbol_path}")
-    if spec.companion_path is not None and not spec.companion_path.exists():
-        pytest.skip(f"Required companion file not found: {spec.companion_path}")
-
-    with spec.symbol_path.open("rb") as symbol_fp:
-        data: dict = {
-            "rsod_log": (io.BytesIO(rsod_path.read_bytes()), spec.rsod_file),
-            "symbol_file": (symbol_fp, spec.symbol_path.name),
-        }
-        # Upload companion binary (MSVC MAP+EFI pair) and any .pdb for
-        # PDB-backed LLDB as extras so the Flask side exercises the
-        # _pair_map_with_pe + _pop_pdb_for auto-detection paths.
-        extra_fps: list = []
-        extras: list = []
-        if spec.companion_path is not None:
-            fp = spec.companion_path.open("rb")
-            extra_fps.append(fp)
-            extras.append((fp, spec.companion_path.name))
-        if spec.pdb_path is not None and spec.pdb_path.exists():
-            fp = spec.pdb_path.open("rb")
-            extra_fps.append(fp)
-            extras.append((fp, spec.pdb_path.name))
-        if extras:
-            data["extra_symbols[]"] = extras if len(extras) > 1 else extras[0]
-        if spec.base_override is not None:
-            data["base"] = f"{spec.base_override:X}"
-        try:
-            response = client.post(
-                "/api/session", data=data, content_type="multipart/form-data"
-            )
-        finally:
-            for fp in extra_fps:
-                fp.close()
-
-    assert response.status_code == 201, response.get_json()
-    body = response.get_json()
-    assert body["frame_count"] == spec.expected_frames
-
-    return ApiSessionContext(session_id=body["session_id"], spec=spec)
-
-
-def _delete_session(client, ctx: ApiSessionContext) -> None:
-    client.delete(f"/api/session/{ctx.session_id}")
-
-
-@pytest.fixture(params=list(DATASET_SPECS.keys()), ids=list(DATASET_SPECS.keys()))
-def api_session(client, request):
-    spec = DATASET_SPECS[request.param]
-    ctx = _create_session(client, spec)
-    try:
-        yield ctx
-    finally:
-        _delete_session(client, ctx)
 
 
 def _get_frame0(client, session_id: str) -> dict:
