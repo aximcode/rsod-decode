@@ -35,6 +35,9 @@ class DatasetSpec:
     rsod_file: str
     symbol_path: Path
     expected_format: str
+    # Physical frame count — what the parser / FP-chain walker
+    # produces from the raw stack dump alone. Asserted by tests
+    # that exercise `analyze_rsod` directly.
     expected_frames: int
     expected_resolved: int
     expected_modules: int
@@ -51,6 +54,12 @@ class DatasetSpec:
     # living in the sibling axl-sdk checkout) actually resolve. Tuple
     # instead of list so the dataclass stays hashable.
     source_roots: tuple[Path, ...] = ()
+    # Frame count after the app-layer tail-call reconstructor runs.
+    # Defaults to `expected_frames` when no reconstruction applies;
+    # fixtures with MSVC tail-call elision (currently just
+    # psa_x64_forcecrash) set this to the reconstructed total.
+    # Asserted by API-level tests via conftest.create_api_session.
+    expected_api_frames: int | None = None
 
 
 @dataclass
@@ -136,6 +145,9 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         pdb_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.pdb",
         expected_format="uefi_x86",
         expected_frames=4,
+        # 4 physical frames + 1 synthetic `run_crashtest` inserted by
+        # the tail-call reconstructor once the LLDB backend lands.
+        expected_api_frames=5,
         expected_resolved=1,
         expected_modules=316,
         expected_vregs=0,

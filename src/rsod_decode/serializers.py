@@ -240,6 +240,7 @@ def frame_to_dict(f: FrameInfo) -> dict:
         'address': f.address,
         'call_addr': f.call_addr,
         'is_crash_frame': f.is_crash_frame,
+        'is_synthetic': f.is_synthetic,
         'module': f.module,
         'symbol': f.symbol.name if f.symbol else None,
         'sym_offset': f.sym_offset,

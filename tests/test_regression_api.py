@@ -29,7 +29,10 @@ def test_api_session_get(api_session: ApiSessionContext, client) -> None:
 
     body = response.get_json()
     assert body["format"] == api_session.spec.expected_format
-    assert len(body["frames"]) == api_session.spec.expected_frames
+    expected_count = (
+        api_session.spec.expected_api_frames
+        or api_session.spec.expected_frames)
+    assert len(body["frames"]) == expected_count
     assert body["backend"] in ("pyelftools", "gdb", "lldb")
     assert body["gdb_available"] in (True, False)
     assert body["lldb_available"] in (True, False)

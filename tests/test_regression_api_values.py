@@ -21,7 +21,9 @@ from dataclasses import dataclass, field
 import pytest
 
 from ._datasets import DATASET_SPECS
-from .conftest import ApiSessionContext
+from .conftest import (
+    ApiSessionContext, create_api_session, delete_api_session,
+)
 
 
 pytestmark = [pytest.mark.api]
@@ -246,9 +248,14 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
                       # after the initial read — the stored pointer
                       # is stale garbage by the time we crash. The
                       # genuine TestConfig struct still lives in
-                      # fForceCrashIfRequested's frame (see frame 2).
+                      # fForceCrashIfRequested's frame (see frame 3).
                       expand_values={"ctx": _CTX_VALUES}),
-            2: _Frame("fForceCrashIfRequested",
+            # Frame 2 is synthetic — re-materialized by the tail-call
+            # reconstructor from MSVC's `jmp initialize_test`
+            # optimization of `run_crashtest`. No spill slots,
+            # therefore no params/locals to pin.
+            2: _Frame("run_crashtest", source_file="psaentry.c"),
+            3: _Frame("fForceCrashIfRequested",
                       source_file="psaentry.c",
                       params=(("argc", "int"), ("argv", "char")),
                       locals_=(("config", "CrashTestConfig"),),
@@ -259,7 +266,7 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
                       expand_values={
                           "config": _config_values(mode=1),
                       }),
-            3: _Frame("fUEFIPSAEntry",
+            4: _Frame("fUEFIPSAEntry",
                       source_file="psaentry.c",
                       params=(("originalTxtAttr", "uint64_t"),
                               ("originalTxtMode", "uint64_t")),
@@ -289,7 +296,10 @@ def test_api_session_values(api_session: ApiSessionContext, client) -> None:
     body = client.get(f"/api/session/{api_session.session_id}").get_json()
 
     assert body["format"] == exp.format
-    assert len(body["frames"]) == api_session.spec.expected_frames
+    expected_count = (
+        api_session.spec.expected_api_frames
+        or api_session.spec.expected_frames)
+    assert len(body["frames"]) == expected_count
     assert body["backend"] in exp.backend_is, (
         f"unexpected backend {body['backend']!r}; "
         f"expected one of {exp.backend_is}")
@@ -610,6 +620,69 @@ def test_api_disasm_has_instructions_for_resolved_frame(
     assert len(insns) > 0, "disasm returned no instructions"
     target_hits = [i for i in insns if i["is_target"]]
     assert target_hits, "no instruction flagged is_target=True"
+
+
+def test_api_tail_call_reconstruction_psa_x64_forcecrash(
+    client,
+) -> None:
+    """The MSVC tail-call reconstructor must re-materialize
+    `run_crashtest` between `initialize_test` and
+    `fForceCrashIfRequested` on the psa_x64_forcecrash fixture.
+
+    MSVC compiled `run_crashtest` as `jmp initialize_test` so the
+    raw stack has 4 frames. After the app-layer reconstruction
+    pass we should see 5 frames with the synthetic run_crashtest
+    at index 2, flagged `is_synthetic=True`, and its own source
+    mapping to psaentry.c. The frame indices below/above should
+    stay anchored to the real functions.
+    """
+    spec = DATASET_SPECS["psa_x64_forcecrash"]
+    if spec.pdb_path is None or not spec.pdb_path.exists():
+        pytest.skip("psa_x64_forcecrash .pdb not present")
+    ctx = create_api_session(client, spec)
+    try:
+        body = client.get(f"/api/session/{ctx.session_id}").get_json()
+        frames = body["frames"]
+        # 4 physical + 1 synthetic = 5 total
+        assert len(frames) == 5, [
+            (f["index"], f.get("symbol"), f.get("is_synthetic"))
+            for f in frames
+        ]
+        symbols = [f.get("symbol") for f in frames]
+        assert symbols[1] == "initialize_test"
+        assert symbols[2] == "run_crashtest"
+        assert symbols[3] == "fForceCrashIfRequested"
+        assert symbols[4] == "fUEFIPSAEntry"
+
+        # Only the middle run_crashtest frame is synthetic.
+        synthetics = [f for f in frames if f.get("is_synthetic")]
+        assert len(synthetics) == 1
+        assert synthetics[0]["symbol"] == "run_crashtest"
+        assert synthetics[0]["index"] == 2
+        assert "psaentry.c" in (synthetics[0].get("source_loc") or "")
+
+        # The synthetic frame's /api/frame response surfaces the
+        # flag and renders empty params/locals (tail-called
+        # functions have no spill slots).
+        fr = client.get(f"/api/frame/{ctx.session_id}/2").get_json()
+        assert fr["is_synthetic"] is True
+        assert fr["symbol"] == "run_crashtest"
+        assert fr["params"] == []
+        assert fr["locals"] == []
+
+        # Disassembly of the synthetic frame should cover the
+        # 5-instruction run_crashtest body and end in a jmp —
+        # the last mnemonic is the tail-call jump into
+        # initialize_test.
+        dis = client.get(f"/api/disasm/{ctx.session_id}/2").get_json()
+        insns = dis["instructions"]
+        assert insns, "synthetic frame disasm is empty"
+        last_mnemonic = insns[-1]["mnemonic"].lower()
+        assert last_mnemonic.startswith("jmp"), (
+            f"expected run_crashtest to end in jmp (tail call), "
+            f"got {last_mnemonic}")
+    finally:
+        delete_api_session(client, ctx)
 
 
 def test_api_disasm_target_highlight_all_resolved_frames(

@@ -265,11 +265,18 @@ def main() -> None:
         if sess.backend == 'pyelftools':
             _log('Using pyelftools backend')
 
-        # Same source_loc backfill as the POST /api/session path —
-        # necessary for PE+PDB sessions where the decoder's initial
-        # resolve pass sees only the stub PEBinary surface.
-        from .app import _backfill_source_loc_from_richer_backend
+        # Same source_loc backfill + tail-call reconstruction as the
+        # POST /api/session path. The backfill is necessary for
+        # PE+PDB sessions where the decoder's initial resolve pass
+        # sees only the stub PEBinary surface; the reconstruction
+        # re-materializes any frames MSVC's tail-call optimizer
+        # elided so the UI backtrace matches the source call chain.
+        from .app import (
+            _backfill_source_loc_from_richer_backend,
+            _reconstruct_tail_call_frames,
+        )
         _backfill_source_loc_from_richer_backend(sess)
+        _reconstruct_tail_call_frames(sess)
 
         register_session(sess)
 

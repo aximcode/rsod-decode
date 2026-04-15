@@ -117,6 +117,35 @@ def _backfill_source_loc_from_richer_backend(session: Session) -> None:
             f.source_loc = info.source_loc
 
 
+def _reconstruct_tail_call_frames(session: Session) -> None:
+    """Re-materialize frames elided by compiler tail-call optimization.
+
+    Walks the existing frame list through the LLDB backend's
+    disassembly-annotation surface and splices in synthetic
+    FrameInfo entries for any tail-called function that sat between
+    an adjacent (child, parent) pair. Safe to call repeatedly —
+    synthetic frames are marked `is_synthetic=True` so we skip them
+    on subsequent passes. Does nothing when no LLDB backend is
+    attached or when no tail calls are detected.
+    """
+    if session.lldb_dwarf is None:
+        return
+    from .lldb_backend import LldbBackend
+    if not isinstance(session.lldb_dwarf, LldbBackend):
+        return
+    from .tail_call_reconstructor import reconstruct_tail_calls
+
+    # Operate on the original (non-synthetic) frames only, so we
+    # don't feed previously-inserted synthetic frames back in if
+    # the caller runs the pass twice.
+    original = [f for f in session.result.frames if not f.is_synthetic]
+    rebuilt = reconstruct_tail_calls(original, session.lldb_dwarf)
+    if len(rebuilt) == len(original):
+        return
+    session.result.frames = rebuilt
+    session.frame_cache.clear()
+
+
 # =============================================================================
 # Flask app factory
 # =============================================================================
@@ -275,6 +304,13 @@ def create_app(repo_root: Path | None = None,
         # Once the richer LLDB backend is attached, walk the frames
         # and populate missing `source_loc` entries from the PDB.
         _backfill_source_loc_from_richer_backend(session)
+
+        # Synthesize frames elided by tail-call optimization. MSVC
+        # happily collapses thin wrappers into `jmp` chains so the
+        # runtime stack is shallower than the source call chain;
+        # LLDB's disassembly annotations let us reconstruct the
+        # missing links and mark them `is_synthetic=True`.
+        _reconstruct_tail_call_frames(session)
 
         store_session(session)
 

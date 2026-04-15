@@ -155,7 +155,11 @@ def create_api_session(client, spec: DatasetSpec) -> ApiSessionContext:
 
     assert response.status_code == 201, response.get_json()
     body = response.get_json()
-    assert body["frame_count"] == spec.expected_frames
+    # API-level count accounts for any synthetic frames inserted by
+    # the tail-call reconstructor; fall back to the physical count
+    # when the fixture doesn't opt into the reconstruction path.
+    expected = spec.expected_api_frames or spec.expected_frames
+    assert body["frame_count"] == expected
     return ApiSessionContext(session_id=body["session_id"], spec=spec)
 
 

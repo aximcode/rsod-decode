@@ -55,9 +55,20 @@ export function BacktracePanel({ frames, callVerified, selectedIndex, onSelect }
             >
               <div className="flex items-baseline gap-2 min-w-0">
                 <span className="text-zinc-600 shrink-0">#{frame.index}</span>
-                <span className={`truncate ${isSelected ? 'text-blue-200' : 'text-zinc-200'}`}>
+                <span className={`truncate ${
+                  isSelected ? 'text-blue-200'
+                  : frame.is_synthetic ? 'text-violet-300 italic'
+                  : 'text-zinc-200'}`}>
                   {frame.symbol ?? '???'}
                 </span>
+                {frame.is_synthetic && (
+                  <span
+                    className="shrink-0 text-[10px] uppercase tracking-wider px-1 py-px rounded bg-violet-950 text-violet-300 border border-violet-800"
+                    title="Synthetic frame — re-materialized from a tail-called function. No stack frame existed at runtime, so param/local values are unavailable."
+                  >
+                    tail
+                  </span>
+                )}
                 {verified === true && <span className="text-green-500 shrink-0" title="Call verified">&#10003;</span>}
                 {verified === false && <span className="text-yellow-500 shrink-0" title="Stale return address">&#9888;</span>}
               </div>

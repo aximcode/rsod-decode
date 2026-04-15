@@ -812,6 +812,181 @@ class LldbBackend:
                 out[a] = info
         return out
 
+    # -----------------------------------------------------------------
+    # Tail-call reconstruction
+    # -----------------------------------------------------------------
+
+    def _function_range(self, name: str) -> tuple[int, int] | None:
+        """Look up a function by name and return its [start, end) file
+        address range, or None if not found."""
+        sctxs = self._target.FindFunctions(name)
+        if not sctxs.GetSize():
+            return None
+        fn = sctxs.GetContextAtIndex(0).GetFunction()
+        if not fn.IsValid():
+            return None
+        start = fn.GetStartAddress()
+        end = fn.GetEndAddress()
+        if not start.IsValid() or not end.IsValid():
+            return None
+        return (start.GetFileAddress(), end.GetFileAddress())
+
+    _CALL_COMMENT_RE = re.compile(
+        r'^(?P<sym>[^\s]+(?: [^\s]+)*?) at (?P<src>[^\s]+:\d+)$')
+
+    def _parse_call_comment(
+        self, comment: str,
+    ) -> tuple[str, str] | None:
+        """Extract `(symbol, source_loc)` from an LLDB insn comment.
+
+        LLDB annotates call/jmp targets with strings like
+        `run_crashtest at psaentry.c:296` — `symbol at file:line`.
+        When the symbol is unresolved the comment is empty.
+        """
+        if not comment:
+            return None
+        m = self._CALL_COMMENT_RE.match(comment.strip())
+        if not m:
+            return None
+        return m.group('sym'), m.group('src')
+
+    def _iter_function_instructions(
+        self, start: int, end: int,
+    ) -> list[Any]:
+        """Return every SBInstruction whose file-address falls in
+        `[start, end)`, in order. Bounded by the caller so a
+        misbehaving ReadInstructions can't spill into the next
+        function's code."""
+        sb = self._resolve_sb_address(start)
+        if not sb.IsValid():
+            return []
+        # x86 instructions average ~3 bytes, so budget for worst case.
+        byte_count = max(1, end - start)
+        instrs = self._target.ReadInstructions(sb, byte_count)
+        kept: list[Any] = []
+        for i in range(instrs.GetSize()):
+            insn = instrs.GetInstructionAtIndex(i)
+            lldb_addr = insn.GetAddress()
+            a = (
+                lldb_addr.GetFileAddress() if self._mode == 'pe_pdb'
+                else lldb_addr.GetLoadAddress(self._target))
+            if a == self._lldb.LLDB_INVALID_ADDRESS or a < start:
+                continue
+            if a >= end:
+                break
+            kept.append(insn)
+        return kept
+
+    def find_callee_at_return_addr(
+        self, ret_addr: int, function_name: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Find the call that returns to `ret_addr` and parse its target.
+
+        Walks the enclosing function's disassembly looking for a
+        call instruction whose `addr + size == ret_addr`. Returns
+        `(callee_symbol, callee_source_loc)` from LLDB's annotation
+        comment, or None if the call is indirect or unresolved.
+
+        For corefile mode `ret_addr` is an ELF offset (runtime
+        adjustment is applied inside `_resolve_sb_address`); for
+        pe_pdb mode it's an absolute file address.
+        """
+        file_mode = self._mode == 'pe_pdb'
+        runtime = ret_addr if file_mode else ret_addr + self._image_base
+
+        range_: tuple[int, int] | None = None
+        if function_name:
+            range_ = self._function_range(function_name)
+        if range_ is None:
+            sb_addr = self._resolve_sb_address(ret_addr)
+            if not sb_addr.IsValid():
+                return None
+            fn = sb_addr.GetFunction()
+            if not fn.IsValid():
+                sym = sb_addr.GetSymbol()
+                if not sym.IsValid():
+                    return None
+                start_sb = sym.GetStartAddress()
+                end_sb = sym.GetEndAddress()
+            else:
+                start_sb = fn.GetStartAddress()
+                end_sb = fn.GetEndAddress()
+            if not start_sb.IsValid() or not end_sb.IsValid():
+                return None
+            start = (
+                start_sb.GetFileAddress() if file_mode
+                else start_sb.GetLoadAddress(self._target))
+            end = (
+                end_sb.GetFileAddress() if file_mode
+                else end_sb.GetLoadAddress(self._target))
+            if start == self._lldb.LLDB_INVALID_ADDRESS:
+                return None
+            range_ = (start, end)
+
+        for insn in self._iter_function_instructions(*range_):
+            mn = (insn.GetMnemonic(self._target) or '').lower()
+            if not mn.startswith(('call', 'bl', 'jmp')):
+                continue
+            insn_addr = insn.GetAddress()
+            a = (
+                insn_addr.GetFileAddress() if file_mode
+                else insn_addr.GetLoadAddress(self._target))
+            if a + insn.GetByteSize() != runtime:
+                continue
+            comment = insn.GetComment(self._target) or ''
+            return self._parse_call_comment(comment)
+        return None
+
+    def tail_call_target(
+        self, function_name: str,
+    ) -> tuple[str, str] | None:
+        """If `function_name` ends in a tail-call `jmp <known_sym>`
+        (no instructions after), return the target `(symbol, source_loc)`
+        from LLDB's annotation. Returns None when the function has
+        a proper `ret`, the tail target is indirect, or the target
+        symbol is not resolvable.
+        """
+        range_ = self._function_range(function_name)
+        if range_ is None:
+            return None
+        insns = self._iter_function_instructions(*range_)
+        if not insns:
+            return None
+        last = insns[-1]
+        mn = (last.GetMnemonic(self._target) or '').lower()
+        if not mn.startswith('jmp') and mn not in ('b',):
+            return None
+        comment = last.GetComment(self._target) or ''
+        return self._parse_call_comment(comment)
+
+    def function_entry_source_loc(
+        self, function_name: str,
+    ) -> tuple[int, str] | None:
+        """Look up a function by name and return
+        `(entry_file_addr, "file:line")` for its first line entry, or
+        None if the function isn't found.
+        """
+        sctxs = self._target.FindFunctions(function_name)
+        if not sctxs.GetSize():
+            return None
+        fn = sctxs.GetContextAtIndex(0).GetFunction()
+        if not fn.IsValid():
+            return None
+        start = fn.GetStartAddress()
+        if not start.IsValid():
+            return None
+        file_addr = start.GetFileAddress()
+        le = start.GetLineEntry()
+        source_loc = ''
+        if le.IsValid():
+            spec = le.GetFileSpec()
+            fname = spec.GetFilename() or ''
+            directory = spec.GetDirectory() or ''
+            if fname:
+                path = f'{directory}/{fname}' if directory else fname
+                source_loc = f'{path}:{le.GetLine()}'
+        return (file_addr, source_loc)
+
     def get_cfi_unwinder(self) -> None:
         """LLDB unwinds internally — pyelftools provides the decoder-time
         CFI unwinder, not this backend."""

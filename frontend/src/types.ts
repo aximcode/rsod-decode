@@ -20,6 +20,7 @@ export interface FrameSummary {
   address: number
   call_addr: number
   is_crash_frame: boolean
+  is_synthetic?: boolean
   module: string
   symbol: string | null
   sym_offset: number

@@ -83,6 +83,12 @@ class FrameInfo:
     frame_fp: int = 0  # this frame's actual FP value (from FP chain walk)
     frame_cfa: int = 0  # CFA (Canonical Frame Address) from CFI rules
     frame_registers: dict[str, int] = field(default_factory=dict)
+    # True for frames inserted by the tail-call reconstructor. These
+    # represent functions that executed at runtime but were compiled
+    # as tail-calls (jmp) so they have no physical stack frame — the
+    # UI can show symbol/source/disasm but variable values are
+    # unavailable because no spill slots exist.
+    is_synthetic: bool = False
 
 
 @dataclass
