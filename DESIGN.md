@@ -1,3 +1,4 @@
+
 # RSOD Debugger — Design Document
 
 ## Overview
@@ -320,8 +321,15 @@ rsod-decode/
 │   ├── app.py              — Flask app, routes, session management
 │   ├── decoder.py          — RSOD text parsing, format detection
 │   ├── dwarf_backend.py    — DwarfInfo class (pyelftools + capstone)
-│   ├── gdb_backend.py      — GDB/MI DWARF backend
-│   ├── symbols.py          — SymbolTable, MapSymbol, map file parser
+│   ├── pe_backend.py       — PEBinary class (pefile + capstone)
+│   ├── gdb_backend.py      — GDB/MI DWARF backend (Phase-5 deletion pending)
+│   ├── gdb_bridge.py       — PTY-based GDB terminal bridge (Phase-5 pending)
+│   ├── lldb_backend.py     — LLDB backend (ELF corefile + PE+PDB static)
+│   ├── lldb_bridge.py      — In-process SBCommandInterpreter for /ws/lldb
+│   ├── lldb_loader.py      — sys.path shim to import system lldb from a venv
+│   ├── corefile.py         — Synthetic ELF core generator (ELFOSABI_LINUX)
+│   ├── symbols.py          — SymbolTable, MapSymbol, map file parser,
+│   │                         + LLDB-driven PDB symbol enumeration
 │   ├── esr.py              — ARM64 ESR decode tables
 │   └── models.py           — Shared dataclasses (CrashInfo, FrameInfo, etc.)
 ├── frontend/
