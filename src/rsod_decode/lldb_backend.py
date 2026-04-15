@@ -22,6 +22,7 @@ from elftools.elf.elffile import ELFFile
 
 from .corefile import write_corefile
 from .lldb_loader import import_lldb
+from .minidump import write_minidump
 from .models import AddressInfo, VarInfo
 
 
@@ -1138,9 +1139,13 @@ class LldbBackend:
         """Alternate constructor for a statically-loaded PE+PDB target.
 
         Builds an LldbBackend that holds a PE target with its PDB loaded
-        as a symbol source, but no SBProcess. Variable values come from
-        the RSOD registers + stack dump that get stashed on the instance,
-        and struct expansion uses SBType layouts from the PDB.
+        as a symbol source and a synthetic Windows minidump mounted via
+        `SBTarget.LoadCore`. The minidump carries the RSOD's register
+        snapshot + stack dump; LLDB's ProcessMinidump plugin unwinds via
+        the PE's `.pdata` records and auto-maps every PE section from
+        the on-disk binary, so `SBProcess.ReadMemory`,
+        `SBFrame.GetVariables`, and `SBValue.GetChildAtIndex` all work
+        against a real (read-only) live-target surface.
         """
         lldb = import_lldb()
         if lldb is None:
@@ -1158,6 +1163,11 @@ class LldbBackend:
         instance._stack_mem = stack_mem
         instance._valid_ranges = []
 
+        dump_path = instance._tmpdir / 'crash.dmp'
+        write_minidump(
+            registers, stack_base, stack_mem,
+            pe_path, image_base, dump_path)
+
         instance._debugger = lldb.SBDebugger.Create()
         instance._debugger.SetAsync(False)
         ci = instance._debugger.GetCommandInterpreter()
@@ -1168,7 +1178,7 @@ class LldbBackend:
             lldb.SBDebugger.Destroy(instance._debugger)
             raise RuntimeError(
                 f'target create failed: {ro.GetError().strip()}')
-        ci.HandleCommand(f'target symbols add {pdb_path}', ro)
+        ci.HandleCommand(f'target symbols add "{pdb_path}"', ro)
         if not ro.Succeeded():
             lldb.SBDebugger.Destroy(instance._debugger)
             raise RuntimeError(
@@ -1178,6 +1188,25 @@ class LldbBackend:
         if not instance._target.IsValid():
             lldb.SBDebugger.Destroy(instance._debugger)
             raise RuntimeError('PE+PDB target invalid after creation')
+
+        err = lldb.SBError()
+        instance._process = instance._target.LoadCore(str(dump_path), err)
+        if not err.Success():
+            lldb.SBDebugger.Destroy(instance._debugger)
+            raise RuntimeError(
+                f'LoadCore failed: {err.GetCString()}')
+        if not instance._process.IsValid() \
+                or instance._process.GetNumThreads() < 1:
+            lldb.SBDebugger.Destroy(instance._debugger)
+            raise RuntimeError('LoadCore returned an invalid process')
+        instance._thread = instance._process.GetThreadAtIndex(0)
+
+        instance._frame_map = {}
+        for i in range(instance._thread.GetNumFrames()):
+            frame = instance._thread.GetFrameAtIndex(i)
+            pc = frame.GetPC()
+            if pc:
+                instance._frame_map[pc] = i
 
         # Cache module sections with their file addresses (no slide
         # — PE files link with ImageBase baked into section addresses).
@@ -1193,9 +1222,9 @@ class LldbBackend:
                     instance._pe_sections.append((file_addr, size, sec))
 
         # Per-frame post-prologue RSP map for DWARF [RSP+offset]
-        # resolution. The crash frame's RSP is the raw register value;
-        # each subsequent frame's RSP is derived from where its
-        # predecessor's return-address slot sits on the stack.
+        # resolution. Still needed by the current `_pe_get_variables`
+        # text-parse path — the variable-walker unification in the
+        # next commit routes through SBFrame instead.
         instance._pe_frame_rsps = instance._compute_pe_frame_rsps(
             frames, stack_base, stack_mem,
             registers.get('RSP', 0))
