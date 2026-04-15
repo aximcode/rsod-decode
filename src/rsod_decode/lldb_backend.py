@@ -818,14 +818,23 @@ class LldbBackend:
         Bounds are in the decoder's address space (ELF offset for
         corefile mode, absolute PE file address for PE+PDB mode);
         `_addr_slide` reconciles them to the LLDB runtime load
-        address space.
+        address space. Walks via `SBFunction.GetInstructions(target)`
+        which returns the function's full instruction list without
+        us having to guess a byte count — the `[start, end)`
+        clamp is a belt-and-braces filter.
         """
         runtime_start = start + self._addr_slide
         sb = self._target.ResolveLoadAddress(runtime_start)
         if not sb.IsValid():
             return []
-        byte_count = max(1, end - start)
-        instrs = self._target.ReadInstructions(sb, byte_count)
+        fn = sb.GetFunction()
+        instrs: Any
+        if fn.IsValid():
+            instrs = fn.GetInstructions(self._target)
+        else:
+            # Symbol-only (no debug info): fall back to a byte-bounded
+            # read since there's no SBFunction to iterate.
+            instrs = self._target.ReadInstructions(sb, max(1, end - start))
         kept: list[Any] = []
         for i in range(instrs.GetSize()):
             insn = instrs.GetInstructionAtIndex(i)
