@@ -10,10 +10,73 @@ interface Props {
   error?: string
 }
 
+const SYMBOL_EXTS = ['.map', '.efi', '.so', '.debug', '.elf', '.pdb']
+// Extensions that are "real" binaries and should claim the primary
+// slot ahead of companion files (.map, .pdb). Matches what the
+// backend's _pair_map_with_pe / _pop_pdb_for classifiers expect as
+// the primary path.
+const PRIMARY_EXTS = ['.efi', '.so', '.debug', '.elf']
+
+function extOf(name: string): string {
+  const lower = name.toLowerCase()
+  const dot = lower.lastIndexOf('.')
+  return dot >= 0 ? lower.slice(dot) : ''
+}
+
+function isSymbolFile(name: string): boolean {
+  return SYMBOL_EXTS.includes(extOf(name))
+}
+
+function isPreferredPrimary(name: string): boolean {
+  return PRIMARY_EXTS.includes(extOf(name))
+}
+
+interface FileSlots {
+  rsod: File | null
+  primary: File | null
+  extras: File[]
+}
+
+const EMPTY_SLOTS: FileSlots = { rsod: null, primary: null, extras: [] }
+
+/**
+ * Pure classifier for the unified upload flow. Routes each incoming
+ * file into one of three buckets:
+ *   - rsod:    any .txt/.log (or anything not recognized as a symbol)
+ *   - primary: the first .efi/.so/.debug/.elf we see; if we later see
+ *              a "better" primary we promote it and demote the old
+ *              one into extras
+ *   - extras:  every other symbol file (.map, .pdb, additional
+ *              .efi/.so from multi-module traces)
+ *
+ * Called from both drag-drop and the single multi-file input so
+ * there's one implementation and no closure-based state reads.
+ */
+function classifyAndMerge(prev: FileSlots, incoming: File[]): FileSlots {
+  let rsod = prev.rsod
+  let primary = prev.primary
+  const extras = [...prev.extras]
+  for (const f of incoming) {
+    if (!isSymbolFile(f.name)) {
+      rsod = f
+      continue
+    }
+    if (primary === null) {
+      primary = f
+      continue
+    }
+    if (isPreferredPrimary(f.name) && !isPreferredPrimary(primary.name)) {
+      extras.push(primary)
+      primary = f
+      continue
+    }
+    extras.push(f)
+  }
+  return { rsod, primary, extras }
+}
+
 export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props) {
-  const [rsodFile, setRsodFile] = useState<File | null>(null)
-  const [symFile, setSymFile] = useState<File | null>(null)
-  const [extraFiles, setExtraFiles] = useState<File[]>([])
+  const [slots, setSlots] = useState<FileSlots>(EMPTY_SLOTS)
   const [pasteText, setPasteText] = useState('')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [base, setBase] = useState('')
@@ -22,11 +85,19 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
   const [dragOver, setDragOver] = useState(false)
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
-  // Bump to force HistoryPanel to re-fetch after an import or
-  // whenever the upload screen renders fresh.
   const [historyKey, setHistoryKey] = useState(0)
   const dropRef = useRef<HTMLDivElement>(null)
+  const addFilesInputRef = useRef<HTMLInputElement>(null)
   const importInputRef = useRef<HTMLInputElement>(null)
+
+  const addFiles = useCallback((incoming: File[]) => {
+    if (incoming.length === 0) return
+    setSlots(prev => classifyAndMerge(prev, incoming))
+    // Any dropped or picked RSOD supersedes pasted text.
+    if (incoming.some(f => !isSymbolFile(f.name))) {
+      setPasteText('')
+    }
+  }, [])
 
   const handleImport = useCallback(async (file: File) => {
     setImporting(true)
@@ -34,10 +105,6 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
     try {
       const res = await api.importSession(file)
       setHistoryKey(k => k + 1)
-      // Drop straight into the imported session so the user sees it
-      // immediately — importSession returns a session_id that's
-      // already persisted, so hydrating it goes through the same
-      // fast path as clicking a history row.
       onOpenSession(res.session_id)
     } catch (e) {
       setImportError(e instanceof Error ? e.message : String(e))
@@ -49,34 +116,36 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setDragOver(false)
-    const files = Array.from(e.dataTransfer.files)
-    for (const f of files) {
-      const name = f.name.toLowerCase()
-      if (name.endsWith('.map') || name.endsWith('.efi') || name.endsWith('.so') || name.endsWith('.debug') || name.endsWith('.pdb')) {
-        if (!symFile) {
-          setSymFile(f)
-        } else {
-          setExtraFiles(prev => [...prev, f])
-        }
-      } else {
-        setRsodFile(f)
-      }
-    }
-  }, [symFile])
+    addFiles(Array.from(e.dataTransfer.files))
+  }, [addFiles])
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    const rsod = rsodFile ?? (pasteText ? new Blob([pasteText], { type: 'text/plain' }) : null)
-    if (!rsod || !symFile) return
+    const rsod = slots.rsod ?? (pasteText ? new Blob([pasteText], { type: 'text/plain' }) : null)
+    if (!rsod || !slots.primary) return
     const opts: UploadOptions = {}
     if (base) opts.base = base
     if (tag) opts.tag = tag
     if (commit) opts.commit = commit
-    onUpload(rsod, symFile, extraFiles.length > 0 ? extraFiles : undefined, opts)
+    onUpload(rsod, slots.primary, slots.extras.length > 0 ? slots.extras : undefined, opts)
   }
 
-  const hasRsod = rsodFile !== null || pasteText.length > 0
-  const canSubmit = hasRsod && symFile !== null && !uploading
+  const removeRsod = () => setSlots(s => ({ ...s, rsod: null }))
+  const removePrimary = () =>
+    // Promote the first extra to primary so the user doesn't lose
+    // their selection to a single stray click. Matches what the
+    // backend would do on a reupload anyway.
+    setSlots(s => {
+      const nextPrimary = s.extras[0] ?? null
+      if (nextPrimary === null) return { ...s, primary: null }
+      return { ...s, primary: nextPrimary, extras: s.extras.slice(1) }
+    })
+  const removeExtra = (f: File) =>
+    setSlots(s => ({ ...s, extras: s.extras.filter(x => x !== f) }))
+
+  const hasRsod = slots.rsod !== null || pasteText.length > 0
+  const canSubmit = hasRsod && slots.primary !== null && !uploading
+  const anyFileSelected = slots.rsod !== null || slots.primary !== null || slots.extras.length > 0
 
   return (
     <div className="flex items-center justify-center min-h-screen p-8">
@@ -92,7 +161,7 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
           </div>
         )}
 
-        {/* Drop zone */}
+        {/* Drop zone — takes RSOD + any symbol files in any order */}
         <div
           ref={dropRef}
           onDragOver={e => { e.preventDefault(); setDragOver(true) }}
@@ -110,52 +179,48 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
             Drop RSOD log and symbol files here
           </p>
           <p className="text-zinc-500 text-sm">
-            .txt/.log for RSOD capture, .map/.efi/.so/.debug/.pdb for symbols
+            .txt/.log for the capture · .efi/.so/.debug/.pdb/.map for symbols · drop them all at once
           </p>
-          {(rsodFile ?? symFile) && (
+          <button
+            type="button"
+            onClick={() => addFilesInputRef.current?.click()}
+            className="mt-3 text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 rounded px-3 py-1 hover:border-zinc-500 transition-colors"
+          >
+            or browse&hellip;
+          </button>
+          <input
+            ref={addFilesInputRef}
+            type="file"
+            multiple
+            accept=".txt,.log,.map,.efi,.so,.debug,.elf,.pdb"
+            onChange={e => {
+              addFiles(Array.from(e.target.files ?? []))
+              e.target.value = ''
+            }}
+            className="hidden"
+          />
+          {anyFileSelected && (
             <div className="mt-4 text-left space-y-1">
-              {rsodFile && (
+              {slots.rsod && (
                 <div className="text-sm text-zinc-300">
-                  <span className="text-green-400">RSOD:</span> {rsodFile.name}
-                  <button type="button" onClick={() => setRsodFile(null)} aria-label={`Remove ${rsodFile.name}`} className="ml-2 text-zinc-500 hover:text-zinc-300">&times;</button>
+                  <span className="text-green-400">RSOD:</span> {slots.rsod.name}
+                  <button type="button" onClick={removeRsod} aria-label={`Remove ${slots.rsod.name}`} className="ml-2 text-zinc-500 hover:text-zinc-300">&times;</button>
                 </div>
               )}
-              {symFile && (
+              {slots.primary && (
                 <div className="text-sm text-zinc-300">
-                  <span className="text-blue-400">Symbols:</span> {symFile.name}
-                  <button type="button" onClick={() => setSymFile(null)} aria-label={`Remove ${symFile.name}`} className="ml-2 text-zinc-500 hover:text-zinc-300">&times;</button>
+                  <span className="text-blue-400">Primary:</span> {slots.primary.name}
+                  <button type="button" onClick={removePrimary} aria-label={`Remove ${slots.primary.name}`} className="ml-2 text-zinc-500 hover:text-zinc-300">&times;</button>
                 </div>
               )}
-              {extraFiles.map(f => (
+              {slots.extras.map(f => (
                 <div key={`${f.name}-${f.size}-${f.lastModified}`} className="text-sm text-zinc-300">
                   <span className="text-purple-400">Extra:</span> {f.name}
-                  <button type="button" onClick={() => setExtraFiles(prev => prev.filter(x => x !== f))} aria-label={`Remove ${f.name}`} className="ml-2 text-zinc-500 hover:text-zinc-300">&times;</button>
+                  <button type="button" onClick={() => removeExtra(f)} aria-label={`Remove ${f.name}`} className="ml-2 text-zinc-500 hover:text-zinc-300">&times;</button>
                 </div>
               ))}
             </div>
           )}
-        </div>
-
-        {/* File inputs */}
-        <div className="grid grid-cols-2 gap-4">
-          <label className="block">
-            <span className="text-sm text-zinc-400">RSOD log</span>
-            <input
-              type="file"
-              accept=".txt,.log"
-              onChange={e => { const f = e.target.files?.[0] ?? null; setRsodFile(f); if (f) setPasteText('') }}
-              className="mt-1 block w-full text-sm text-zinc-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-zinc-700 file:text-zinc-200 hover:file:bg-zinc-600 file:cursor-pointer"
-            />
-          </label>
-          <label className="block">
-            <span className="text-sm text-zinc-400">Symbol file</span>
-            <input
-              type="file"
-              accept=".map,.efi,.so,.debug,.elf,.pdb"
-              onChange={e => setSymFile(e.target.files?.[0] ?? null)}
-              className="mt-1 block w-full text-sm text-zinc-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-zinc-700 file:text-zinc-200 hover:file:bg-zinc-600 file:cursor-pointer"
-            />
-          </label>
         </div>
 
         {/* Paste area */}
@@ -164,7 +229,7 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
             <span className="text-sm text-zinc-400">Or paste RSOD text</span>
             <textarea
               value={pasteText}
-              onChange={e => { setPasteText(e.target.value); if (e.target.value) setRsodFile(null) }}
+              onChange={e => { setPasteText(e.target.value); if (e.target.value) setSlots(s => ({ ...s, rsod: null })) }}
               placeholder="Paste serial console output here..."
               rows={4}
               className="mt-1 block w-full rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm font-mono p-3 placeholder:text-zinc-600 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 focus:outline-none resize-y"
@@ -262,7 +327,6 @@ export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props)
           </div>
         )}
 
-        {/* History — always visible, collapses gracefully when empty */}
         <div className="pt-2">
           <HistoryPanel
             onOpen={onOpenSession}
