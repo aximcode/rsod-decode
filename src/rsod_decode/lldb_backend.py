@@ -402,14 +402,55 @@ class LldbBackend:
             return {'error': 'Frame not found'}
         sv = frame.EvaluateExpression(expr)
         err = sv.GetError()
-        if not err.Success():
-            return {'error': err.GetCString() or 'Unknown error'}
-        werr = self._lldb.SBError()
-        unsigned = sv.GetValueAsUnsigned(werr, 0)
-        value = sv.GetValue()
-        if value is None and werr.Success():
-            value = f'0x{unsigned:x}'
-        return {'value': value or '', 'type': sv.GetTypeName() or ''}
+        if err.Success():
+            werr = self._lldb.SBError()
+            unsigned = sv.GetValueAsUnsigned(werr, 0)
+            value = sv.GetValue()
+            if value is None and werr.Success():
+                value = f'0x{unsigned:x}'
+            return {'value': value or '', 'type': sv.GetTypeName() or ''}
+
+        # PE+PDB fallback: the expression parser routes memory reads
+        # through `SBProcess.ReadMemory`, which returns None for
+        # file-backed PE .data/.bss/.rdata under ProcessMinidump. If
+        # the expression is a bare identifier naming a global, look
+        # it up via `SBTarget.FindFirstGlobalVariable` and read the
+        # bytes through `SBValue.GetData` (which bypasses the broken
+        # read path). The answer is the linker-time initializer —
+        # Dell RSODs don't capture runtime `.data`/`.bss` memory, so
+        # post-boot mutations are unrecoverable.
+        trimmed = expr.strip()
+        if trimmed.replace('_', '').isalnum() and not trimmed[0].isdigit():
+            gv = self._target.FindFirstGlobalVariable(trimmed)
+            if gv.IsValid():
+                data = gv.GetData()
+                if data and data.GetByteSize() > 0:
+                    read_err = self._lldb.SBError()
+                    byte_size = gv.GetByteSize()
+                    if byte_size == 1:
+                        raw = data.GetUnsignedInt8(read_err, 0)
+                    elif byte_size == 2:
+                        raw = data.GetUnsignedInt16(read_err, 0)
+                    elif byte_size == 4:
+                        raw = data.GetUnsignedInt32(read_err, 0)
+                    elif byte_size == 8:
+                        raw = data.GetUnsignedInt64(read_err, 0)
+                    else:
+                        raw = None
+                    if raw is not None and read_err.Success():
+                        # Suffix with a clarifying note — the
+                        # frontend's ResultValue renderer shows
+                        # "0x<hex> <suffix>" as a clickable hex
+                        # address plus a green-tinted label, so the
+                        # user sees both the value AND the caveat.
+                        return {
+                            'value': (
+                                f'0x{raw:x} '
+                                f'(linker-time; runtime .data not '
+                                f'captured in RSOD)'),
+                            'type': gv.GetTypeName() or '',
+                        }
+        return {'error': err.GetCString() or 'Unknown error'}
 
     # -----------------------------------------------------------------
     # Type expansion (via cached SBValue handles, keyed by var_key)
