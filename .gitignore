@@ -11,6 +11,20 @@ build/
 node_modules/
 frontend/node_modules/
 
+# Vite build output. Regenerated on every `npm run build` and
+# picked up at runtime by server.py — cloners should run
+# `cd frontend && npm install && npm run build` once before
+# launching rsod-debug (server warns when dist is missing).
+frontend/dist/
+# TypeScript incremental build cache — purely local, thrashes on
+# every typecheck.
+*.tsbuildinfo
+
+# Playwright MCP scratch: snapshot YAML and console logs dropped
+# into .playwright-mcp/ while driving the browser during
+# regression audits. Session-local and noisy.
+.playwright-mcp/
+
 # IDE
 .vscode/
 .idea/
