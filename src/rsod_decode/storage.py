@@ -19,6 +19,7 @@ File layout under `~/.rsod-debug/`:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import shutil
 import sqlite3
 from collections.abc import Iterator
@@ -29,6 +30,11 @@ from . import data_dir as _data_dir
 
 
 CURRENT_SCHEMA_VERSION = 2
+
+# Length of the content-hash prefix used as the session id. 16 hex
+# chars = 64 bits; collision probability is ignorable at any realistic
+# team scale (a 10K-session team is ~1e-11 collision chance).
+SESSION_ID_LEN = 16
 
 
 # =============================================================================
@@ -70,6 +76,36 @@ class HydratedInputs:
     base_override: int | None
     dwarf_prefix: str | None
     imported_from: str | None = None
+
+
+# =============================================================================
+# Content-hash session ids
+# =============================================================================
+
+def compute_session_id(files_dir: Path) -> str:
+    """Return the stable session id derived from a directory of inputs.
+
+    Hashes every regular file under `files_dir` sorted by basename —
+    rsod.txt plus whatever symbol files the caller staged. Including
+    the basename in the hash means renaming the primary .efi to
+    something else produces a different id (which is correct: the
+    symbol file's name flows into the pair/pdb classifier).
+
+    The first `SESSION_ID_LEN` hex chars of sha256 are the id; same
+    inputs on any install produce the same id, which is what makes
+    cross-team permalinks work.
+    """
+    h = hashlib.sha256()
+    for item in sorted(files_dir.iterdir(), key=lambda p: p.name):
+        if not item.is_file():
+            continue
+        h.update(item.name.encode('utf-8'))
+        h.update(b'\0')
+        with item.open('rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        h.update(b'\0')
+    return h.hexdigest()[:SESSION_ID_LEN]
 
 
 # =============================================================================
@@ -164,9 +200,15 @@ def save_session(
     failure the caller must roll back that directory.
     """
     with _connect() as conn:
+        # INSERT OR IGNORE makes save_session idempotent: a row that
+        # already exists (because the caller raced another upload of
+        # the same content, or failed to take the dedup fast path
+        # before us) silently wins and this call is a no-op. Same
+        # treatment for session_files since its PK is (session_id,
+        # rel_path) — identical content → identical rows → ignored.
         conn.execute(
             """
-            INSERT INTO sessions (
+            INSERT OR IGNORE INTO sessions (
                 id, created_at, rsod_format, image_name, image_base,
                 exception_desc, crash_pc, crash_symbol, frame_count,
                 backend, rsod_text, base_override, dwarf_prefix,
@@ -179,7 +221,8 @@ def save_session(
         )
         conn.executemany(
             """
-            INSERT INTO session_files (session_id, filename, file_type, rel_path)
+            INSERT OR IGNORE INTO session_files
+                (session_id, filename, file_type, rel_path)
             VALUES (?, ?, ?, ?)
             """,
             [(session_id, f.filename, f.file_type, f.rel_path) for f in files],

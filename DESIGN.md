@@ -62,10 +62,13 @@ in a navigable interface instead of a flat text file.
 │  │  gdb_backend + symbols + corefile + esr         │ │
 │  └─────────────────────────────────────────────────┘ │
 │                                                      │
-│  SQLite session store at ~/.rsod-debug/sessions.db,  │
-│  in-memory _sessions dict is an LRU hot cache in     │
-│  front. Evicted or cross-restart sessions hydrate    │
-│  on demand by replaying service.run_analysis against │
+│  SQLite session store at ~/.rsod-debug/sessions.db.  │
+│  session_id is a 16-char sha256 prefix over the      │
+│  input files, so re-uploads dedup and Alice/Bob      │
+│  installs produce matching ids for the same crash.   │
+│  In-memory _sessions dict is an LRU hot cache in     │
+│  front; evicted or cross-restart sessions hydrate on │
+│  demand by replaying service.run_analysis against    │
 │  the files persisted under ~/.rsod-debug/files/<id>/.│
 └──────────────────────────────────────────────────────┘
 ```
@@ -349,12 +352,17 @@ POST /api/import
 
 The bundle is a flat zip containing `metadata.json`, `rsod.txt`,
 and every symbol file from the session's `files/<id>/` directory.
-`/api/import` mints a new `session_id` locally and records the
-original id as `imported_from` so provenance survives the hop.
-See "Session Storage" below for the metadata schema and zip
-safety contract.
+Because `session_id` is a content hash over the inputs (see
+"Session Storage"), Alice's id and Bob's id for the same crash
+**match across installs** — so `/api/import` typically hits the
+dedup fast path and returns the same id that `#session/<id>`
+links to on Alice's machine. `imported_from` records the original
+id from the bundle's `metadata.json` as an audit marker ("this
+row arrived via /api/import"); under content hashing the pointer
+is usually tautological but is preserved for provenance UI.
 
-Permalinks across restarts come for free: `#session/<id>` hits
+Permalinks across restarts (and across installs, once a bundle is
+imported) come for free: `#session/<id>` hits
 `GET /api/session/<id>`, which hydrates from SQLite on cache miss
 by re-running `service.run_analysis` against the persisted inputs.
 
@@ -436,8 +444,10 @@ rsod-decode/
    c. extract_crash_info() → CrashInfo
    d. resolve addresses → line_info per module
    e. decode_x86() or decode_arm64() → annotated lines + frames
-   f. Persist inputs to SQLite + copy files to ~/.rsod-debug/files/<id>/,
-      then stuff the in-memory Session into the LRU-evicted hot cache
+   f. Stage inputs under files/.staging/<uuid>/, content-hash to the
+      session_id, dedup fast-path if the id already exists, else
+      promote the staging dir to files/<id>/ and persist to SQLite.
+      Either way the in-memory Session lands in the LRU hot cache.
    g. Return session_id + crash summary + frame list
    ↓
 4. Frontend loads session, shows crash banner + backtrace
@@ -566,6 +576,32 @@ every hydration. The analysis is deterministic, so there's no
 versioned result format to migrate and no drift between stored and
 recomputed frames.
 
+### Session id is a content hash
+
+`session_id` is `sha256(rsod.txt | <primary basename> | <primary
+bytes> | … | <extra basename> | <extra bytes>)[:16]` — 16 hex chars,
+64 bits, computed by `storage.compute_session_id(files_dir)`. Two
+consequences:
+
+- **Dedup is automatic.** Re-uploading the same inputs returns the
+  existing row instead of creating a duplicate. `INSERT OR IGNORE`
+  in `save_session` is the defensive backstop; the create_session
+  and import_session routes check for an existing row up front and
+  skip `run_analysis` entirely on a hit (HTTP 200 + `deduplicated:
+  true`). Fresh uploads return the usual 201.
+- **Cross-install permalinks are free.** Alice and Bob independently
+  computing the hash over the same inputs produce the same id, so
+  Bob importing Alice's bundle lands in a row with Alice's id. The
+  exact same `#session/abc123def4567890` link resolves on any
+  install that has imported (or independently uploaded) the same
+  crash. Bundles are still the transport for symbol files; the id
+  is just a stable reference.
+
+Uploads stage files under `files/.staging/<uuid>/` first, compute
+the hash, then either `rename` the staging dir to `files/<id>/`
+(fresh) or `rmtree` it (dedup). Staging lives under `.staging/` so
+the top level of `files/` only contains real session ids.
+
 Schema v2:
 
 ```
@@ -677,9 +713,12 @@ crash-<date>-<short8>.rsod.zip
 - `metadata.json` must parse as a JSON object with an integer
   `schema_version ≤ BUNDLE_SCHEMA_VERSION`.
 
-Imports always mint a new `session_id` and record the original in
-`sessions.imported_from`, so two installs never collide on the
-same id.
+Imports compute the content hash over the unpacked inputs (after
+discarding `metadata.json`, which isn't part of the canonical
+input set), then dedup the same way uploads do: existing id →
+HTTP 200 with `deduplicated: true`; fresh → HTTP 201. Either way
+the new row's `imported_from` captures the `session_id` field
+from `metadata.json` for audit purposes.
 
 ## What We Reuse vs Build New
 

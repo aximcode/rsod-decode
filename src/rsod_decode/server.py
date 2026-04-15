@@ -23,7 +23,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import data_dir as _data_dir
+from . import data_dir as _data_dir, storage
 from .app import create_app, persist_session
 from .session import Session, register_session
 from .symbols import SymbolLoadError, load_symbols
@@ -146,26 +146,51 @@ def main() -> None:
             except ValueError:
                 sys.exit(f"Error: invalid base address: {args.base}")
 
-        # Copy the CLI inputs into the persistent files dir up-front so
-        # the live session and any future hydration after a restart
-        # both read from the same location. Everything downstream —
-        # load_symbols, run_analysis, persist_session — runs against
-        # the copies, not the user's original paths.
-        session_id = uuid.uuid4().hex[:12]
-        files_dir = _data_dir.session_files_dir_for(session_id)
-        files_dir.mkdir(parents=True, exist_ok=True)
+        # Stage the CLI inputs, compute the content-hash session id,
+        # then either promote staging to the final location or discard
+        # it and reuse the existing files if this content was already
+        # uploaded (possibly in a prior `rsod serve` run on the same
+        # data dir).
+        staging_root = _data_dir.session_files_dir() / '.staging'
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging_dir = staging_root / uuid.uuid4().hex
+        staging_dir.mkdir(parents=True, exist_ok=True)
         try:
-            (files_dir / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
-            primary_path = files_dir / args.symbol_file.name
-            shutil.copy2(args.symbol_file, primary_path)
-            extra_paths: list[Path] = []
+            (staging_dir / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
+            staging_primary = staging_dir / args.symbol_file.name
+            shutil.copy2(args.symbol_file, staging_primary)
             for src in args.sym:
-                dst = files_dir / src.name
-                shutil.copy2(src, dst)
-                extra_paths.append(dst)
+                shutil.copy2(src, staging_dir / src.name)
         except OSError as e:
-            shutil.rmtree(files_dir, ignore_errors=True)
-            sys.exit(f"Error copying inputs to {files_dir}: {e}")
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            sys.exit(f"Error copying inputs: {e}")
+
+        session_id = storage.compute_session_id(staging_dir)
+        files_dir = _data_dir.session_files_dir_for(session_id)
+        is_dedup = storage.session_exists(session_id) and files_dir.exists()
+        if is_dedup:
+            _log(f"Session {session_id} already in store — reusing persisted files")
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            storage.delete_session(session_id)  # drop stale row, no-op if absent
+            if files_dir.exists():
+                shutil.rmtree(files_dir)
+            try:
+                staging_dir.rename(files_dir)
+            except OSError as e:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                sys.exit(f"Error promoting staging dir: {e}")
+
+        primary_path = files_dir / args.symbol_file.name
+        extra_paths: list[Path] = [files_dir / s.name for s in args.sym]
+
+        def _cli_rollback() -> None:
+            # Only rmtree on the fresh-promotion path. Dedup reuses
+            # the already-persisted files dir — erasing it would
+            # break every other session that content-hashes to it.
+            if not is_dedup:
+                shutil.rmtree(files_dir, ignore_errors=True)
+                storage.delete_session(session_id)
 
         # MSVC/EPSA: detect a MAP+EFI companion pair in the extras, and
         # pick up a matching .pdb for PDB-backed LLDB.
@@ -187,7 +212,7 @@ def main() -> None:
                 companion_path=companion,
                 pdb_path=pdb_path if companion is None else None)
         except SymbolLoadError as e:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            _cli_rollback()
             sys.exit(f"Error: {e}")
 
         extra_sources = {}
@@ -196,7 +221,7 @@ def main() -> None:
                 s = load_symbols(p, dwarf_prefix=args.dwarf_prefix,
                                  repo_root=repo_root)
             except SymbolLoadError as e:
-                shutil.rmtree(files_dir, ignore_errors=True)
+                _cli_rollback()
                 sys.exit(f"Error: {e}")
             extra_sources[p.stem.lower()] = s
 
@@ -222,6 +247,9 @@ def main() -> None:
 
         created_at = datetime.now(timezone.utc).isoformat()
         try:
+            # INSERT OR IGNORE inside save_session makes this a no-op
+            # on dedup, so we can always call it. The row's
+            # created_at stays at whatever the first upload recorded.
             persist_session(
                 session_id=session_id, created_at=created_at, ctx=ctx,
                 rsod_text=rsod_text,
@@ -231,7 +259,7 @@ def main() -> None:
                 dwarf_prefix=args.dwarf_prefix,
             )
         except Exception as e:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            _cli_rollback()
             sys.exit(f"Error persisting session: {e}")
 
         sess = Session.from_analysis_context(

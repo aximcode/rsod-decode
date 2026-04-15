@@ -392,13 +392,17 @@ def test_session_persistence_across_restart(client, app) -> None:
     assert not files_dir.exists()
 
 
-def test_export_import_roundtrip(client, app) -> None:
-    """Upload → export zip → fresh client → import → matching frames.
+def test_export_import_roundtrip(
+    client, app, tmp_path, monkeypatch,
+) -> None:
+    """Upload → export → import on a fresh data dir → matching frames.
 
-    Uses edk2_aa64 for the same LLDB-independence reason as the
-    persistence test. Asserts the imported session gets a new id,
-    records the original id as imported_from, and yields a backtrace
-    that matches the pre-export response.
+    Under the content-hash id model, Alice and Bob running separate
+    installs still produce the same session_id for the same inputs.
+    This test exercises that cross-install stability by pointing the
+    fresh Flask app at a different `RSOD_DATA_DIR` so the import
+    genuinely lands in an empty store — the way Bob's machine looks
+    the first time he receives Alice's bundle.
     """
     import io
     import json
@@ -407,7 +411,6 @@ def test_export_import_roundtrip(client, app) -> None:
     spec = DATASET_SPECS["edk2_aa64"]
     ctx = create_api_session(client, spec)
     original_id = ctx.session_id
-
     original_body = client.get(f"/api/session/{original_id}").get_json()
 
     # Export as a zip bundle.
@@ -434,13 +437,10 @@ def test_export_import_roundtrip(client, app) -> None:
             assert "/" not in name and "\\" not in name
             assert name not in ("..", ".")
 
-    # Simulate a cross-install import on a fresh Flask app.
-    from rsod_decode.session import _sessions, evict_from_memory
+    # Simulate Bob's install: a completely separate RSOD_DATA_DIR with
+    # an empty sessions.db. The monkeypatch auto-reverts on teardown.
     from rsod_decode.app import create_app
-    evicted = _sessions.pop(original_id, None)
-    assert evicted is not None
-    evict_from_memory(evicted)
-
+    monkeypatch.setenv("RSOD_DATA_DIR", str(tmp_path / "bob"))
     fresh_app = create_app(
         repo_root=app.config["REPO_ROOT"],
         dwarf_prefix=app.config["DWARF_PREFIX"],
@@ -449,6 +449,7 @@ def test_export_import_roundtrip(client, app) -> None:
     fresh_app.config["TESTING"] = True
     fresh_client = fresh_app.test_client()
 
+    # Bob's store is empty — the import is fresh, so 201.
     import_resp = fresh_client.post(
         "/api/import",
         data={"file": (io.BytesIO(zip_bytes), "bundle.rsod.zip")},
@@ -457,23 +458,41 @@ def test_export_import_roundtrip(client, app) -> None:
     assert import_resp.status_code == 201, import_resp.get_json()
     import_body = import_resp.get_json()
     new_id = import_body["session_id"]
-    assert new_id != original_id
+
+    # Under Option B, same inputs → same id across installs. This is
+    # the cross-team permalink property in action.
+    assert new_id == original_id
     assert import_body["imported_from"] == original_id
 
-    # Backtrace should match the pre-export response on the new id.
+    # Backtrace matches the pre-export response.
     new_body = fresh_client.get(f"/api/session/{new_id}").get_json()
     assert len(new_body["frames"]) == len(original_body["frames"])
     for a, b in zip(original_body["frames"], new_body["frames"]):
         assert a["address"] == b["address"]
 
-    # History should show the imported row with imported_from set.
+    # Bob's history shows one row with imported_from set.
     hist = fresh_client.get("/api/history").get_json()
     new_row = next(s for s in hist["sessions"] if s["id"] == new_id)
     assert new_row["imported_from"] == original_id
 
-    # Cleanup.
-    fresh_client.delete(f"/api/session/{new_id}")
-    fresh_client.delete(f"/api/session/{original_id}")
+    # Cleanup Alice's row (still on the original data dir — the
+    # monkeypatch reverts when the test exits).
+    monkeypatch.delenv("RSOD_DATA_DIR", raising=False)
+    client.delete(f"/api/session/{original_id}")
+
+
+def test_upload_dedup_same_content(client) -> None:
+    """Uploading the same fixture twice yields one row and 200 on re-upload."""
+    spec = DATASET_SPECS["edk2_aa64"]
+    first = create_api_session(client, spec)
+    try:
+        second = create_api_session(client, spec)
+        assert second.session_id == first.session_id
+        hist = client.get("/api/history").get_json()
+        matches = [s for s in hist["sessions"] if s["id"] == first.session_id]
+        assert len(matches) == 1
+    finally:
+        client.delete(f"/api/session/{first.session_id}")
 
 
 def test_import_rejects_unsafe_bundles(client) -> None:

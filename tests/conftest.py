@@ -162,7 +162,9 @@ def create_api_session(client, spec: DatasetSpec) -> ApiSessionContext:
             for fp in extra_fps:
                 fp.close()
 
-    assert response.status_code == 201, response.get_json()
+    # 201 on fresh content, 200 on a dedup hit — both are valid
+    # since the upload ultimately refers to the same persisted row.
+    assert response.status_code in (200, 201), response.get_json()
     body = response.get_json()
     # API-level count accounts for any synthetic frames inserted by
     # the tail-call reconstructor; fall back to the physical count

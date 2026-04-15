@@ -291,6 +291,63 @@ def _extract_bundle(stream, files_dir: Path) -> dict:
     return metadata
 
 
+def _staging_dir() -> Path:
+    """Return a fresh scratch dir for in-flight uploads.
+
+    Uploads land here first so we can compute the content hash — and
+    thus the canonical session id — before choosing a final location.
+    Staging dirs live under `files/.staging/` so the top level of
+    `files/` contains only real session ids.
+    """
+    root = _data_dir.session_files_dir() / '.staging'
+    root.mkdir(parents=True, exist_ok=True)
+    d = root / uuid.uuid4().hex
+    return d
+
+
+def _try_resolve_existing(app: Flask, session_id: str) -> Session | None:
+    """Return the live Session for `session_id` if it's healthy on disk.
+
+    Used by the dedup fast path in /api/session and /api/import: if
+    the content hash already has a DB row AND a files dir AND
+    hydration still works, the caller discards its fresh copy and
+    returns the existing session. Any one of those checks failing
+    falls through to the fresh-upload path.
+    """
+    files_dir = _data_dir.session_files_dir_for(session_id)
+    if not storage.session_exists(session_id) or not files_dir.exists():
+        return None
+    existing = get_session(session_id)
+    if existing is not None:
+        return existing
+    try:
+        existing = _hydrate_session(app, session_id)
+    except FileNotFoundError:
+        return None
+    if existing is not None:
+        store_session(existing)
+    return existing
+
+
+def _promote_staging(
+    staging_dir: Path, session_id: str,
+) -> Path:
+    """Rename `staging_dir` to its content-hash final location.
+
+    Cleans up stale fragments (orphan DB row, orphan files dir) before
+    the rename so the move is always into an empty slot. Returns the
+    final dir. Caller must handle rollback on any exception raised
+    AFTER this function returns — by the time we're done, the staging
+    dir is gone.
+    """
+    storage.delete_session(session_id)  # no-op when absent
+    final_dir = _data_dir.session_files_dir_for(session_id)
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    staging_dir.rename(final_dir)
+    return final_dir
+
+
 def _hydrate_session(app: Flask, session_id: str) -> Session | None:
     """Reconstruct a Session from SQLite + on-disk files.
 
@@ -376,22 +433,58 @@ def create_app(repo_root: Path | None = None,
             except ValueError:
                 return jsonify(error=f'invalid base address: {base_str}'), 400
 
-        session_id = uuid.uuid4().hex[:12]
-        files_dir = _data_dir.session_files_dir_for(session_id)
-
-        def _rollback() -> None:
-            shutil.rmtree(files_dir, ignore_errors=True)
-
+        # Stage uploads first so we can compute the content hash and
+        # the final session id. Dedup happens BEFORE we waste work
+        # re-running run_analysis on inputs we've already persisted.
+        staging_dir = _staging_dir()
         try:
             primary_path, extra_paths, rsod_text = _copy_uploads_to_disk(
-                files_dir,
+                staging_dir,
                 request.files['rsod_log'],
                 request.files['symbol_file'],
                 request.files.getlist('extra_symbols[]'),
             )
         except OSError as e:
-            _rollback()
+            shutil.rmtree(staging_dir, ignore_errors=True)
             return jsonify(error=f'upload failed: {e}'), 500
+
+        session_id = storage.compute_session_id(staging_dir)
+
+        # Dedup fast path: same content hash as an existing healthy
+        # session → discard staging, return the existing session.
+        existing = _try_resolve_existing(app, session_id)
+        if existing is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(
+                session_id=session_id,
+                crash_summary=crash_info_to_dict(existing.result.crash_info),
+                frame_count=len(existing.result.frames),
+                deduplicated=True,
+            ), 200
+
+        # Fresh session — promote staging to the canonical files dir.
+        try:
+            files_dir = _promote_staging(staging_dir, session_id)
+        except OSError as e:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            # Rename race with a concurrent upload of identical
+            # content: the other request won, dedup-resolve instead.
+            existing = _try_resolve_existing(app, session_id)
+            if existing is not None:
+                return jsonify(
+                    session_id=session_id,
+                    crash_summary=crash_info_to_dict(existing.result.crash_info),
+                    frame_count=len(existing.result.frames),
+                    deduplicated=True,
+                ), 200
+            return jsonify(error=f'promote failed: {e}'), 500
+
+        # Paths in staging_dir became invalid on rename — rebuild.
+        primary_path = files_dir / primary_path.name
+        extra_paths = [files_dir / p.name for p in extra_paths]
+
+        def _rollback() -> None:
+            shutil.rmtree(files_dir, ignore_errors=True)
 
         try:
             ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
@@ -954,13 +1047,15 @@ def create_app(repo_root: Path | None = None,
             zf.writestr(
                 'metadata.json',
                 json.dumps(metadata, indent=2, sort_keys=True))
-            zf.writestr('rsod.txt', inputs.rsod_text)
-            # Every non-rsod file in the session's files dir goes into
-            # the bundle verbatim. rel_path is always a flat basename
-            # under files_dir; iterdir() is safe because _copy_uploads
-            # never creates subdirs.
+            # Every file in the session's files dir goes into the
+            # bundle verbatim — including rsod.txt read from disk, so
+            # the raw bytes survive the round trip. Re-encoding from
+            # inputs.rsod_text would lose any non-UTF-8 sequences in
+            # the original capture and change the content hash on
+            # import. rel_path is always a flat basename under
+            # files_dir (the upload path never creates subdirs).
             for item in files_dir.iterdir():
-                if item.name == 'rsod.txt' or not item.is_file():
+                if not item.is_file():
                     continue
                 zf.write(item, arcname=item.name)
         buf.seek(0)
@@ -981,41 +1076,65 @@ def create_app(repo_root: Path | None = None,
         if upload is None:
             return jsonify(error='file upload (zip bundle) required'), 400
 
-        new_id = uuid.uuid4().hex[:12]
-        files_dir = _data_dir.session_files_dir_for(new_id)
+        # Extract into staging, hash, then either dedup or promote.
+        # Same pattern as /api/session, different source of files.
+        staging_dir = _staging_dir()
+        try:
+            metadata = _extract_bundle(upload.stream, staging_dir)
+        except _BundleError as e:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(error=str(e)), 400
+        except zipfile.BadZipFile:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(error='not a valid zip archive'), 400
+        except OSError as e:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(error=f'bundle extraction failed: {e}'), 500
+
+        if not (staging_dir / 'rsod.txt').exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(error='bundle missing rsod.txt'), 400
+        primary_name = metadata.get('primary_filename') or ''
+        if not primary_name or not (staging_dir / primary_name).exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(
+                error=f'bundle missing primary symbol file {primary_name!r}'), 400
+
+        # Drop metadata.json BEFORE hashing — it's not part of the
+        # canonical input set, and keeping it in the hash would make
+        # the id depend on who exported the bundle (created_at,
+        # metadata schema_version, etc.) instead of on the crash
+        # inputs themselves.
+        try:
+            (staging_dir / 'metadata.json').unlink()
+        except FileNotFoundError:
+            pass
+
+        session_id = storage.compute_session_id(staging_dir)
+        bundle_original_id = metadata.get('session_id')
+
+        existing = _try_resolve_existing(app, session_id)
+        if existing is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(
+                session_id=session_id,
+                imported_from=bundle_original_id,
+                crash_summary=crash_info_to_dict(existing.result.crash_info),
+                frame_count=len(existing.result.frames),
+                deduplicated=True,
+            ), 200
+
+        try:
+            files_dir = _promote_staging(staging_dir, session_id)
+        except OSError as e:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(error=f'promote failed: {e}'), 500
 
         def _rollback() -> None:
             shutil.rmtree(files_dir, ignore_errors=True)
 
-        try:
-            metadata = _extract_bundle(upload.stream, files_dir)
-        except _BundleError as e:
-            _rollback()
-            return jsonify(error=str(e)), 400
-        except zipfile.BadZipFile:
-            _rollback()
-            return jsonify(error='not a valid zip archive'), 400
-        except OSError as e:
-            _rollback()
-            return jsonify(error=f'bundle extraction failed: {e}'), 500
-
-        rsod_path = files_dir / 'rsod.txt'
-        if not rsod_path.exists():
-            _rollback()
-            return jsonify(error='bundle missing rsod.txt'), 400
-
-        primary_name = metadata.get('primary_filename') or ''
-        if not primary_name:
-            _rollback()
-            return jsonify(error='bundle metadata missing primary_filename'), 400
+        # Reconstruct the "extras" list _analyze_from_disk expects.
         primary_path = files_dir / primary_name
-        if not primary_path.exists():
-            _rollback()
-            return jsonify(error=f'bundle missing {primary_name}'), 400
-
-        # Reconstruct the "extras" list the upload path expects.
-        # companion + pdb + extras all go in flat, _analyze_from_disk
-        # re-runs the pair/pdb classifier.
         extras: list[Path] = []
         for name_field in ('companion_filename', 'pdb_filename'):
             name = metadata.get(name_field)
@@ -1032,7 +1151,8 @@ def create_app(repo_root: Path | None = None,
                 return jsonify(error=f'bundle missing {name}'), 400
             extras.append(p)
 
-        rsod_text = rsod_path.read_text(encoding='utf-8', errors='replace')
+        rsod_text = (files_dir / 'rsod.txt').read_text(
+            encoding='utf-8', errors='replace')
 
         try:
             ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
@@ -1054,25 +1174,25 @@ def create_app(repo_root: Path | None = None,
         created_at = datetime.now(timezone.utc).isoformat()
         try:
             persist_session(
-                session_id=new_id, created_at=created_at, ctx=ctx,
+                session_id=session_id, created_at=created_at, ctx=ctx,
                 rsod_text=rsod_text,
                 primary_path=primary_path, companion_path=companion,
                 pdb_path=pdb_path, remaining_extras=remaining_extras,
                 base_override=metadata.get('base_override'),
                 dwarf_prefix=metadata.get('dwarf_prefix'),
-                imported_from=metadata.get('session_id'),
+                imported_from=bundle_original_id,
             )
         except Exception:
             _rollback()
             raise
 
         session = Session.from_analysis_context(
-            ctx, new_id, created_at=created_at)
+            ctx, session_id, created_at=created_at)
         store_session(session)
 
         return jsonify(
-            session_id=new_id,
-            imported_from=metadata.get('session_id'),
+            session_id=session_id,
+            imported_from=bundle_original_id,
             crash_summary=crash_info_to_dict(ctx.result.crash_info),
             frame_count=len(ctx.result.frames),
         ), 201

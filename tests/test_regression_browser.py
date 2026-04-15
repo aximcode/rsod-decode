@@ -181,7 +181,8 @@ def _upload_session(app, spec: DatasetSpec) -> str:
             for f in extra_fps:
                 f.close()
 
-    assert response.status_code == 201, response.get_json()
+    # 201 on fresh content, 200 on a dedup hit — either is valid.
+    assert response.status_code in (200, 201), response.get_json()
     return response.get_json()['session_id']
 
 
