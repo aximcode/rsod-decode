@@ -390,3 +390,145 @@ def test_session_persistence_across_restart(client, app) -> None:
     resp = fresh_client.delete(f"/api/session/{session_id}")
     assert resp.status_code == 200
     assert not files_dir.exists()
+
+
+def test_export_import_roundtrip(client, app) -> None:
+    """Upload → export zip → fresh client → import → matching frames.
+
+    Uses edk2_aa64 for the same LLDB-independence reason as the
+    persistence test. Asserts the imported session gets a new id,
+    records the original id as imported_from, and yields a backtrace
+    that matches the pre-export response.
+    """
+    import io
+    import json
+    import zipfile
+
+    spec = DATASET_SPECS["edk2_aa64"]
+    ctx = create_api_session(client, spec)
+    original_id = ctx.session_id
+
+    original_body = client.get(f"/api/session/{original_id}").get_json()
+
+    # Export as a zip bundle.
+    export_resp = client.get(f"/api/export/{original_id}")
+    assert export_resp.status_code == 200
+    assert export_resp.mimetype == "application/zip"
+    disposition = export_resp.headers.get("Content-Disposition", "")
+    assert ".rsod.zip" in disposition
+    assert original_id[:8] in disposition
+    zip_bytes = export_resp.data
+
+    # Peek inside the bundle — metadata.json + rsod.txt + at least
+    # the primary symbol file must be present, all as flat basenames.
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = set(zf.namelist())
+        assert "metadata.json" in names
+        assert "rsod.txt" in names
+        metadata = json.loads(zf.read("metadata.json").decode("utf-8"))
+        assert metadata["session_id"] == original_id
+        assert metadata["schema_version"] == 1
+        primary = metadata["primary_filename"]
+        assert primary in names
+        for name in names:
+            assert "/" not in name and "\\" not in name
+            assert name not in ("..", ".")
+
+    # Simulate a cross-install import on a fresh Flask app.
+    from rsod_decode.session import _sessions, evict_from_memory
+    from rsod_decode.app import create_app
+    evicted = _sessions.pop(original_id, None)
+    assert evicted is not None
+    evict_from_memory(evicted)
+
+    fresh_app = create_app(
+        repo_root=app.config["REPO_ROOT"],
+        dwarf_prefix=app.config["DWARF_PREFIX"],
+        source_paths=app.config.get("SOURCE_PATHS") or None,
+    )
+    fresh_app.config["TESTING"] = True
+    fresh_client = fresh_app.test_client()
+
+    import_resp = fresh_client.post(
+        "/api/import",
+        data={"file": (io.BytesIO(zip_bytes), "bundle.rsod.zip")},
+        content_type="multipart/form-data",
+    )
+    assert import_resp.status_code == 201, import_resp.get_json()
+    import_body = import_resp.get_json()
+    new_id = import_body["session_id"]
+    assert new_id != original_id
+    assert import_body["imported_from"] == original_id
+
+    # Backtrace should match the pre-export response on the new id.
+    new_body = fresh_client.get(f"/api/session/{new_id}").get_json()
+    assert len(new_body["frames"]) == len(original_body["frames"])
+    for a, b in zip(original_body["frames"], new_body["frames"]):
+        assert a["address"] == b["address"]
+
+    # History should show the imported row with imported_from set.
+    hist = fresh_client.get("/api/history").get_json()
+    new_row = next(s for s in hist["sessions"] if s["id"] == new_id)
+    assert new_row["imported_from"] == original_id
+
+    # Cleanup.
+    fresh_client.delete(f"/api/session/{new_id}")
+    fresh_client.delete(f"/api/session/{original_id}")
+
+
+def test_import_rejects_unsafe_bundles(client) -> None:
+    """Path traversal, absolute paths, symlinks, and oversized bundles
+    must all be rejected before any disk write lands in files_dir."""
+    import io
+    import json
+    import zipfile
+
+    def _make_bundle(members: list[tuple[str, bytes, int]]) -> bytes:
+        """Build a minimal bundle. members = (name, data, external_attr)."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            metadata = {"schema_version": 1, "session_id": "abc",
+                        "primary_filename": "primary.efi"}
+            zf.writestr("metadata.json", json.dumps(metadata))
+            for name, data, ext_attr in members:
+                info = zipfile.ZipInfo(name)
+                info.external_attr = ext_attr
+                zf.writestr(info, data)
+        return buf.getvalue()
+
+    def _post(bundle: bytes) -> tuple[int, dict]:
+        resp = client.post(
+            "/api/import",
+            data={"file": (io.BytesIO(bundle), "b.zip")},
+            content_type="multipart/form-data",
+        )
+        return resp.status_code, resp.get_json()
+
+    # Path traversal via ../
+    code, body = _post(_make_bundle([("../escape.efi", b"x", 0)]))
+    assert code == 400 and "unsafe" in body["error"].lower()
+
+    # Absolute path
+    code, body = _post(_make_bundle([("/etc/passwd", b"x", 0)]))
+    assert code == 400 and "unsafe" in body["error"].lower()
+
+    # Nested directory
+    code, body = _post(_make_bundle([("sub/dir/file.efi", b"x", 0)]))
+    assert code == 400
+
+    # Symlink (S_IFLNK = 0xA000 in upper 4 bits of external_attr high word)
+    symlink_attr = (0xA000) << 16
+    code, body = _post(_make_bundle([("link.efi", b"target", symlink_attr)]))
+    assert code == 400 and "symlink" in body["error"].lower()
+
+    # Missing file field entirely
+    resp = client.post("/api/import", data={}, content_type="multipart/form-data")
+    assert resp.status_code == 400
+
+    # Not a zip
+    resp = client.post(
+        "/api/import",
+        data={"file": (io.BytesIO(b"not a zip"), "b.zip")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 400

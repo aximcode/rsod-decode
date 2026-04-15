@@ -7,14 +7,27 @@ in-memory `_sessions` dict acts as a hot cache. On cache miss,
 """
 from __future__ import annotations
 
+import io
+import json
 import shutil
 import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from werkzeug.utils import secure_filename
+
+
+# Export/import bundle format version — bumped when metadata.json
+# gains required fields that older importers don't know about.
+BUNDLE_SCHEMA_VERSION = 1
+
+# Hard cap on the total uncompressed size of a /api/import bundle.
+# Primary guard against zip bombs. Set well above realistic symbol
+# bundles (PE + PDB + rsod is ~10-40 MB) but far below a fork bomb.
+BUNDLE_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MiB
 
 from . import data_dir as _data_dir, storage
 from .models import SymbolSource, clean_path, binary_for_frame, find_source_file
@@ -160,6 +173,7 @@ def persist_session(
     remaining_extras: list[Path],
     base_override: int | None,
     dwarf_prefix: str | None,
+    imported_from: str | None = None,
 ) -> None:
     """Insert one row + session_files entries for a freshly-uploaded session.
 
@@ -167,6 +181,8 @@ def persist_session(
     `data_dir.session_files_dir_for(session_id)` — only filenames
     (basenames relative to that dir) are stored in `session_files`.
     Used by both the HTTP upload handler and the CLI pre-load path.
+    `imported_from` is set by POST /api/import to preserve the
+    original session id from the bundle as provenance.
     """
     ci = ctx.result.crash_info
     files: list[storage.FileEntry] = [
@@ -202,7 +218,77 @@ def persist_session(
         base_override=base_override,
         dwarf_prefix=dwarf_prefix,
         files=files,
+        imported_from=imported_from,
     )
+
+
+class _BundleError(ValueError):
+    """Raised on a malformed or unsafe /api/import upload."""
+
+
+def _extract_bundle(stream, files_dir: Path) -> dict:
+    """Unpack an /api/import zip into `files_dir`, returning metadata.
+
+    Safety guards (applied BEFORE any disk write):
+    - Members must be regular files — reject dirs, symlinks, devices
+      (zipfile's external_attr upper bits expose the POSIX mode).
+    - Member names must be flat basenames — no directory separators,
+      no absolute paths, no `..` traversal, no empty/control chars.
+    - Total uncompressed size is capped at BUNDLE_MAX_UNCOMPRESSED to
+      shut down zip-bomb amplification before the extract loop runs.
+    - metadata.json must be present and parse as a dict with an
+      integer `schema_version` this server understands.
+    """
+    files_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(stream) as zf:
+        infos = zf.infolist()
+        total = 0
+        for info in infos:
+            name = info.filename
+            if not name or name != name.strip():
+                raise _BundleError(f'suspicious member name: {name!r}')
+            if name.endswith('/') or info.is_dir():
+                raise _BundleError(f'bundles must be flat (got dir: {name})')
+            # Reject anything that isn't a bare basename.
+            if '/' in name or '\\' in name or name in ('.', '..') \
+                    or Path(name).is_absolute():
+                raise _BundleError(f'unsafe path in bundle: {name!r}')
+            # Symlink detection via POSIX mode bits in external_attr.
+            mode = (info.external_attr >> 16) & 0xF000
+            if mode == 0xA000:  # S_IFLNK
+                raise _BundleError(f'symlink not allowed in bundle: {name}')
+            if info.file_size < 0:
+                raise _BundleError(f'negative size: {name}')
+            total += info.file_size
+            if total > BUNDLE_MAX_UNCOMPRESSED:
+                raise _BundleError(
+                    f'bundle exceeds {BUNDLE_MAX_UNCOMPRESSED // (1024 * 1024)} '
+                    'MiB uncompressed cap')
+
+        metadata_raw: bytes | None = None
+        for info in infos:
+            dst = files_dir / info.filename
+            with zf.open(info) as src_fp, dst.open('wb') as dst_fp:
+                shutil.copyfileobj(src_fp, dst_fp)
+            if info.filename == 'metadata.json':
+                metadata_raw = dst.read_bytes()
+
+    if metadata_raw is None:
+        raise _BundleError('bundle missing metadata.json')
+    try:
+        metadata = json.loads(metadata_raw.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise _BundleError(f'metadata.json not valid JSON: {e}') from e
+    if not isinstance(metadata, dict):
+        raise _BundleError('metadata.json must be a JSON object')
+    schema = metadata.get('schema_version')
+    if not isinstance(schema, int):
+        raise _BundleError('metadata.json missing integer schema_version')
+    if schema > BUNDLE_SCHEMA_VERSION:
+        raise _BundleError(
+            f'bundle schema_version {schema} newer than supported '
+            f'{BUNDLE_SCHEMA_VERSION}')
+    return metadata
 
 
 def _hydrate_session(app: Flask, session_id: str) -> Session | None:
@@ -833,7 +919,163 @@ def create_app(repo_root: Path | None = None,
             'crash_symbol': r.crash_symbol,
             'frame_count': r.frame_count,
             'backend': r.backend,
+            'imported_from': r.imported_from,
         } for r in rows])
+
+    # -----------------------------------------------------------------
+    # GET /api/export/<id> — download a session bundle (.rsod.zip)
+    # -----------------------------------------------------------------
+    @app.get('/api/export/<session_id>')
+    def export_session(session_id: str):
+        inputs = storage.hydrate_inputs(session_id)
+        if inputs is None:
+            return jsonify(error='session not found'), 404
+
+        files_dir = _data_dir.session_files_dir_for(session_id)
+        metadata = {
+            'schema_version': BUNDLE_SCHEMA_VERSION,
+            'session_id': session_id,
+            'created_at': inputs.created_at,
+            'rsod_filename': 'rsod.txt',
+            'primary_filename': inputs.primary_path.name,
+            'companion_filename': (
+                inputs.companion_path.name if inputs.companion_path else None),
+            'pdb_filename': (
+                inputs.pdb_path.name if inputs.pdb_path else None),
+            'extra_filenames': [p.name for p in inputs.extra_paths],
+            'base_override': inputs.base_override,
+            'dwarf_prefix': inputs.dwarf_prefix,
+        }
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(
+            buf, 'w', compression=zipfile.ZIP_DEFLATED,
+        ) as zf:
+            zf.writestr(
+                'metadata.json',
+                json.dumps(metadata, indent=2, sort_keys=True))
+            zf.writestr('rsod.txt', inputs.rsod_text)
+            # Every non-rsod file in the session's files dir goes into
+            # the bundle verbatim. rel_path is always a flat basename
+            # under files_dir; iterdir() is safe because _copy_uploads
+            # never creates subdirs.
+            for item in files_dir.iterdir():
+                if item.name == 'rsod.txt' or not item.is_file():
+                    continue
+                zf.write(item, arcname=item.name)
+        buf.seek(0)
+
+        date_part = (inputs.created_at or '').split('T', 1)[0] or 'unknown'
+        short_id = session_id[:8]
+        filename = f'crash-{date_part}-{short_id}.rsod.zip'
+        return send_file(
+            buf, mimetype='application/zip',
+            as_attachment=True, download_name=filename)
+
+    # -----------------------------------------------------------------
+    # POST /api/import — unpack a bundle, create a new session
+    # -----------------------------------------------------------------
+    @app.post('/api/import')
+    def import_session():
+        upload = request.files.get('file')
+        if upload is None:
+            return jsonify(error='file upload (zip bundle) required'), 400
+
+        new_id = uuid.uuid4().hex[:12]
+        files_dir = _data_dir.session_files_dir_for(new_id)
+
+        def _rollback() -> None:
+            shutil.rmtree(files_dir, ignore_errors=True)
+
+        try:
+            metadata = _extract_bundle(upload.stream, files_dir)
+        except _BundleError as e:
+            _rollback()
+            return jsonify(error=str(e)), 400
+        except zipfile.BadZipFile:
+            _rollback()
+            return jsonify(error='not a valid zip archive'), 400
+        except OSError as e:
+            _rollback()
+            return jsonify(error=f'bundle extraction failed: {e}'), 500
+
+        rsod_path = files_dir / 'rsod.txt'
+        if not rsod_path.exists():
+            _rollback()
+            return jsonify(error='bundle missing rsod.txt'), 400
+
+        primary_name = metadata.get('primary_filename') or ''
+        if not primary_name:
+            _rollback()
+            return jsonify(error='bundle metadata missing primary_filename'), 400
+        primary_path = files_dir / primary_name
+        if not primary_path.exists():
+            _rollback()
+            return jsonify(error=f'bundle missing {primary_name}'), 400
+
+        # Reconstruct the "extras" list the upload path expects.
+        # companion + pdb + extras all go in flat, _analyze_from_disk
+        # re-runs the pair/pdb classifier.
+        extras: list[Path] = []
+        for name_field in ('companion_filename', 'pdb_filename'):
+            name = metadata.get(name_field)
+            if name:
+                p = files_dir / name
+                if not p.exists():
+                    _rollback()
+                    return jsonify(error=f'bundle missing {name}'), 400
+                extras.append(p)
+        for name in metadata.get('extra_filenames') or []:
+            p = files_dir / name
+            if not p.exists():
+                _rollback()
+                return jsonify(error=f'bundle missing {name}'), 400
+            extras.append(p)
+
+        rsod_text = rsod_path.read_text(encoding='utf-8', errors='replace')
+
+        try:
+            ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
+                app,
+                rsod_text=rsod_text,
+                primary_path=primary_path,
+                extra_paths=extras,
+                base_override=metadata.get('base_override'),
+                dwarf_prefix=metadata.get('dwarf_prefix')
+                    or app.config.get('DWARF_PREFIX'),
+            )
+        except SymbolLoadError as e:
+            _rollback()
+            return jsonify(error=str(e)), 400
+        except Exception:
+            _rollback()
+            raise
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        try:
+            persist_session(
+                session_id=new_id, created_at=created_at, ctx=ctx,
+                rsod_text=rsod_text,
+                primary_path=primary_path, companion_path=companion,
+                pdb_path=pdb_path, remaining_extras=remaining_extras,
+                base_override=metadata.get('base_override'),
+                dwarf_prefix=metadata.get('dwarf_prefix'),
+                imported_from=metadata.get('session_id'),
+            )
+        except Exception:
+            _rollback()
+            raise
+
+        session = Session.from_analysis_context(
+            ctx, new_id, created_at=created_at)
+        store_session(session)
+
+        return jsonify(
+            session_id=new_id,
+            imported_from=metadata.get('session_id'),
+            crash_summary=crash_info_to_dict(ctx.result.crash_info),
+            frame_count=len(ctx.result.frames),
+        ), 201
 
     # -----------------------------------------------------------------
     # DELETE /api/session/<id> — drop in-memory + SQLite + files dir

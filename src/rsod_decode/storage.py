@@ -28,7 +28,7 @@ from pathlib import Path
 from . import data_dir as _data_dir
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 # =============================================================================
@@ -46,6 +46,7 @@ class HistoryRow:
     crash_symbol: str
     frame_count: int
     backend: str
+    imported_from: str | None = None
 
 
 @dataclass
@@ -68,6 +69,7 @@ class HydratedInputs:
     extra_paths: list[Path]
     base_override: int | None
     dwarf_prefix: str | None
+    imported_from: str | None = None
 
 
 # =============================================================================
@@ -124,7 +126,13 @@ def init_db() -> None:
                     PRIMARY KEY (session_id, rel_path)
                 );
             """)
-            conn.execute(f'PRAGMA user_version = {CURRENT_SCHEMA_VERSION}')
+            version = 1
+        if version < 2:
+            # Schema v2: track cross-install import provenance so Bob
+            # can see whose crash he imported from Alice.
+            conn.execute('ALTER TABLE sessions ADD COLUMN imported_from TEXT')
+            version = 2
+        conn.execute(f'PRAGMA user_version = {CURRENT_SCHEMA_VERSION}')
 
 
 # =============================================================================
@@ -147,6 +155,7 @@ def save_session(
     base_override: int | None,
     dwarf_prefix: str | None,
     files: list[FileEntry],
+    imported_from: str | None = None,
 ) -> None:
     """Insert one session row + its file metadata.
 
@@ -160,12 +169,13 @@ def save_session(
             INSERT INTO sessions (
                 id, created_at, rsod_format, image_name, image_base,
                 exception_desc, crash_pc, crash_symbol, frame_count,
-                backend, rsod_text, base_override, dwarf_prefix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                backend, rsod_text, base_override, dwarf_prefix,
+                imported_from
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (session_id, created_at, rsod_format, image_name, image_base,
              exception_desc, crash_pc, crash_symbol, frame_count,
-             backend, rsod_text, base_override, dwarf_prefix),
+             backend, rsod_text, base_override, dwarf_prefix, imported_from),
         )
         conn.executemany(
             """
@@ -189,7 +199,8 @@ def list_sessions(
             cur = conn.execute(
                 """
                 SELECT id, created_at, image_name, exception_desc,
-                       crash_pc, crash_symbol, frame_count, backend
+                       crash_pc, crash_symbol, frame_count, backend,
+                       imported_from
                 FROM sessions
                 WHERE created_at < ?
                 ORDER BY created_at DESC
@@ -201,7 +212,8 @@ def list_sessions(
             cur = conn.execute(
                 """
                 SELECT id, created_at, image_name, exception_desc,
-                       crash_pc, crash_symbol, frame_count, backend
+                       crash_pc, crash_symbol, frame_count, backend,
+                       imported_from
                 FROM sessions
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -218,6 +230,7 @@ def list_sessions(
                 crash_symbol=row['crash_symbol'] or '',
                 frame_count=row['frame_count'] or 0,
                 backend=row['backend'] or 'pyelftools',
+                imported_from=row['imported_from'],
             )
             for row in cur.fetchall()
         ]
@@ -240,7 +253,8 @@ def hydrate_inputs(session_id: str) -> HydratedInputs | None:
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT id, created_at, rsod_text, base_override, dwarf_prefix
+            SELECT id, created_at, rsod_text, base_override, dwarf_prefix,
+                   imported_from
             FROM sessions WHERE id = ?
             """,
             (session_id,),
@@ -285,6 +299,7 @@ def hydrate_inputs(session_id: str) -> HydratedInputs | None:
         extra_paths=extras,
         base_override=row['base_override'],
         dwarf_prefix=row['dwarf_prefix'],
+        imported_from=row['imported_from'],
     )
 
 

@@ -50,6 +50,9 @@ in a navigable interface instead of a flat text file.
 │  /api/source/<id>/<n>  GET  source file context      │
 │  /api/resolve/<id>     POST resolve arbitrary addr   │
 │  /api/backend/<id>     POST switch DWARF backend     │
+│  /api/history          GET  list persisted sessions  │
+│  /api/export/<id>      GET  download .rsod.zip bundle│
+│  /api/import           POST upload a bundle          │
 │  /ws/lldb/<id>         WS   LLDB terminal bridge     │
 │  /ws/gdb/<id>          WS   GDB/MI terminal bridge   │
 │                                                      │
@@ -59,8 +62,11 @@ in a navigable interface instead of a flat text file.
 │  │  gdb_backend + symbols + corefile + esr         │ │
 │  └─────────────────────────────────────────────────┘ │
 │                                                      │
-│  In-memory session store (session._sessions dict,    │
-│  LRU-evicted at 50 entries, process-local)           │
+│  SQLite session store at ~/.rsod-debug/sessions.db,  │
+│  in-memory _sessions dict is an LRU hot cache in     │
+│  front. Evicted or cross-restart sessions hydrate    │
+│  on demand by replaying service.run_analysis against │
+│  the files persisted under ~/.rsod-debug/files/<id>/.│
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -76,7 +82,7 @@ in a navigable interface instead of a flat text file.
 | ELF+DWARF / PE+PDB (richer) | system LLDB via lldb_loader | Runtime var resolution, corefile unwind, minidump unwind |
 | ELF+DWARF (cross-check) | GDB/MI via pygdbmi | Second opinion for CFI unwinding + expr eval |
 | Demangling | cxxfilt | C++ name demangling |
-| Session store | In-memory dict, LRU | Process-local; sessions die with the server |
+| Session store | SQLite + in-memory LRU cache | Persistent history + permalinks; re-hydrates via `service.run_analysis` on restart |
 | Browser launch | stdlib `webbrowser` | Default tab open — no native-window bindings |
 | Distribution | stdlib zipapp (`rsod.pyzw`) | Single file; first-run extracts capstone + frontend/dist |
 
@@ -314,16 +320,43 @@ session's shared LLDB/GDB state, so the user can run ad-hoc
 commands (`register read`, `expression`, etc.) without leaving the
 browser.
 
-### What's not in the API
+### Session History
 
-No history, no permalinks, no cross-instance export/import. Sessions
-live and die with the server process — the analyzer is a local dev
-tool, and the source-of-truth artifacts (RSOD capture + symbol
-files) already live on the user's filesystem.
+```
+GET /api/history?limit=100&before=<iso-ts>
+  Response: { sessions[]: {
+    id, created_at, image_name, exception_desc,
+    crash_pc, crash_symbol, frame_count, backend,
+    imported_from   // provenance pointer if created via /api/import
+  }}
+```
 
-The in-browser URL hash `#session/<id>` is purely a client-side
-route the React SPA uses to remember which session is being
-viewed across refreshes — it is not a persistent permalink.
+Drives the history list in the upload view. Sessions are ordered
+newest-first; `before` pages backward through older rows.
+
+### Export / Import Bundles
+
+```
+GET /api/export/<id>
+  Response: application/zip
+  Content-Disposition: attachment; filename="crash-<date>-<short8>.rsod.zip"
+
+POST /api/import
+  Body: multipart/form-data
+    file: <zip bundle produced by /api/export>
+  Response: { session_id, imported_from, crash_summary, frame_count }
+```
+
+The bundle is a flat zip containing `metadata.json`, `rsod.txt`,
+and every symbol file from the session's `files/<id>/` directory.
+`/api/import` mints a new `session_id` locally and records the
+original id as `imported_from` so provenance survives the hop.
+See "Session Storage" below for the metadata schema and zip
+safety contract.
+
+Permalinks across restarts come for free: `#session/<id>` hits
+`GET /api/session/<id>`, which hydrates from SQLite on cache miss
+by re-running `service.run_analysis` against the persisted inputs.
 
 ## Project Structure
 
@@ -340,6 +373,8 @@ rsod-decode/
 │   │                         + source_loc backfill + tail-call reconstruction
 │   │                         + frame-level resolve_frame_vars
 │   ├── session.py          — Session dataclass + from/as_analysis_context
+│   ├── storage.py          — SQLite session store (schema v2, migrations)
+│   ├── data_dir.py         — ~/.rsod-debug/ path + RSOD_DATA_DIR override
 │   ├── pdb_routing.py      — MSVC PE / .map / .pdb companion detection
 │   ├── resource_paths.py   — frontend_dist() helper (pyzw-aware)
 │   ├── serializers.py      — VarInfo → dict + crash_info_to_dict
@@ -401,7 +436,8 @@ rsod-decode/
    c. extract_crash_info() → CrashInfo
    d. resolve addresses → line_info per module
    e. decode_x86() or decode_arm64() → annotated lines + frames
-   f. Store Session in the in-memory dict (LRU-evicted at 50)
+   f. Persist inputs to SQLite + copy files to ~/.rsod-debug/files/<id>/,
+      then stuff the in-memory Session into the LRU-evicted hot cache
    g. Return session_id + crash summary + frame list
    ↓
 4. Frontend loads session, shows crash banner + backtrace
@@ -518,32 +554,132 @@ Distribution constraints:
 
 ## Session Storage
 
-In-memory only. [src/rsod_decode/session.py](src/rsod_decode/session.py)
-owns a module-level `_sessions: dict[str, Session]` capped at
-`MAX_SESSIONS = 50`. When the cap is hit, the oldest entry is
-evicted via `cleanup_session` — which closes the LLDB/GDB
-backends, closes the pyelftools binary, and `shutil.rmtree`s the
-per-session temp dir.
+### Persistent layer
 
-Every `Session` holds:
+SQLite at `~/.rsod-debug/sessions.db` (override via
+`RSOD_DATA_DIR`). [src/rsod_decode/storage.py](src/rsod_decode/storage.py)
+owns the schema + CRUD, [src/rsod_decode/data_dir.py](src/rsod_decode/data_dir.py)
+owns the path resolution. The design hinge is that **storage holds
+inputs, not results**: each row records the rsod text + form fields
++ a list of symbol files, and `service.run_analysis` is re-run on
+every hydration. The analysis is deterministic, so there's no
+versioned result format to migrate and no drift between stored and
+recomputed frames.
+
+Schema v2:
+
+```
+sessions(
+    id, created_at, rsod_format, image_name, image_base,
+    exception_desc, crash_pc, crash_symbol, frame_count,
+    backend, rsod_text, base_override, dwarf_prefix,
+    imported_from   -- v2: original id when the row came from /api/import
+) WITHOUT ROWID;
+
+session_files(
+    session_id, filename, file_type, rel_path
+)  -- file_type ∈ {'primary','companion','pdb','extra'}
+```
+
+On-disk layout:
+
+```
+~/.rsod-debug/
+├── sessions.db
+└── files/<session_id>/
+    ├── rsod.txt
+    ├── <primary symbol file>
+    ├── <companion>        (MSVC map or pe, if any)
+    ├── <pdb>              (if any)
+    └── <extra symbol files>
+```
+
+Schema version is tracked via `PRAGMA user_version`.
+`storage.init_db()` is idempotent and runs inline migrations
+(v1 → v2 is a single `ALTER TABLE`).
+
+### In-memory hot cache
+
+[src/rsod_decode/session.py](src/rsod_decode/session.py) keeps a
+module-level `_sessions: dict[str, Session]` capped at
+`MAX_SESSIONS = 50` in front of SQLite. Cleanup is split into two
+paths:
+
+- `evict_from_memory` — closes LLDB/GDB backends, drops the pyelftools
+  binary, clears `frame_cache`, and removes the session from the
+  dict. **Leaves persistent files and the SQLite row alone.** Used
+  for LRU eviction.
+- `delete_session` — everything `evict_from_memory` does, plus
+  `storage.delete_session(id)` which drops the row and
+  `rmtree`s `files/<id>/`. Only called from `DELETE /api/session/<id>`.
+
+Every `Session` in memory holds:
 
 - `result: AnalysisResult` — the shared core's parse output (frames,
   registers, stack mem, call_verified map)
 - `source` / `extra_sources` — `SymbolSource` for the primary module
   + each extra the user uploaded
 - `rsod_text` — the raw upload, cached for the `/api/session` GET
-- `temp_dir` — per-session scratch (corefile, extracted uploads,
-  etc.); removed in cleanup
+- `temp_dir` — short-lived scratch (GDB terminal corefile, etc.);
+  **not** the persistent files dir. `None` until a bridge needs it
 - `lldb_dwarf` / `gdb_dwarf` — richer backend instances, populated
   lazily by service.run_analysis / service.reinit_backend
 - `frame_cache: dict[int, dict]` — per-frame JSON response cache so
   repeated `/api/frame/<id>/<n>` hits don't re-run DWARF walks
 
-Sessions are process-local: restarting `rsod serve` wipes them.
-There's no history, no permalinks, no persistence to disk. This is
-a deliberate simplification — the analyzer is a local dev tool, not
-a shared service, and the source-of-truth artifacts (RSOD capture,
-symbol files) already live on the user's filesystem.
+Restarting `rsod serve` now preserves history: on first access to an
+evicted or cross-restart session, `_get_session` calls
+`storage.hydrate_inputs`, re-runs `service.run_analysis` against the
+persisted files, and stuffs the result back into the in-memory
+dict. Permalinks (`#session/<id>`) work through the same path.
+
+### Export / import bundle format
+
+A `GET /api/export/<id>` response is a flat zip:
+
+```
+crash-<date>-<short8>.rsod.zip
+├── metadata.json     — schema_version, session_id, file roles
+├── rsod.txt          — original capture
+├── <primary>         — symbol file (basename only)
+├── <companion>       — MSVC map or pe, if present
+├── <pdb>             — if present
+└── <extras>…         — additional symbol files
+```
+
+`metadata.json` schema (v1):
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "<original id>",
+  "created_at": "<iso>",
+  "rsod_filename": "rsod.txt",
+  "primary_filename": "<basename>",
+  "companion_filename": "<basename or null>",
+  "pdb_filename": "<basename or null>",
+  "extra_filenames": ["<basename>", "…"],
+  "base_override": <int or null>,
+  "dwarf_prefix": "<str or null>"
+}
+```
+
+`POST /api/import` accepts the same shape and runs it through
+`_extract_bundle`, which enforces (before touching disk):
+
+- Member names must be flat basenames — rejects `..`, absolute
+  paths, `/` or `\` separators, empty / whitespace-only names.
+- Directories, symlinks (via POSIX mode `S_IFLNK` in the zip's
+  `external_attr` high word), and other non-regular members are
+  rejected outright.
+- Total uncompressed size is capped at `BUNDLE_MAX_UNCOMPRESSED`
+  (500 MiB) — the zip-bomb backstop.
+- `metadata.json` must parse as a JSON object with an integer
+  `schema_version ≤ BUNDLE_SCHEMA_VERSION`.
+
+Imports always mint a new `session_id` and record the original in
+`sessions.imported_from`, so two installs never collide on the
+same id.
 
 ## What We Reuse vs Build New
 
