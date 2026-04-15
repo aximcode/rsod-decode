@@ -44,14 +44,11 @@ def main() -> None:
                         help='Additional symbol files for multi-module traces')
     parser.add_argument('--base', type=str, default=None,
                         help='Override image base address (hex)')
-    parser.add_argument('--source-root', type=Path, default=None,
-                        help='Local source tree root for source context')
     parser.add_argument('--source-path', type=Path, action='append',
                         default=[], dest='source_paths',
-                        help='Additional source tree to search when the '
-                             'DWARF file path is not under the primary '
-                             'source root (repeatable; e.g. '
-                             '~/projects/aximcode/axl-sdk)')
+                        help='Source tree to search for DWARF/PDB source '
+                             'files (repeatable; auto-detected rsod-decode '
+                             'repo is always searched as a fallback)')
     parser.add_argument('--tag', type=str, default=None,
                         help='Git tag for source context (e.g. v1.0.3)')
     parser.add_argument('--commit', type=str, default=None,
@@ -86,16 +83,18 @@ def main() -> None:
             repo_root = parent
             break
 
-    # Default source root: repo root or inferred from script location
-    primary_source_root = args.source_root
-    if primary_source_root is None:
-        primary_source_root = repo_root or Path(__file__).resolve().parents[3]
+    # Validate --source-path args eagerly so typos don't silently
+    # degrade to "source file not found" later.
     for sp in args.source_paths:
         if not sp.is_dir():
             sys.exit(f"Error: --source-path directory not found: {sp}")
+    # Every --source-path comes first (highest-priority search roots)
+    # and we always fall back to the auto-detected rsod-decode repo
+    # so in-tree fixtures keep working without extra flags.
+    fallback_root = repo_root or Path(__file__).resolve().parents[3]
     source_root: Path | list[Path] = (
-        [primary_source_root, *args.source_paths]
-        if args.source_paths else primary_source_root)
+        [*args.source_paths, fallback_root]
+        if args.source_paths else fallback_root)
 
     # Resolve git ref (tag or commit) for source context
     git_ref: GitRef | None = None

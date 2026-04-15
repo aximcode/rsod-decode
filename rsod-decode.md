@@ -160,8 +160,9 @@ Source lines around the crash point (if source tree is accessible or
      296:     return rc;
 ```
 
-Use `--source-root` to specify the local source tree, or `--tag`/`--commit`
-to read source from a specific git revision.
+Use `--source-path` to point at an out-of-tree source checkout
+(repeatable), or `--tag`/`--commit` to read source from a specific
+git revision of the auto-detected rsod-decode repo.
 
 ## Options
 
@@ -171,7 +172,7 @@ to read source from a specific git revision.
 | `-v, --verbose` | Show disassembly, source context, and parameters |
 | `-s FILE` | Additional symbol file for multi-module traces (repeatable) |
 | `--base HEX` | Override image base address (hex, e.g. `5948A000`) |
-| `--source-root PATH` | Local source tree root for source context |
+| `--source-path PATH` | Source tree to search (repeatable; auto-detected rsod-decode repo is always a fallback) |
 | `--tag TAG` | Git tag for source context (reads source at that revision) |
 | `--commit HASH` | Git commit hash for source context |
 
