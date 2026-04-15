@@ -271,12 +271,20 @@ def main() -> None:
         # sees only the stub PEBinary surface; the reconstruction
         # re-materializes any frames MSVC's tail-call optimizer
         # elided so the UI backtrace matches the source call chain.
+        # `roots` feeds both the backfill's brace-line normalizer
+        # and the reconstructor's synthetic-frame normalizer so
+        # single-instruction tail-call wrappers don't leave the
+        # highlight sitting on a bare `{`.
         from .app import (
             _backfill_source_loc_from_richer_backend,
             _reconstruct_tail_call_frames,
         )
-        _backfill_source_loc_from_richer_backend(sess)
-        _reconstruct_tail_call_frames(sess)
+        cli_source_roots: list[Path] = []
+        if repo_root is not None:
+            cli_source_roots.append(repo_root)
+        cli_source_roots.extend(args.source_paths or [])
+        _backfill_source_loc_from_richer_backend(sess, cli_source_roots)
+        _reconstruct_tail_call_frames(sess, cli_source_roots)
 
         register_session(sess)
 

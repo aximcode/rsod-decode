@@ -336,17 +336,17 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
             # decoder's FP/scan walker doesn't set frame[0].symbol
             # since trigger_gp_fault is a tail-called leaf — we pin
             # the `vector` param via the richer backend instead.
-            # Frame 0 is trigger_gp_fault (crash frame). The PDB
-            # line table maps the faulting PC to the function
-            # opening brace (an MSVC PDB quirk for single-
-            # statement functions); the disasm target is the
-            # `movabsq $-0x2152ffff21530000, %rax` instruction
-            # that loads the 0xDEAD0000DEAD0000 sentinel pointer
-            # the function is about to dereference.
+            # Frame 0 is trigger_gp_fault (crash frame). MSVC's
+            # PDB maps the faulting PC to line 212 (the function
+            # opening brace); after `_advance_past_brace_line`
+            # walks past the `{`, the `(void)vector;` no-op, and
+            # the `// Store to...` comment, the highlight lands
+            # on the faulting store:
+            #   *(volatile UINT64 *)0xDEAD0000DEAD0000ULL = 0;
             0: _Frame("trigger_gp_fault",
                       source_file="psaentry.c",
                       is_synthetic=False,
-                      source_line_text="{",
+                      source_line_text="0xDEAD0000DEAD0000",
                       disasm_target_mnemonic="movabsq",
                       params=(("vector", "unsigned"),),
                       # psaentry.c dispatch_crash line:
@@ -375,12 +375,13 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
                       source_line_text="dispatch_crash(",
                       disasm_target_mnemonic="jmp"),
             # prepare_crash_context is a 1-instruction wrapper;
-            # its source_loc lands on the function's opening
-            # brace (PDB mapping for single-line functions).
+            # its PDB line entry sits on the function's `{`, but
+            # the brace-advance normalizer walks forward to the
+            # single statement `validate_environment(ctx);`.
             3: _Frame("prepare_crash_context",
                       source_file="psaentry.c",
                       is_synthetic=True,
-                      source_line_text="{",
+                      source_line_text="validate_environment(ctx)",
                       disasm_target_mnemonic="jmp"),
             4: _Frame("initialize_test",
                       source_file="psaentry.c",

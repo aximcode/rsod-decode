@@ -4,6 +4,7 @@ Phase 1: In-memory session storage, file uploads to temp dir.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 import uuid
@@ -82,7 +83,112 @@ def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
     return session, None
 
 
-def _backfill_source_loc_from_richer_backend(session: Session) -> None:
+# `//` and `/*` are unambiguous comment markers. We deliberately
+# do NOT include `*` here even though continuation lines of block
+# comments start with it — `*ptr` dereference expressions also
+# start with it, and distinguishing requires tracking block-
+# comment state across lines. We accept that a multi-line block
+# comment inside the advance window could lead to a skip-miss
+# (returning the `*` continuation as "code"), which in practice
+# almost never happens because normal C doesn't put block-comment
+# bodies between `{` and the first real statement.
+_COMMENT_START_PREFIXES = ('//', '/*')
+# `(void)argc;` et al. — MSVC-friendly unused-parameter suppression
+# that shows up right inside function bodies. We skip these when
+# advancing past a bare `{` so the highlight lands on the first
+# genuinely executable statement, not the cast-to-void.
+_UNUSED_PARAM_RE = re.compile(r'^\(void\)\w+\s*;\s*(?://.*)?$')
+
+
+def _source_search_roots(app: Flask) -> list[Path]:
+    """Return the ordered list of source-tree roots to feed to
+    `find_source_file` / `_advance_past_brace_line`. Mirrors the
+    order used by `/api/source`: REPO_ROOT first, then each
+    `--source-path` the operator configured.
+    """
+    roots: list[Path] = []
+    repo_root = app.config.get('REPO_ROOT')
+    if repo_root is not None:
+        roots.append(repo_root)
+    roots.extend(app.config.get('SOURCE_PATHS') or [])
+    return roots
+
+
+def _advance_past_brace_line(
+    source_loc: str, roots: list[Path],
+) -> str:
+    """Normalize a `file:line` past an opening-brace-only line.
+
+    MSVC's PDB frequently maps a faulting or tail-call `jmp`
+    instruction back to the function's opening `{` rather than
+    the first executable statement — especially for single-
+    instruction tail-call wrappers and for the first instruction
+    of any function. That gives the UI a highlight sitting on
+    `{` instead of on the line the code is actually running.
+
+    This helper reads the source file (when reachable via
+    `roots`), and if the `file:line` target is a line whose
+    stripped contents are just `{` (or empty, or a comment),
+    walks forward up to 8 lines looking for the first line
+    containing real code. Returns the original `source_loc`
+    unchanged when the file isn't reachable or the line already
+    contains real code, so stale offsets never silently shift.
+    """
+    if not source_loc or ':' not in source_loc:
+        return source_loc
+    file_part, line_part = source_loc.rsplit(':', 1)
+    try:
+        target_line = int(line_part)
+    except ValueError:
+        return source_loc
+    if target_line < 1:
+        return source_loc
+
+    abs_path = Path(file_part)
+    src_path: Path | None = None
+    if abs_path.is_absolute() and abs_path.is_file():
+        src_path = abs_path
+    else:
+        src_path = find_source_file(roots, file_part, target_line)
+    if src_path is None:
+        return source_loc
+
+    try:
+        lines = src_path.read_text(
+            encoding='utf-8', errors='replace').splitlines()
+    except OSError:
+        return source_loc
+
+    def _is_code(text: str) -> bool:
+        t = text.strip()
+        if not t:
+            return False
+        if t in ('{', '}'):
+            return False
+        if t.startswith(_COMMENT_START_PREFIXES):
+            return False
+        if _UNUSED_PARAM_RE.match(t):
+            return False
+        return True
+
+    idx = target_line - 1
+    if idx >= len(lines):
+        return source_loc
+    if _is_code(lines[idx]):
+        return source_loc
+
+    for delta in range(1, 9):
+        probe = idx + delta
+        if probe >= len(lines):
+            break
+        if _is_code(lines[probe]):
+            return f'{file_part}:{target_line + delta}'
+    return source_loc
+
+
+def _backfill_source_loc_from_richer_backend(
+    session: Session, roots: list[Path] | None = None,
+) -> None:
     """Fill missing per-frame `source_loc` and `symbol` via the
     session's richer backend.
 
@@ -110,11 +216,18 @@ def _backfill_source_loc_from_richer_backend(session: Session) -> None:
     function name when `frame.symbol` is missing, so downstream
     consumers (tail-call reconstructor, serializer) see a populated
     symbol even for addresses the static .map didn't know about.
+
+    When `roots` is supplied, every newly-assigned source_loc is
+    passed through `_advance_past_brace_line` so MSVC's habit of
+    mapping tail-call jmps and leaf-function instructions to the
+    function's opening `{` gets normalized to the first real
+    statement.
     """
     backend = session.lldb_dwarf or session.gdb_dwarf
     if backend is None:
         return
     from .models import MapSymbol
+    roots = list(roots or [])
     for f in session.result.frames:
         if f.source_loc and f.symbol:
             continue
@@ -125,14 +238,16 @@ def _backfill_source_loc_from_richer_backend(session: Session) -> None:
         if info is None:
             continue
         if info.source_loc and not f.source_loc:
-            f.source_loc = info.source_loc
+            f.source_loc = _advance_past_brace_line(info.source_loc, roots)
         if info.function and f.symbol is None:
             f.symbol = MapSymbol(
                 address=f.address, name=info.function,
                 object_file=f.module or '', is_function=True)
 
 
-def _reconstruct_tail_call_frames(session: Session) -> None:
+def _reconstruct_tail_call_frames(
+    session: Session, roots: list[Path] | None = None,
+) -> None:
     """Re-materialize frames elided by compiler tail-call optimization.
 
     Walks the existing frame list through the LLDB backend's
@@ -142,6 +257,10 @@ def _reconstruct_tail_call_frames(session: Session) -> None:
     synthetic frames are marked `is_synthetic=True` so we skip them
     on subsequent passes. Does nothing when no LLDB backend is
     attached or when no tail calls are detected.
+
+    When `roots` is supplied, each synthetic frame's source_loc is
+    passed through `_advance_past_brace_line` so 1-instruction
+    wrapper functions don't leave the UI highlighting a bare `{`.
     """
     if session.lldb_dwarf is None:
         return
@@ -157,6 +276,10 @@ def _reconstruct_tail_call_frames(session: Session) -> None:
     rebuilt = reconstruct_tail_calls(original, session.lldb_dwarf)
     if len(rebuilt) == len(original):
         return
+    if roots:
+        for f in rebuilt:
+            if f.is_synthetic and f.source_loc:
+                f.source_loc = _advance_past_brace_line(f.source_loc, roots)
     session.result.frames = rebuilt
     session.frame_cache.clear()
 
@@ -318,14 +441,15 @@ def create_app(repo_root: Path | None = None,
         # static PEBinary for psa_x64.efi — PEBinary has no line info.
         # Once the richer LLDB backend is attached, walk the frames
         # and populate missing `source_loc` entries from the PDB.
-        _backfill_source_loc_from_richer_backend(session)
+        source_roots = _source_search_roots(app)
+        _backfill_source_loc_from_richer_backend(session, source_roots)
 
         # Synthesize frames elided by tail-call optimization. MSVC
         # happily collapses thin wrappers into `jmp` chains so the
         # runtime stack is shallower than the source call chain;
         # LLDB's disassembly annotations let us reconstruct the
         # missing links and mark them `is_synthetic=True`.
-        _reconstruct_tail_call_frames(session)
+        _reconstruct_tail_call_frames(session, source_roots)
 
         store_session(session)
 
@@ -675,6 +799,29 @@ def create_app(repo_root: Path | None = None,
         insns = binary.disassemble_around(target_addr, context)
         src_map = binary.source_lines_for_addrs([a for a, _, _ in insns])
 
+        # Normalize per-instruction source annotations so the
+        # Disasm tab's grey line-header text matches whatever the
+        # Source tab is highlighting. Without this step an
+        # instruction sitting at the function entry would show
+        # "psaentry.c:272" (the `{`) while the Source tab shows
+        # line 273 (the first real statement) — the exact drift
+        # the regression tests now pin against.
+        roots = _source_search_roots(app)
+        if roots:
+            advance_cache: dict[str, str] = {}
+
+            def _advance(src: str) -> str:
+                if not src:
+                    return src
+                cached = advance_cache.get(src)
+                if cached is not None:
+                    return cached
+                adjusted = _advance_past_brace_line(src, roots)
+                advance_cache[src] = adjusted
+                return adjusted
+
+            src_map = {a: _advance(s) for a, s in src_map.items()}
+
         instructions = []
         for addr, mnemonic, op_str in insns:
             instructions.append({
@@ -868,7 +1015,8 @@ def create_app(repo_root: Path | None = None,
 
         session.backend = target
         session.frame_cache.clear()
-        _backfill_source_loc_from_richer_backend(session)
+        _backfill_source_loc_from_richer_backend(
+            session, _source_search_roots(app))
         return jsonify(backend=session.backend)
 
     # -----------------------------------------------------------------
