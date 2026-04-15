@@ -1058,6 +1058,26 @@ def test_api_tail_call_reconstruction_psa_x64_forcecrash(
         assert params4["build_id"]["string_preview"] == "crashtest-v3", (
             f"expected build_id preview 'crashtest-v3', got "
             f"{params4['build_id'].get('string_preview')!r}")
+        # The reconstructor should also have made `config` expandable
+        # via SBTarget.CreateValueFromAddress + the synthetic var_key
+        # cache, so the UI's expand arrow wires through `/api/expand`.
+        assert params4["config"]["is_expandable"] is True, (
+            f"expected initialize_test.config to be expandable via "
+            f"synthetic SBValue cache, got {params4['config']!r}")
+        config_key = params4["config"]["var_key"]
+        assert config_key, "config has no var_key for /api/expand"
+        expand_resp = client.get(
+            f"/api/expand/{ctx.session_id}/4"
+            f"?addr=0x{params4['config']['expand_addr']:X}"
+            f"&var_key={config_key}")
+        assert expand_resp.status_code == 200
+        fields = {
+            f["name"]: f for f in expand_resp.get_json()["fields"]
+        }
+        assert fields["version"]["value"] == 3, fields["version"]
+        assert fields["flags"]["value"] == 0x1234, fields["flags"]
+        assert fields["session_id"]["value"] == 0xDEAD0000CAFE0000, \
+            fields["session_id"]
 
         # Frame 5 (run_crashtest, synthetic) — `argc` is the
         # cross-frame propagation case: the chase in

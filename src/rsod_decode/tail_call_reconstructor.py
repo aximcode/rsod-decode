@@ -70,10 +70,30 @@ def _looks_like_char_pointer(type_name: str) -> bool:
     return 'char' in t.lower() or 'CHAR' in t
 
 
+def _strip_pointer_suffix(type_name: str) -> str | None:
+    """For a ``T *`` type name, return the canonical ``T``. Strips
+    qualifiers (``const``, ``volatile``) and struct/class/union
+    prefixes. Returns ``None`` if ``type_name`` isn't a pointer or
+    ``char``-ish (those are handled by the C-string preview path).
+    """
+    t = type_name.strip()
+    if not t.endswith('*'):
+        return None
+    t = t[:-1].strip()
+    for prefix in ('const ', 'volatile ',
+                   'struct ', 'class ', 'union '):
+        while t.startswith(prefix):
+            t = t[len(prefix):].strip()
+    if not t or 'char' in t.lower():
+        return None
+    return t
+
+
 def _callsite_args_to_varinfos(
     backend: LldbBackend,
     function_name: str,
     working_set: dict[str, CallsiteArg],
+    frame_pc: int,
 ) -> list[VarInfo]:
     """Build a VarInfo list from the resolved callsite args for a
     function with a known PDB parameter signature.
@@ -86,9 +106,16 @@ def _callsite_args_to_varinfos(
     floating-point arguments are not reconstructed today — they'd
     need stack-spill analysis and XMM state respectively.
 
-    For ``char *``-ish params with a resolved pointer value, we also
-    read a short C-string preview via the backend so the UI shows
-    ``build_id = 0x1800f7438 "crashtest-v3"``.
+    Pointer enrichment: for ``char *``-ish params with a resolved
+    pointer value, we read a short C-string preview via the backend
+    so the UI shows ``build_id = 0x1800f7438 "crashtest-v3"``. For
+    pointers to struct/class/union types we create a synthetic
+    SBValue at the pointed-at address via
+    `LldbBackend.make_struct_pointer_value` and wire up
+    ``is_expandable``/``expand_addr``/``var_key`` so the UI's expand
+    arrow can walk the struct through the normal `/api/expand`
+    path. ``frame_pc`` keys the cache so var_keys are unique across
+    frames.
     """
     params = backend.get_function_parameters(function_name)
     out: list[VarInfo] = []
@@ -110,6 +137,15 @@ def _callsite_args_to_varinfos(
             preview = backend._read_cstring_via_process(arg.value)
             if preview:
                 var.string_preview = preview
+        else:
+            pointee = _strip_pointer_suffix(type_name)
+            if pointee:
+                var_key = backend.make_struct_pointer_value(
+                    name, arg.value, pointee, frame_pc)
+                if var_key:
+                    var.is_expandable = True
+                    var.expand_addr = arg.value
+                    var.var_key = var_key
         out.append(var)
     return out
 
@@ -184,7 +220,8 @@ def reconstruct_tail_calls(
             _propagate_entry_args_from_parent(
                 child_entry_args, parent)
             child.callsite_params = _callsite_args_to_varinfos(
-                backend, child_sym, child_entry_args)
+                backend, child_sym, child_entry_args,
+                frame_pc=child.address)
 
     # Pass 2: build the output frame list in crash-first order with
     # synthetic frames spliced in.
@@ -350,7 +387,7 @@ def _resolve_chain_and_args(
             address=jmp_addr, name=name,
             object_file=parent_module or '', is_function=True)
         callsite_params = _callsite_args_to_varinfos(
-            backend, name, entry_args)
+            backend, name, entry_args, frame_pc=jmp_addr)
         synthetic_frames.append(FrameInfo(
             index=0,  # re-indexed by caller
             address=jmp_addr,

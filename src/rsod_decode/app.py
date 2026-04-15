@@ -573,6 +573,18 @@ def create_app(repo_root: Path | None = None,
                     if not dst.get('string_preview') and \
                             recovered.string_preview:
                         dst['string_preview'] = recovered.string_preview
+                    # Expandable pointer-to-struct: the reconstructor
+                    # may have built a synthetic SBValue via
+                    # `CreateValueFromAddress` for pointers the base
+                    # LLDB walk couldn't expand (spill-slot reuse).
+                    # Carry through is_expandable/expand_addr/var_key
+                    # so the UI's expand arrow wires into the cached
+                    # value through /api/expand.
+                    if recovered.is_expandable and recovered.var_key \
+                            and not dst.get('var_key'):
+                        dst['is_expandable'] = True
+                        dst['expand_addr'] = recovered.expand_addr
+                        dst['var_key'] = recovered.var_key
 
             # Infer unresolved params from ancestor frames (pyelftools only).
             # GDB/LLDB backends resolve entry_values themselves.

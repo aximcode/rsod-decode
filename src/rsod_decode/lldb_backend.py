@@ -992,6 +992,43 @@ class LldbBackend:
                     jmp_src = f'{path}:{le.GetLine()}'
         return (target_symbol, jmp_addr, jmp_src)
 
+    def make_struct_pointer_value(
+        self, name: str, addr: int, type_name: str, frame_pc: int,
+    ) -> str | None:
+        """Create a synthetic SBValue at ``addr`` with the pointee type
+        named ``type_name`` (the struct the pointer points at, not the
+        pointer type itself), cache it on ``_var_objects``, and return
+        a ``v_<pc>_<name>`` var_key the ``/api/expand`` path can use
+        to walk the struct.
+
+        Returns ``None`` if the type can't be resolved or the address
+        isn't mappable — callers should leave the param non-expandable
+        in that case. Used by the tail-call reconstructor to back-fill
+        pointer-typed arguments that the standard frame-variable walk
+        couldn't resolve (spill-slot reuse, register-held on entry,
+        etc.) so the UI's expand affordance still works.
+        """
+        if not self._has_memory(addr, 1):
+            return None
+        pointee = self._target.FindFirstType(type_name)
+        if not pointee.IsValid():
+            return None
+        pointee = pointee.GetCanonicalType()
+        type_class = pointee.GetTypeClass()
+        if type_class not in (
+            self._lldb.eTypeClassStruct,
+            self._lldb.eTypeClassClass,
+            self._lldb.eTypeClassUnion,
+        ):
+            return None
+        sb_addr = self._lldb.SBAddress(addr, self._target)
+        sv = self._target.CreateValueFromAddress(name, sb_addr, pointee)
+        if not sv.IsValid() or sv.GetNumChildren() == 0:
+            return None
+        var_key = f'v_{frame_pc:x}_{name}'
+        self._var_objects[var_key] = sv
+        return var_key
+
     def frame_body_rsp(self, addr: int) -> int | None:
         """Return the body-RSP (``SBFrame.GetSP()``) for the LLDB-unwound
         frame whose PC matches ``addr``, or None if no match.
