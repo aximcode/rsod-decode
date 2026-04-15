@@ -265,6 +265,12 @@ def main() -> None:
         if sess.backend == 'pyelftools':
             _log('Using pyelftools backend')
 
+        # Same source_loc backfill as the POST /api/session path —
+        # necessary for PE+PDB sessions where the decoder's initial
+        # resolve pass sees only the stub PEBinary surface.
+        from .app import _backfill_source_loc_from_richer_backend
+        _backfill_source_loc_from_richer_backend(sess)
+
         register_session(sess)
 
         _log(f"Session {session_id}: {len(result.frames)} frames, "
