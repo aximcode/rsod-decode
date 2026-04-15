@@ -157,7 +157,7 @@ def main() -> None:
 
         # MSVC/EPSA: detect a MAP+EFI companion pair in the extras, and
         # pick up a matching .pdb for PDB-backed LLDB.
-        from .app import _pair_map_with_pe, _pop_pdb_for
+        from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
         from .symbols import is_pe
         sym_extras = list(args.sym)
         companion, sym_extras = _pair_map_with_pe(args.symbol_file, sym_extras)

@@ -95,6 +95,42 @@ def test_psa_x64_forcecrash_symbols_from_pdb_only() -> None:
     assert 'fForceCrashIfRequested' in symbols
 
 
+@pytest.mark.lldb
+def test_psa_x64_forcecrash_cli_pdb_routing(tmp_path) -> None:
+    """decode_rsod must thread a .pdb extra through to load_symbols.
+
+    Regression pin for the CLI path: prior to the fix, `rsod-decode
+    rsod.txt psa_x64.efi -s psa_x64.pdb` ignored the .pdb and returned
+    0 symbols. Exercises decode_rsod end-to-end (not just analyze_rsod)
+    to cover the PDB-routing branch in decoder.decode_rsod.
+    """
+    from pathlib import Path
+    from rsod_decode.lldb_loader import import_lldb
+    from rsod_decode.decoder import decode_rsod
+
+    if import_lldb() is None:
+        pytest.skip("lldb Python module not available")
+
+    base = Path(__file__).parent / "fixtures" / "psa_x64_forcecrash"
+    pdb = base / "psa_x64.pdb"
+    if not pdb.exists():
+        pytest.skip("psa_x64_forcecrash.pdb not present")
+
+    out = tmp_path / "out.txt"
+    decode_rsod(
+        log_path=base / "rsod_psa_x64.txt",
+        sym_path=base / "psa_x64.efi",
+        out_path=out,
+        base_override=None,
+        verbose=False,
+        extra_sym_paths=[pdb],
+        source_root=None,
+    )
+    text = out.read_text()
+    assert 'initialize_test' in text
+    assert 'fForceCrashIfRequested' in text
+
+
 def test_psa_x64_pe_backend_ready(load_dataset_run) -> None:
     """The MSVC/EPSA psa_x64 fixture should load via PEBinary + .map and
     expose a working disassembler + call-site checker, regardless of

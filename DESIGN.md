@@ -427,27 +427,47 @@ rsod-debug --port 9090         # custom port
 
 ## .pyzw Packaging
 
-The build script creates a self-contained Python zipapp:
+Only the CLI analyzer (`rsod-decode`) is shipped as a standalone
+zipapp. `rsod-debug` (the Flask web UI + bundled frontend) stays an
+editable install — it has a different distribution story and is
+out of scope for the zipapp build.
 
+Build:
 ```
-python build_pyz.py → rsod-debug.pyzw
+python build_pyz.py → rsod-decode.pyzw   # ~2 MB, ~1.8 MB observed
 ```
 
 Contents:
-- All backend Python code
-- Built frontend assets (from `npm run build`)
-- Pure-Python dependencies (pyelftools, capstone wheels, cxxfilt, Flask)
-- pywebview (optional, pure-Python portion)
+- `rsod_decode/` package (CLI code path only; same source as the
+  editable install, unchanged)
+- Pure-Python deps bundled inside the zip: pyelftools, cxxfilt, pefile
+- `capstone/` bundled in the zip but extracted on first run — its
+  `libcapstone.so` is loaded via `ctypes.CDLL` using a
+  `__file__`-relative path, so zipimport can't serve it
+
+Excluded on purpose:
+- Flask / werkzeug / flask-sock / simple-websocket — web-only; the
+  CLI transitive import closure does not touch them (verified via
+  `assert 'flask' not in sys.modules` after `import rsod_decode.cli`)
+- `pywebview`, `playwright`, `pygdbmi` — web/dev-only
+- LLDB Python bindings — runtime-loaded from the host's system install
+  via `lldb_loader.py`; the shim returns `None` gracefully when
+  absent, so the pyzw still runs on hosts without LLDB (ELF fixtures
+  work, PE+PDB path degrades)
+- `tests/`, `tests/fixtures/`, `frontend/`, any `.dist-info` metadata
 
 First-run behavior:
-- Extracts frontend assets to `~/.rsod-debug/static/`
-- Creates `~/.rsod-debug/sessions.db` for history
-- Uploaded symbol files cached in `~/.rsod-debug/symbols/`
+- `__main__.py` hashes the zipapp and extracts any `NATIVE_PACKAGES`
+  (currently just `capstone`) to
+  `~/.cache/rsod-decode/libs/<hash16>/`, then prepends that dir to
+  `sys.path` and invokes `rsod_decode.cli:main`. Subsequent runs
+  skip extraction when the `.extracted` marker is present.
 
-Distribution:
-- Single `.pyzw` file, ~5MB
-- Users run: `python rsod-debug.pyzw`
-- Works on Windows, Linux, macOS with Python 3.10+
+Distribution constraints:
+- The bundled `libcapstone.so` makes the pyzw **architecture-specific**
+  — a Linux x86_64 build only runs on Linux x86_64. Build separate
+  pyzw artifacts per target platform if cross-distribution is needed.
+- Requires Python 3.10+ on the target host (same as editable install).
 
 ## Session Storage
 

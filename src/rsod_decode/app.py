@@ -18,6 +18,7 @@ from .models import SymbolSource, clean_path, binary_for_frame, find_source_file
 from .corefile import write_corefile
 from .decoder import analyze_rsod
 from .gdb_bridge import GdbSession
+from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
 from .serializers import (
     _RE_MEM_LOC, _build_frame_ctx, _var_to_dict,
     crash_info_to_dict, binary_for_session, frame_to_dict, registers_to_dict,
@@ -27,52 +28,6 @@ from .session import (
     pop_session, register_session, store_session,
 )
 from .symbols import SymbolLoadError, is_pe, load_symbols
-
-
-def _pair_map_with_pe(
-    primary: Path, extras: list[Path],
-) -> tuple[Path | None, list[Path]]:
-    """Return (companion, filtered_extras) if primary has a paired PE/.map
-    companion in extras, else (None, extras) unchanged.
-
-    MSVC EPSA commonly names the map file `psa.efi.map`, so we also match
-    by full-name suffix in addition to stem equality.
-    """
-    prim_name = primary.name.lower()
-    prim_stem = primary.stem.lower()
-    prim_is_pe = is_pe(primary)
-    prim_is_map = prim_name.endswith('.map')
-    if not (prim_is_pe or prim_is_map):
-        return None, extras
-
-    for i, ex in enumerate(extras):
-        ex_name = ex.name.lower()
-        ex_stem = ex.stem.lower()
-        ex_is_pe = is_pe(ex)
-        ex_is_map = ex_name.endswith('.map')
-        same_stem = ex_stem == prim_stem
-        map_for_pe = ex_name == f"{prim_name}.map"  # psa.efi + psa.efi.map
-        pe_for_map = prim_name == f"{ex_name}.map"  # psa.efi.map + psa.efi
-        if prim_is_pe and ex_is_map and (same_stem or map_for_pe):
-            return ex, extras[:i] + extras[i + 1:]
-        if prim_is_map and ex_is_pe and (same_stem or pe_for_map):
-            return ex, extras[:i] + extras[i + 1:]
-    return None, extras
-
-
-def _pop_pdb_for(stem: str, extras: list[Path]) -> tuple[Path | None, list[Path]]:
-    """Pull a `<stem>.pdb` out of extras if one is present.
-
-    Returned (pdb, remaining). Stem match is case-insensitive, and we
-    strip one trailing extension from each candidate so `psa.efi.pdb`
-    pairs with `psa.efi` as well as `psa.pdb` pairing with `psa`.
-    """
-    stem_l = stem.lower()
-    for i, ex in enumerate(extras):
-        if ex.name.lower().endswith('.pdb') and \
-                ex.stem.lower() == stem_l:
-            return ex, extras[:i] + extras[i + 1:]
-    return None, extras
 
 
 def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
