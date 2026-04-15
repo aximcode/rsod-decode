@@ -59,10 +59,41 @@ class _Frame:
     symbol: str | None = None
     source_file: str | None = None
     source_line: int | None = None
+    # The literal snippet (substring-matched) that the Source tab
+    # should render on the highlighted line for this frame. Grounds
+    # the test in the actual checked-in source instead of relying
+    # on observation-based line numbers. When set, enforces that
+    # GET /api/source/<sid>/<idx> has `is_target=True` on a row
+    # whose `text` contains this substring.
+    source_line_text: str | None = None
+    # Expected mnemonic prefix ('call', 'callq', 'jmp', 'bl', 'movabsq'…)
+    # of the disassembly target instruction. When set, enforces
+    # that GET /api/disasm/<sid>/<idx> marks an instruction
+    # is_target=True whose mnemonic startswith() this. Catches
+    # "target highlight landed on the wrong instruction" bugs.
+    disasm_target_mnemonic: str | None = None
+    # Expected trailing substring in that target instruction's
+    # `source_line` annotation. Used to assert the disassembly
+    # view's per-instruction source mapping agrees with the Source
+    # tab — i.e. the two views point at the same line rather than
+    # drifting by one (return-site vs call-site bugs).
+    disasm_target_source_endswith: str | None = None
     params: tuple[tuple[str, str], ...] = ()
     locals_: tuple[tuple[str, str], ...] = ()
     expand_values: dict[str, dict[str, int | str]] = field(
         default_factory=dict)
+    # Scalar parameter / local values pinned directly from source
+    # code. Maps variable name → expected integer value for scalar
+    # types (int / pointers / enums) or string for char* / char[]
+    # fields. The value is asserted exactly when the backend can
+    # resolve it — when the backend returns None (location is a
+    # callee-clobbered caller-saved register etc.), the pin is
+    # skipped rather than failing so the test is robust against
+    # register-allocator variation while still catching "we used
+    # to resolve this and now we don't" regressions.
+    param_values: dict[str, int | str] = field(default_factory=dict)
+    local_values: dict[str, int | str] = field(default_factory=dict)
+    is_synthetic: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -116,18 +147,50 @@ def _config_values(mode: int) -> dict[str, int | str]:
 
 _CRASHTEST_FRAMES_EDK2 = {
     0: _Frame("trigger_page_fault", "crashtest.c", 78,
-              params=(("addr", "void"),)),
+              is_synthetic=False,
+              params=(("addr", "void"),),
+              # crashtest.c:153 — `trigger_page_fault(NULL);`
+              # — so addr is a null pointer on entry.
+              param_values={"addr": 0}),
     1: _Frame("dispatch_crash", "crashtest.c", 153,
+              is_synthetic=False,
+              source_line_text="trigger_page_fault(NULL)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:153",
               params=(("ctx", "CrashContext"),),
-              locals_=(("mode", "char"),)),
+              locals_=(("mode", "char"),),
+              # dispatch_crash's `mode` local is
+              # `ctx->config->name` — not a compile-time constant,
+              # but for both edk2 and dell fixtures the string
+              # lives in read-only data and the CrashTest main()
+              # sets config->name from argv[0] or similar. Leave
+              # unpinned (string_preview would vary).
+              ),
     2: _Frame("validate_environment", "crashtest.c", 162,
+              is_synthetic=False,
+              source_line_text="dispatch_crash(ctx)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:162",
               params=(("ctx", "CrashContext"),)),
     3: _Frame("prepare_crash_context", "crashtest.c", 168,
+              is_synthetic=False,
+              source_line_text="validate_environment(ctx)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:168",
               params=(("ctx", "CrashContext"),)),
     4: _Frame("initialize_test", "crashtest.c", 186,
+              is_synthetic=False,
+              source_line_text="prepare_crash_context(&ctx)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:186",
               params=(("config", "TestConfig"),
                       ("build_id", "char")),
               locals_=(("ctx", "CrashContext"),),
+              # crashtest.c:194 — run_crashtest calls
+              # `initialize_test(config, "crashtest-v3")` — so
+              # initialize_test's `build_id` param points to a
+              # static string literal "crashtest-v3".
+              param_values={"build_id": "crashtest-v3"},
               expand_values={
                   "ctx": _CTX_VALUES,
                   # edk2 fixture was invoked with "pf" (page fault
@@ -135,15 +198,27 @@ _CRASHTEST_FRAMES_EDK2 = {
                   "config": _config_values(mode=0),
               }),
     5: _Frame("run_crashtest", "crashtest.c", 194,
+              is_synthetic=False,
+              source_line_text='initialize_test(config, "crashtest-v3")',
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:194",
               params=(("config", "TestConfig"),
                       ("argc", "int"))),
     6: _Frame("main", "crashtest.c", 252,
+              is_synthetic=False,
+              source_line_text="run_crashtest(&config, argc)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:252",
               params=(("argc", "int"), ("argv", "char")),
               locals_=(("config", "TestConfig"),),
               expand_values={
                   "config": _config_values(mode=0),
               }),
     7: _Frame("_AxlEntry", "axl-crt0-native.c", 38,
+              is_synthetic=False,
+              source_line_text="int rc = main(argc, argv)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="axl-crt0-native.c:38",
               params=(("ImageHandle", "EFI_HANDLE"),
                       ("SystemTable", "EFI_SYSTEM_TABLE")),
               locals_=(("argc", "int"), ("argv", "char"),
@@ -152,31 +227,59 @@ _CRASHTEST_FRAMES_EDK2 = {
 
 _CRASHTEST_FRAMES_DELL_AA64 = {
     0: _Frame("dispatch_crash", "crashtest.c", 156,
+              is_synthetic=False,
               params=(("ctx", "CrashContext"),),
               locals_=(("mode", "char"),)),
     1: _Frame("validate_environment", "crashtest.c", 162,
+              is_synthetic=False,
+              source_line_text="dispatch_crash(ctx)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:162",
               params=(("ctx", "CrashContext"),)),
     2: _Frame("prepare_crash_context", "crashtest.c", 168,
+              is_synthetic=False,
+              source_line_text="validate_environment(ctx)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:168",
               params=(("ctx", "CrashContext"),)),
     3: _Frame("initialize_test", "crashtest.c", 186,
+              is_synthetic=False,
+              source_line_text="prepare_crash_context(&ctx)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:186",
               params=(("config", "TestConfig"),
                       ("build_id", "char")),
               locals_=(("ctx", "CrashContext"),),
+              # Same as edk2: run_crashtest passes the literal
+              # "crashtest-v3" as build_id. crashtest.c:194.
+              param_values={"build_id": "crashtest-v3"},
               expand_values={
                   "ctx": _CTX_VALUES,
                   # dell_aa64 fixture was invoked with "gp" → mode = 1.
                   "config": _config_values(mode=1),
               }),
     4: _Frame("run_crashtest", "crashtest.c", 194,
+              is_synthetic=False,
+              source_line_text='initialize_test(config, "crashtest-v3")',
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:194",
               params=(("config", "TestConfig"),
                       ("argc", "int"))),
     5: _Frame("main", "crashtest.c", 252,
+              is_synthetic=False,
+              source_line_text="run_crashtest(&config, argc)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="crashtest.c:252",
               params=(("argc", "int"), ("argv", "char")),
               locals_=(("config", "TestConfig"),),
               expand_values={
                   "config": _config_values(mode=1),
               }),
     6: _Frame("_AxlEntry", "axl-crt0-native.c", 38,
+              is_synthetic=False,
+              source_line_text="int rc = main(argc, argv)",
+              disasm_target_mnemonic="bl",
+              disasm_target_source_endswith="axl-crt0-native.c:38",
               params=(("ImageHandle", "EFI_HANDLE"),
                       ("SystemTable", "EFI_SYSTEM_TABLE")),
               locals_=(("argc", "int"), ("argv", "char"),
@@ -233,13 +336,57 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
             # decoder's FP/scan walker doesn't set frame[0].symbol
             # since trigger_gp_fault is a tail-called leaf — we pin
             # the `vector` param via the richer backend instead.
-            # Frame 0 crashes inside trigger_gp_fault; the PDB line
-            # table maps that PC back to the assignment at psaentry.c
-            # line 212 (`int* null_ptr = nullptr;`).
-            0: _Frame(source_file="psaentry.c",
-                      params=(("vector", "unsigned"),)),
-            1: _Frame("initialize_test",
+            # Frame 0 is trigger_gp_fault (crash frame). The PDB
+            # line table maps the faulting PC to the function
+            # opening brace (an MSVC PDB quirk for single-
+            # statement functions); the disasm target is the
+            # `movabsq $-0x2152ffff21530000, %rax` instruction
+            # that loads the 0xDEAD0000DEAD0000 sentinel pointer
+            # the function is about to dereference.
+            0: _Frame("trigger_gp_fault",
                       source_file="psaentry.c",
+                      is_synthetic=False,
+                      source_line_text="{",
+                      disasm_target_mnemonic="movabsq",
+                      params=(("vector", "unsigned"),),
+                      # psaentry.c dispatch_crash line:
+                      #     trigger_gp_fault(0x0D);
+                      # vector lives in MSVC DWARF register 26
+                      # (XMM9), not in the Dell RSOD register
+                      # dump, so the backend returns None and the
+                      # pin skips cleanly. Still useful as a
+                      # regression pin for the day the backend
+                      # learns to extract XMM values.
+                      param_values={"vector": 0x0D}),
+            # Frames 1-3: synthetic tail-call chain between
+            # trigger_gp_fault and initialize_test. dispatch_crash
+            # dispatches via a switch that jmps to
+            # trigger_gp_fault on mode=GP; validate_environment
+            # ends with `jmp dispatch_crash`; prepare_crash_context
+            # is a 1-instruction wrapper `jmp validate_environment`.
+            1: _Frame("dispatch_crash",
+                      source_file="psaentry.c",
+                      is_synthetic=True,
+                      source_line_text="trigger_gp_fault(",
+                      disasm_target_mnemonic="jmp"),
+            2: _Frame("validate_environment",
+                      source_file="psaentry.c",
+                      is_synthetic=True,
+                      source_line_text="dispatch_crash(",
+                      disasm_target_mnemonic="jmp"),
+            # prepare_crash_context is a 1-instruction wrapper;
+            # its source_loc lands on the function's opening
+            # brace (PDB mapping for single-line functions).
+            3: _Frame("prepare_crash_context",
+                      source_file="psaentry.c",
+                      is_synthetic=True,
+                      source_line_text="{",
+                      disasm_target_mnemonic="jmp"),
+            4: _Frame("initialize_test",
+                      source_file="psaentry.c",
+                      is_synthetic=False,
+                      source_line_text="prepare_crash_context(&ctx)",
+                      disasm_target_mnemonic="call",
                       params=(("config", "CrashTestConfig"),
                               ("build_id", "char")),
                       locals_=(("ctx", "CrashContext"),),
@@ -248,15 +395,20 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
                       # after the initial read — the stored pointer
                       # is stale garbage by the time we crash. The
                       # genuine TestConfig struct still lives in
-                      # fForceCrashIfRequested's frame (see frame 3).
+                      # fForceCrashIfRequested's frame (see frame 6).
                       expand_values={"ctx": _CTX_VALUES}),
-            # Frame 2 is synthetic — re-materialized by the tail-call
-            # reconstructor from MSVC's `jmp initialize_test`
-            # optimization of `run_crashtest`. No spill slots,
-            # therefore no params/locals to pin.
-            2: _Frame("run_crashtest", source_file="psaentry.c"),
-            3: _Frame("fForceCrashIfRequested",
+            # Frame 5: synthetic run_crashtest, tail-called into
+            # initialize_test. No spill slots, so no params/locals.
+            5: _Frame("run_crashtest",
                       source_file="psaentry.c",
+                      is_synthetic=True,
+                      source_line_text='initialize_test(config, "crashtest-v3")',
+                      disasm_target_mnemonic="jmp"),
+            6: _Frame("fForceCrashIfRequested",
+                      source_file="psaentry.c",
+                      is_synthetic=False,
+                      source_line_text="run_crashtest(&config, argc)",
+                      disasm_target_mnemonic="call",
                       params=(("argc", "int"), ("argv", "char")),
                       locals_=(("config", "CrashTestConfig"),),
                       # In PsaEntry.c's adapted hook fForceCrashIfRequested
@@ -266,8 +418,11 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
                       expand_values={
                           "config": _config_values(mode=1),
                       }),
-            4: _Frame("fUEFIPSAEntry",
+            7: _Frame("fUEFIPSAEntry",
                       source_file="psaentry.c",
+                      is_synthetic=False,
+                      source_line_text="fForceCrashIfRequested(argc, argv)",
+                      disasm_target_mnemonic="call",
                       params=(("originalTxtAttr", "uint64_t"),
                               ("originalTxtMode", "uint64_t")),
                       locals_=(("argv", "char"),
@@ -348,24 +503,39 @@ def test_api_frame_symbols_and_source(
 ) -> None:
     """Every frame in the per-fixture expectations map must match.
 
-    Pins the FP/RBP walker output (symbol per index) and the source
-    location metadata (file + line) in one pass through the frame
-    list returned by GET /api/session.
+    Pins the FP/RBP walker output (symbol per index), the source
+    location metadata (file + line + literal snippet), the
+    `is_synthetic` flag, the Source-tab rendered content, and the
+    Disassembly-tab target mnemonic + its source-line annotation.
+    The source-line assertions use literal checked-in text so a
+    regression that shifts the highlight by one line (return site
+    vs call site) fails loudly instead of silently swapping which
+    of two adjacent lines is marked.
     """
     exp = _expect(api_session)
     if not exp.frames:
         pytest.skip("no frame expectations")
 
-    body = client.get(f"/api/session/{api_session.session_id}").get_json()
+    sid = api_session.session_id
+    body = client.get(f"/api/session/{sid}").get_json()
     frames = body["frames"]
     for idx, fe in exp.frames.items():
         assert idx < len(frames), f"no frame {idx}"
         frame = frames[idx]
+
+        # Symbol + is_synthetic metadata.
         if fe.symbol is not None:
             got_symbol = frame["symbol"]
             assert got_symbol is not None and fe.symbol in got_symbol, (
                 f"frame {idx}: expected symbol containing "
                 f"{fe.symbol!r}, got {got_symbol!r}")
+        if fe.is_synthetic is not None:
+            assert frame.get("is_synthetic", False) == fe.is_synthetic, (
+                f"frame {idx} ({frame.get('symbol')!r}): "
+                f"is_synthetic={frame.get('is_synthetic')}, "
+                f"expected {fe.is_synthetic}")
+
+        # source_loc file + line.
         if fe.source_file is not None:
             src = frame["source_loc"] or ""
             assert fe.source_file in src, (
@@ -375,6 +545,64 @@ def test_api_frame_symbols_and_source(
                 assert f":{fe.source_line}" in src, (
                     f"frame {idx} source_loc {src!r} does not "
                     f"contain line {fe.source_line}")
+
+        # Source tab rendered content: the target-flagged line's
+        # text must contain the expected literal snippet.
+        if fe.source_line_text is not None:
+            src_body = client.get(
+                f"/api/source/{sid}/{idx}").get_json()
+            if src_body.get("lines"):
+                targets = [
+                    ln for ln in src_body["lines"]
+                    if ln.get("is_target")
+                ]
+                assert targets, (
+                    f"frame {idx}: /api/source returned {len(src_body['lines'])} "
+                    f"lines but none were flagged is_target")
+                tgt_text = targets[0]["text"]
+                assert fe.source_line_text in tgt_text, (
+                    f"frame {idx} ({frame.get('symbol')!r}): "
+                    f"Source tab target line is "
+                    f"{tgt_text.strip()!r}, expected to contain "
+                    f"{fe.source_line_text!r}")
+            else:
+                # Source file isn't reachable on this machine
+                # (out-of-tree tree missing) — skip the literal
+                # assertion rather than fail.
+                pass
+
+        # Disassembly tab: target instruction mnemonic + its own
+        # source-line annotation. Grounds the disasm view in the
+        # same source line the Source tab claims — if they drift
+        # (e.g. frame.address = return-addr but /api/disasm uses
+        # frame.address directly), one of the two assertions
+        # fires.
+        if (fe.disasm_target_mnemonic is not None
+                or fe.disasm_target_source_endswith is not None):
+            dis_body = client.get(
+                f"/api/disasm/{sid}/{idx}").get_json()
+            targets = [
+                i for i in dis_body.get("instructions", [])
+                if i.get("is_target")
+            ]
+            assert targets, (
+                f"frame {idx} ({frame.get('symbol')!r}): "
+                f"/api/disasm has no is_target instruction")
+            t = targets[0]
+            if fe.disasm_target_mnemonic is not None:
+                assert t["mnemonic"].lower().startswith(
+                        fe.disasm_target_mnemonic.lower()), (
+                    f"frame {idx} ({frame.get('symbol')!r}): "
+                    f"disasm target mnemonic is {t['mnemonic']!r}, "
+                    f"expected to start with "
+                    f"{fe.disasm_target_mnemonic!r}")
+            if fe.disasm_target_source_endswith is not None:
+                sl = t.get("source_line", "")
+                assert sl.endswith(fe.disasm_target_source_endswith), (
+                    f"frame {idx} ({frame.get('symbol')!r}): "
+                    f"disasm target source_line is {sl!r}, "
+                    f"expected to end with "
+                    f"{fe.disasm_target_source_endswith!r}")
 
 
 # =============================================================================
@@ -396,6 +624,15 @@ def test_api_per_frame_variables(
     _EXPECTATIONS.frames so the full call chain is covered one
     assertion at a time — a regression in any specific frame's
     variable extraction is pinpointed directly.
+
+    Asserts, in increasing specificity:
+      1. name + type substring match on each declared param/local
+      2. scalar value match for anything in `param_values`/`local_values`
+         (sourced from the fixture's .c source). Skipped per-pin
+         when the backend returns None (caller-saved register not
+         in the RSOD register dump) so the test doesn't punish
+         register-allocator variation but still catches
+         "extraction regressed from a previously-resolved value".
     """
     from .conftest import create_api_session, delete_api_session
 
@@ -404,7 +641,8 @@ def test_api_per_frame_variables(
     try:
         exp = _EXPECTATIONS[fixture_key]
         fe = exp.frames[frame_idx]
-        if not (fe.params or fe.locals_):
+        if not (fe.params or fe.locals_ or fe.param_values
+                or fe.local_values):
             pytest.skip(f"frame {frame_idx}: no variable expectations")
 
         body = client.get(
@@ -419,8 +657,63 @@ def test_api_per_frame_variables(
             _collect_var_names(body["locals"]),
             fe.locals_,
         )
+
+        # Scalar value assertions. Works against params and locals
+        # lookup tables built from the frame detail so we don't have
+        # to care which kind each name belongs to.
+        def _by_name(items: list[dict]) -> dict[str, dict]:
+            return {v["name"]: v for v in items}
+
+        params_by_name = _by_name(body["params"])
+        locals_by_name = _by_name(body["locals"])
+
+        for name, expected in fe.param_values.items():
+            v = params_by_name.get(name)
+            assert v is not None, (
+                f"frame {frame_idx}: param {name!r} missing for "
+                f"value pin (expected {expected!r})")
+            _assert_scalar_value(
+                frame_idx, "param", name, v, expected)
+        for name, expected in fe.local_values.items():
+            v = locals_by_name.get(name)
+            assert v is not None, (
+                f"frame {frame_idx}: local {name!r} missing for "
+                f"value pin (expected {expected!r})")
+            _assert_scalar_value(
+                frame_idx, "local", name, v, expected)
     finally:
         delete_api_session(client, ctx)
+
+
+def _assert_scalar_value(
+    frame_idx: int, kind: str, name: str,
+    var: dict, expected: int | str,
+) -> None:
+    """Compare a /api/frame variable dict against a source-pinned
+    expected value. Integers and pointers compare via `value`;
+    strings compare via `string_preview` substring match so null
+    terminators / trailing whitespace are tolerated.
+    """
+    if isinstance(expected, str):
+        preview = var.get("string_preview") or ""
+        if not preview:
+            pytest.skip(
+                f"frame {frame_idx} {kind} {name!r}: no "
+                f"string_preview returned (expected {expected!r})")
+        assert expected in preview, (
+            f"frame {frame_idx} {kind} {name!r} string_preview "
+            f"is {preview!r}, expected to contain {expected!r}")
+        return
+
+    got = var.get("value")
+    if got is None:
+        pytest.skip(
+            f"frame {frame_idx} {kind} {name!r}: backend returned "
+            f"None for scalar value (register not recoverable "
+            f"from this RSOD)")
+    assert got == expected, (
+        f"frame {frame_idx} {kind} {name!r} value is 0x{got:x} "
+        f"({got}), expected 0x{expected:x} ({expected})")
 
 
 # Parameterize over every (fixture, frame) that has value expectations
@@ -625,16 +918,33 @@ def test_api_disasm_has_instructions_for_resolved_frame(
 def test_api_tail_call_reconstruction_psa_x64_forcecrash(
     client,
 ) -> None:
-    """The MSVC tail-call reconstructor must re-materialize
-    `run_crashtest` between `initialize_test` and
-    `fForceCrashIfRequested` on the psa_x64_forcecrash fixture.
+    """The MSVC tail-call reconstructor must re-materialize every
+    tail-called function in the psa_x64_forcecrash chain.
 
-    MSVC compiled `run_crashtest` as `jmp initialize_test` so the
-    raw stack has 4 frames. After the app-layer reconstruction
-    pass we should see 5 frames with the synthetic run_crashtest
-    at index 2, flagged `is_synthetic=True`, and its own source
-    mapping to psaentry.c. The frame indices below/above should
-    stay anchored to the real functions.
+    MSVC compiles the adapted PSA hook as two tail-call chains:
+
+        initialize_test --(call)--> prepare_crash_context
+                        |
+                        +---(jmp)--> validate_environment
+                        |
+                        +---(jmp)--> dispatch_crash
+                        |
+                        +---(jmp)--> trigger_gp_fault
+
+    and
+
+        fForceCrashIfRequested --(call)--> run_crashtest
+                               |
+                               +---(jmp)--> initialize_test
+
+    so the raw stack has 4 physical frames
+    (trigger_gp_fault, initialize_test, fForceCrashIfRequested,
+    fUEFIPSAEntry) and the reconstructor inserts 4 synthetic
+    frames (dispatch_crash, validate_environment,
+    prepare_crash_context, run_crashtest) for a total of 8. Each
+    synthetic frame's location points at its own tail-call jmp
+    (not the function entry) so the Source/Disassembly tabs
+    highlight the call site the user expects to see.
     """
     spec = DATASET_SPECS["psa_x64_forcecrash"]
     if spec.pdb_path is None or not spec.pdb_path.exists():
@@ -643,44 +953,70 @@ def test_api_tail_call_reconstruction_psa_x64_forcecrash(
     try:
         body = client.get(f"/api/session/{ctx.session_id}").get_json()
         frames = body["frames"]
-        # 4 physical + 1 synthetic = 5 total
-        assert len(frames) == 5, [
+        assert len(frames) == 8, [
             (f["index"], f.get("symbol"), f.get("is_synthetic"))
             for f in frames
         ]
         symbols = [f.get("symbol") for f in frames]
-        assert symbols[1] == "initialize_test"
-        assert symbols[2] == "run_crashtest"
-        assert symbols[3] == "fForceCrashIfRequested"
-        assert symbols[4] == "fUEFIPSAEntry"
+        assert symbols == [
+            "trigger_gp_fault",
+            "dispatch_crash",
+            "validate_environment",
+            "prepare_crash_context",
+            "initialize_test",
+            "run_crashtest",
+            "fForceCrashIfRequested",
+            "fUEFIPSAEntry",
+        ]
 
-        # Only the middle run_crashtest frame is synthetic.
-        synthetics = [f for f in frames if f.get("is_synthetic")]
-        assert len(synthetics) == 1
-        assert synthetics[0]["symbol"] == "run_crashtest"
-        assert synthetics[0]["index"] == 2
-        assert "psaentry.c" in (synthetics[0].get("source_loc") or "")
+        # Frames 1, 2, 3, 5 are synthetic; everything else is
+        # physical.
+        synth_indices = {
+            f["index"] for f in frames if f.get("is_synthetic")
+        }
+        assert synth_indices == {1, 2, 3, 5}
 
-        # The synthetic frame's /api/frame response surfaces the
-        # flag and renders empty params/locals (tail-called
-        # functions have no spill slots).
-        fr = client.get(f"/api/frame/{ctx.session_id}/2").get_json()
-        assert fr["is_synthetic"] is True
-        assert fr["symbol"] == "run_crashtest"
-        assert fr["params"] == []
-        assert fr["locals"] == []
+        # Every synthetic frame should have a psaentry.c
+        # source_loc and its /api/frame response should have
+        # empty params/locals (no stack frame = no spill slots).
+        for idx in sorted(synth_indices):
+            fr = client.get(
+                f"/api/frame/{ctx.session_id}/{idx}").get_json()
+            assert fr["is_synthetic"] is True
+            assert "psaentry.c" in (fr.get("source_loc") or ""), (
+                f"synthetic frame {idx} {fr.get('symbol')!r} has "
+                f"unexpected source_loc {fr.get('source_loc')!r}")
+            assert fr["params"] == []
+            assert fr["locals"] == []
 
-        # Disassembly of the synthetic frame should cover the
-        # 5-instruction run_crashtest body and end in a jmp —
-        # the last mnemonic is the tail-call jump into
-        # initialize_test.
-        dis = client.get(f"/api/disasm/{ctx.session_id}/2").get_json()
+        # `run_crashtest` (frame 5) is the classic wrapper: 5
+        # instructions ending in a tail-call jmp. Pin that shape
+        # as a sanity check on the function-range clamping.
+        dis = client.get(
+            f"/api/disasm/{ctx.session_id}/5").get_json()
         insns = dis["instructions"]
-        assert insns, "synthetic frame disasm is empty"
+        assert insns, "synthetic run_crashtest disasm is empty"
         last_mnemonic = insns[-1]["mnemonic"].lower()
         assert last_mnemonic.startswith("jmp"), (
             f"expected run_crashtest to end in jmp (tail call), "
             f"got {last_mnemonic}")
+
+        # The disasm target on a non-crash frame should now be
+        # the CALL / JMP instruction (not the return address).
+        # Frame 6 = fForceCrashIfRequested, whose call to
+        # run_crashtest is a real callq; frame 5 = run_crashtest
+        # itself, whose exit is a jmp to initialize_test.
+        for idx, expected_mnemonic in [(6, "call"), (5, "jmp")]:
+            body = client.get(
+                f"/api/disasm/{ctx.session_id}/{idx}").get_json()
+            target_instrs = [
+                i for i in body["instructions"] if i["is_target"]
+            ]
+            assert target_instrs, f"frame {idx}: no target highlight"
+            mn = target_instrs[0]["mnemonic"].lower()
+            assert mn.startswith(expected_mnemonic), (
+                f"frame {idx}: expected target mnemonic "
+                f"{expected_mnemonic!r}, got {mn!r}")
     finally:
         delete_api_session(client, ctx)
 

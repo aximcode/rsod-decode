@@ -145,9 +145,14 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         pdb_path=FIXTURES_DIR / "psa_x64_forcecrash" / "psa_x64.pdb",
         expected_format="uefi_x86",
         expected_frames=4,
-        # 4 physical frames + 1 synthetic `run_crashtest` inserted by
+        # 4 physical frames + 4 synthetic frames re-materialized by
         # the tail-call reconstructor once the LLDB backend lands.
-        expected_api_frames=5,
+        # The MSVC tail-call chain in the adapted PSA hook is
+        # dispatch_crash → validate_environment → prepare_crash_context
+        # (between trigger_gp_fault and initialize_test) plus
+        # run_crashtest (between initialize_test and
+        # fForceCrashIfRequested), for 4 inserted frames.
+        expected_api_frames=8,
         expected_resolved=1,
         expected_modules=316,
         expected_vregs=0,

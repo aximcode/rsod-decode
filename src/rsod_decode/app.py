@@ -83,7 +83,8 @@ def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
 
 
 def _backfill_source_loc_from_richer_backend(session: Session) -> None:
-    """Fill missing per-frame `source_loc` via the session's richer backend.
+    """Fill missing per-frame `source_loc` and `symbol` via the
+    session's richer backend.
 
     The decoder's source_loc resolution pass only sees the static
     pyelftools / PEBinary surface — for PE+PDB sessions it returns
@@ -92,22 +93,32 @@ def _backfill_source_loc_from_richer_backend(session: Session) -> None:
     re-run the lookup for any frames that are still missing a
     source_loc and populate them from line-table-aware data.
 
-    Crash frames key off `frame.address`; non-crash frames key off
-    `frame.call_addr - 1` to land inside the caller's location-list
-    range instead of the return address (which falls in an entry_value
-    range that resolves to the callee). This mirrors the lookup_pc
-    convention used by `get_frame`.
+    Both crash frames and non-crash frames key off `call_addr - 1`
+    here: for crash frames `call_addr == address`, so this is
+    identical to `address - 1` which is still inside the faulting
+    instruction's range; for non-crash frames `call_addr - 1` lands
+    inside the call instruction in the caller — a pre-call PC that
+    the PDB maps to the source line that issued the call. That's
+    the line the user expects to see highlighted when they inspect
+    a frame ("where was the caller when it handed off control").
+    Using the raw return address (`frame.address`) would map to the
+    *next* source line because MSVC's line table associates the
+    post-call PC with whatever statement follows it — usually the
+    function's closing brace.
+
+    We also synthesize a `MapSymbol` from the richer backend's
+    function name when `frame.symbol` is missing, so downstream
+    consumers (tail-call reconstructor, serializer) see a populated
+    symbol even for addresses the static .map didn't know about.
     """
     backend = session.lldb_dwarf or session.gdb_dwarf
     if backend is None:
         return
+    from .models import MapSymbol
     for f in session.result.frames:
-        if f.source_loc:
+        if f.source_loc and f.symbol:
             continue
-        if f.is_crash_frame:
-            target = f.address
-        else:
-            target = (f.call_addr - 1) if f.call_addr else None
+        target = (f.call_addr - 1) if f.call_addr else f.address
         if not target:
             continue
         info = backend.resolve_address(target)
@@ -115,6 +126,10 @@ def _backfill_source_loc_from_richer_backend(session: Session) -> None:
             continue
         if info.source_loc and not f.source_loc:
             f.source_loc = info.source_loc
+        if info.function and f.symbol is None:
+            f.symbol = MapSymbol(
+                address=f.address, name=info.function,
+                object_file=f.module or '', is_function=True)
 
 
 def _reconstruct_tail_call_frames(session: Session) -> None:
@@ -367,7 +382,18 @@ def create_app(repo_root: Path | None = None,
 
         binary = binary_for_session(session, frame)
         img_base = session.img_base
-        if binary and frame.address:
+        # Synthetic (tail-call reconstructed) frames have no
+        # physical stack frame, so there are no spill slots to
+        # read params/locals from — even though the function
+        # itself is a real PDB/DWARF entity with declared
+        # parameters. Short-circuit here so the UI renders empty
+        # tables instead of showing stale register snapshots
+        # from whoever's actually occupying RSP/RBP at the time.
+        if frame.is_synthetic:
+            result['params'] = []
+            result['locals'] = []
+            result['globals'] = []
+        elif binary and frame.address:
             ctx = _build_frame_ctx(frame, session, img_base)
             # For non-crash frames, use call_addr - 1 for DWARF location
             # lookup.  The return address lands in DW_OP_entry_value ranges
@@ -624,15 +650,24 @@ def create_app(repo_root: Path | None = None,
 
         frame = session.result.frames[frame_index]
         binary = binary_for_session(session, frame)
-        # Target highlight and forward-decode anchor is the frame's
-        # own address (return address for non-crash frames, crash PC
-        # for frame 0) because that's the instruction the UI wants
-        # marked "we're about to execute this". `frame.call_addr` is
-        # `address - insn_size` for DWARF location-list lookups and
-        # is *not* a valid instruction boundary on variable-length
-        # x86, so the target highlight would never match any decoded
-        # instruction if we used it as the anchor.
+        # For crash / synthetic frames, highlight `frame.address`
+        # directly — it's the faulting PC (crash frame) or the
+        # tail-call jmp (synthetic frame) and in both cases the
+        # user wants to see THAT instruction. For non-crash frames
+        # `frame.address` is the return address (instruction AFTER
+        # the call) and highlighting it gives a confusing "we're
+        # in the function epilogue / closing brace" picture. Ask
+        # the richer backend to find the CALL instruction whose
+        # return address matches, and highlight that instead — it
+        # lines up with what the Source tab shows (the call site).
         target_addr = frame.address or frame.call_addr
+        if (binary is not None and frame.address
+                and not frame.is_crash_frame and not frame.is_synthetic):
+            from .lldb_backend import LldbBackend
+            if isinstance(binary, LldbBackend):
+                call_site = binary.call_site_addr_for_return(frame.address)
+                if call_site is not None:
+                    target_addr = call_site
         if not binary or not target_addr:
             return jsonify(instructions=[])
 

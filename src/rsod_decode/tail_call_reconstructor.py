@@ -107,11 +107,13 @@ def _chain_between(
     """Build the intermediate synthetic frames between parent and child.
 
     Walks at most `_MAX_HOPS` tail calls forward from parent's direct
-    callee. Returns frames in parent-to-child order (which is the
-    same as deeper-to-shallower on the stack, so callers that
-    process the backtrace crash-first need to reverse). This helper
-    already orders them correctly for `reconstruct_tail_calls`'s
-    output list.
+    callee until the chain meets `child_symbol`. Each synthetic
+    frame's location is pinned to its tail-call `jmp` instruction —
+    the last thing the function executed before handing control
+    off to the next link — rather than the function entry. This is
+    what the UI should highlight in Source/Disassembly, because
+    "where execution was" at the moment of elision is the jmp, not
+    the prologue.
     """
     direct = backend.find_callee_at_return_addr(
         parent_return_addr, parent_function)
@@ -123,48 +125,50 @@ def _chain_between(
     if direct_name == child_symbol:
         return []
 
-    chain: list[tuple[str, str]] = [direct]
+    # Walk the tail-call chain starting from `direct_name`. At each
+    # step, `tail_call_target` returns the jmp's target symbol plus
+    # the (addr, source_loc) of the jmp instruction itself. We
+    # record one (name, jmp_addr, jmp_src) tuple per synthetic
+    # frame: `name` is the function we're sitting in, `jmp_*` is
+    # its tail-call site.
+    chain: list[tuple[str, int, str]] = []
     current = direct_name
     for _ in range(_MAX_HOPS):
         tail = backend.tail_call_target(current)
         if tail is None:
-            # Not a tail-call chain — we're stuck. Return what we
-            # have; if the stack walker is correct the chain
-            # still won't match the child, but the caller keeps
-            # the parent-child edge anyway. Suppress the frames
-            # since an orphaned chain is more confusing than none.
+            # `current` has a real ret or an indirect jmp — the
+            # chain doesn't reach `child_symbol` via tail calls.
+            # Drop the whole reconstruction rather than inserting
+            # a dangling partial chain.
             return []
-        tail_name, _ = tail
-        if tail_name == child_symbol:
+        target_name, jmp_addr, jmp_src = tail
+        chain.append((current, jmp_addr, jmp_src))
+        if target_name == child_symbol:
             break
-        chain.append(tail)
-        current = tail_name
+        current = target_name
     else:
         # Ran out of hops without reaching the child. Drop.
         return []
 
-    # Build FrameInfo objects for each step in the chain. Frame
-    # ordering in the final backtrace: child (lower index) ↑ chain
-    # entries ↑ parent (higher index). We were given the chain in
-    # parent-to-child order (direct callee first), but we want
-    # child-to-parent for insertion, so reverse.
+    # Build FrameInfo objects for each step. The final backtrace
+    # order is: child (lower index) ↑ chain ↑ parent (higher
+    # index). We collected `chain` in parent-to-child order (the
+    # first entry is what parent directly called), so reverse for
+    # insertion order.
     synthetic_frames: list[FrameInfo] = []
-    for name, _src in reversed(chain):
-        info = backend.function_entry_source_loc(name)
-        entry_addr = info[0] if info else 0
-        source_loc = info[1] if info else ''
+    for name, jmp_addr, jmp_src in reversed(chain):
         fake_sym = MapSymbol(
-            address=entry_addr, name=name,
+            address=jmp_addr, name=name,
             object_file=parent_module or '', is_function=True)
         synthetic_frames.append(FrameInfo(
             index=0,  # re-indexed by caller
-            address=entry_addr,
+            address=jmp_addr,
             module=parent_module,
             symbol=fake_sym,
             sym_offset=0,
-            source_loc=source_loc,
+            source_loc=jmp_src,
             is_crash_frame=False,
-            call_addr=entry_addr,
+            call_addr=jmp_addr,
             is_synthetic=True,
         ))
     return synthetic_frames

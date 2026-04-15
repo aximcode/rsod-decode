@@ -665,27 +665,44 @@ class LldbBackend:
         file_mode = self._mode == 'pe_pdb'
         runtime = addr if file_mode else addr + self._image_base
 
-        # Find the enclosing function start to anchor the backward half.
-        # Falls back to the sweep-from-addr behavior if unavailable.
+        # Find the enclosing function's range. The backward window is
+        # anchored on the function start when it's within reach, and
+        # both halves are clamped to `[func_start, func_end)` so we
+        # don't bleed into neighbouring functions' epilogues / int3
+        # padding (which would get tagged with the wrong source
+        # line by LLDB's line table).
         sb_addr = self._resolve_sb_address(addr)
         func_start_rt: int | None = None
+        func_end_rt: int | None = None
         if sb_addr.IsValid():
             fn = sb_addr.GetFunction()
-            start_sb = (
-                fn.GetStartAddress() if fn.IsValid()
-                else sb_addr.GetSymbol().GetStartAddress())
-            if start_sb.IsValid():
+            if fn.IsValid():
+                start_sb = fn.GetStartAddress()
+                end_sb = fn.GetEndAddress()
+            else:
+                sym = sb_addr.GetSymbol()
+                start_sb = sym.GetStartAddress()
+                end_sb = sym.GetEndAddress()
+            if start_sb.IsValid() and end_sb.IsValid():
                 fs = (
                     start_sb.GetFileAddress() if file_mode
                     else start_sb.GetLoadAddress(self._target))
+                fe = (
+                    end_sb.GetFileAddress() if file_mode
+                    else end_sb.GetLoadAddress(self._target))
                 if fs != self._lldb.LLDB_INVALID_ADDRESS and fs > 0:
                     func_start_rt = fs
+                if fe != self._lldb.LLDB_INVALID_ADDRESS and fe > fs:
+                    func_end_rt = fe
 
-        # Backward: anchor on the function start when it's within
-        # reach. Otherwise read a generous backward window and filter.
-        if (
+        # Backward: skip entirely when addr is at (or before) the
+        # function entry. Otherwise anchor on func_start.
+        if func_start_rt is not None and runtime <= func_start_rt:
+            back_start = runtime
+            back_count = 0
+        elif (
             func_start_rt is not None
-            and 0 < runtime - func_start_rt <= context * 6
+            and runtime - func_start_rt <= context * 6
         ):
             back_start = func_start_rt
             back_count = max(1, (runtime - back_start) // 2 + 8)
@@ -704,6 +721,10 @@ class LldbBackend:
 
         window_lo = runtime - context
         window_hi = runtime + context
+        if func_start_rt is not None:
+            window_lo = max(window_lo, func_start_rt)
+        if func_end_rt is not None:
+            window_hi = min(window_hi, func_end_rt)
         insns: list[tuple[int, str, str]] = []
         seen: set[int] = set()
 
@@ -727,7 +748,8 @@ class LldbBackend:
                 insns.append((offset_addr, mnemonic, operands))
 
         # Backward half: only keep instructions strictly below runtime.
-        _consume(_read_from(back_start, back_count), window_lo, runtime)
+        if back_count > 0:
+            _consume(_read_from(back_start, back_count), window_lo, runtime)
         # Forward half: decode from runtime itself so `addr` lands
         # exactly on an instruction boundary.
         _consume(_read_from(runtime, context * 2), runtime, window_hi)
@@ -787,8 +809,17 @@ class LldbBackend:
         sb_addr = self._resolve_sb_address(addr)
         if not sb_addr.IsValid():
             return None
-        symbol = sb_addr.GetSymbol()
-        fn = symbol.GetName() if symbol.IsValid() else ''
+        # PE+PDB exposes function names via SBAddress.GetFunction()
+        # only — SBSymbol is invalid for PDB-backed targets. Prefer
+        # SBFunction when it's valid and fall back to SBSymbol for
+        # corefile/DWARF paths where the function scope tables
+        # carry the richer info on SBSymbol.
+        fn_obj = sb_addr.GetFunction()
+        if fn_obj.IsValid():
+            fn = fn_obj.GetName() or ''
+        else:
+            symbol = sb_addr.GetSymbol()
+            fn = symbol.GetName() if symbol.IsValid() else ''
         line_entry = sb_addr.GetLineEntry()
         source_loc = ''
         if line_entry.IsValid():
@@ -853,47 +884,61 @@ class LldbBackend:
     def _iter_function_instructions(
         self, start: int, end: int,
     ) -> list[Any]:
-        """Return every SBInstruction whose file-address falls in
-        `[start, end)`, in order. Bounded by the caller so a
-        misbehaving ReadInstructions can't spill into the next
-        function's code."""
-        sb = self._resolve_sb_address(start)
+        """Return every SBInstruction whose address falls in
+        `[start, end)` in order.
+
+        Address space is consistently the file-address space for
+        both modes — for pe_pdb that's the absolute PE file address
+        (what PDB records carry), for corefile that's the ELF
+        offset (what `GetFileAddress` on an in-module SBAddress
+        returns). The function handles the mode-specific SBAddress
+        construction and instruction-addr extraction internally so
+        callers can pass `GetFileAddress()`-derived bounds
+        uniformly.
+        """
+        file_mode = self._mode == 'pe_pdb'
+        if file_mode:
+            sb = self._target.ResolveFileAddress(start)
+        else:
+            # Corefile: use load-address space for the SBAddress
+            # constructor because that's what the process-less
+            # ResolveLoadAddress expects, then translate back to
+            # file-addr for comparisons. image_base is the runtime
+            # slide the target was loaded at.
+            sb = self._target.ResolveLoadAddress(start + self._image_base)
         if not sb.IsValid():
             return []
-        # x86 instructions average ~3 bytes, so budget for worst case.
         byte_count = max(1, end - start)
         instrs = self._target.ReadInstructions(sb, byte_count)
         kept: list[Any] = []
         for i in range(instrs.GetSize()):
             insn = instrs.GetInstructionAtIndex(i)
             lldb_addr = insn.GetAddress()
-            a = (
-                lldb_addr.GetFileAddress() if self._mode == 'pe_pdb'
-                else lldb_addr.GetLoadAddress(self._target))
-            if a == self._lldb.LLDB_INVALID_ADDRESS or a < start:
+            if file_mode:
+                a = lldb_addr.GetFileAddress()
+            else:
+                load = lldb_addr.GetLoadAddress(self._target)
+                if load == self._lldb.LLDB_INVALID_ADDRESS:
+                    continue
+                a = load - self._image_base
+            if a < start:
                 continue
             if a >= end:
                 break
             kept.append(insn)
         return kept
 
-    def find_callee_at_return_addr(
+    def _locate_call_at_return(
         self, ret_addr: int, function_name: str | None = None,
-    ) -> tuple[str, str] | None:
-        """Find the call that returns to `ret_addr` and parse its target.
-
-        Walks the enclosing function's disassembly looking for a
-        call instruction whose `addr + size == ret_addr`. Returns
-        `(callee_symbol, callee_source_loc)` from LLDB's annotation
-        comment, or None if the call is indirect or unresolved.
-
-        For corefile mode `ret_addr` is an ELF offset (runtime
-        adjustment is applied inside `_resolve_sb_address`); for
-        pe_pdb mode it's an absolute file address.
+    ) -> tuple[Any, int] | None:
+        """Walk the enclosing function looking for the call whose
+        return address is `ret_addr`. Returns `(SBInstruction,
+        file_addr)` on success, None otherwise. The walk is
+        bounded by the function's [start, end) range so we don't
+        stumble into neighbouring code. All addresses are in the
+        file-address space (ELF offset for corefile, PE file
+        address for pe_pdb) — the same space `ret_addr` is in.
         """
-        file_mode = self._mode == 'pe_pdb'
-        runtime = ret_addr if file_mode else ret_addr + self._image_base
-
         range_: tuple[int, int] | None = None
         if function_name:
             range_ = self._function_range(function_name)
@@ -902,49 +947,94 @@ class LldbBackend:
             if not sb_addr.IsValid():
                 return None
             fn = sb_addr.GetFunction()
-            if not fn.IsValid():
+            if fn.IsValid():
+                start_sb = fn.GetStartAddress()
+                end_sb = fn.GetEndAddress()
+            else:
                 sym = sb_addr.GetSymbol()
                 if not sym.IsValid():
                     return None
                 start_sb = sym.GetStartAddress()
                 end_sb = sym.GetEndAddress()
-            else:
-                start_sb = fn.GetStartAddress()
-                end_sb = fn.GetEndAddress()
             if not start_sb.IsValid() or not end_sb.IsValid():
                 return None
-            start = (
-                start_sb.GetFileAddress() if file_mode
-                else start_sb.GetLoadAddress(self._target))
-            end = (
-                end_sb.GetFileAddress() if file_mode
-                else end_sb.GetLoadAddress(self._target))
+            start = start_sb.GetFileAddress()
+            end = end_sb.GetFileAddress()
             if start == self._lldb.LLDB_INVALID_ADDRESS:
                 return None
             range_ = (start, end)
 
+        file_mode = self._mode == 'pe_pdb'
         for insn in self._iter_function_instructions(*range_):
             mn = (insn.GetMnemonic(self._target) or '').lower()
             if not mn.startswith(('call', 'bl', 'jmp')):
                 continue
             insn_addr = insn.GetAddress()
-            a = (
-                insn_addr.GetFileAddress() if file_mode
-                else insn_addr.GetLoadAddress(self._target))
-            if a + insn.GetByteSize() != runtime:
-                continue
-            comment = insn.GetComment(self._target) or ''
-            return self._parse_call_comment(comment)
+            if file_mode:
+                a = insn_addr.GetFileAddress()
+            else:
+                load = insn_addr.GetLoadAddress(self._target)
+                if load == self._lldb.LLDB_INVALID_ADDRESS:
+                    continue
+                a = load - self._image_base
+            if a + insn.GetByteSize() == ret_addr:
+                return (insn, a)
         return None
+
+    def find_callee_at_return_addr(
+        self, ret_addr: int, function_name: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Find the call that returns to `ret_addr` and parse its target.
+
+        Returns `(callee_symbol, callee_source_loc)` from LLDB's
+        annotation comment, or None if the call is indirect or
+        unresolved. Corefile mode expects `ret_addr` as an ELF
+        offset; pe_pdb mode expects an absolute file address.
+        """
+        located = self._locate_call_at_return(ret_addr, function_name)
+        if located is None:
+            return None
+        insn, _ = located
+        comment = insn.GetComment(self._target) or ''
+        return self._parse_call_comment(comment)
+
+    def call_site_addr_for_return(
+        self, ret_addr: int,
+    ) -> int | None:
+        """Return the file address of the call instruction whose
+        return address is `ret_addr`, or None if not found.
+
+        This is what the UI's disassembly tab should center on for a
+        non-crash frame: the actual CALL / BL instruction, not the
+        address past it. Corefile mode returns an ELF offset,
+        pe_pdb mode returns an absolute file address — matching the
+        address space of `frame.address` in each mode.
+        """
+        located = self._locate_call_at_return(ret_addr)
+        if located is None:
+            return None
+        _, insn_addr = located
+        return insn_addr
 
     def tail_call_target(
         self, function_name: str,
-    ) -> tuple[str, str] | None:
-        """If `function_name` ends in a tail-call `jmp <known_sym>`
-        (no instructions after), return the target `(symbol, source_loc)`
-        from LLDB's annotation. Returns None when the function has
-        a proper `ret`, the tail target is indirect, or the target
-        symbol is not resolvable.
+    ) -> tuple[str, int, str] | None:
+        """Locate `function_name`'s terminating tail-call jmp.
+
+        If the function ends in an unconditional `jmp <known_sym>`
+        (no instructions after), returns a tuple of
+        `(target_symbol_name, jmp_file_addr, jmp_source_loc)` — the
+        symbol the jmp lands on, the file address of the jmp
+        instruction itself, and the `file:line` source location of
+        the jmp from LLDB's line table. Returns None when the
+        function has a proper `ret`, the tail target is indirect,
+        or the target symbol is not resolvable.
+
+        Callers use the jmp's own `(addr, source_loc)` as the
+        "current location" of a synthetic tail-called frame —
+        that's more meaningful than the function entry since it
+        shows where control transferred to the next link in the
+        chain.
         """
         range_ = self._function_range(function_name)
         if range_ is None:
@@ -956,8 +1046,35 @@ class LldbBackend:
         mn = (last.GetMnemonic(self._target) or '').lower()
         if not mn.startswith('jmp') and mn not in ('b',):
             return None
-        comment = last.GetComment(self._target) or ''
-        return self._parse_call_comment(comment)
+        parsed = self._parse_call_comment(last.GetComment(self._target) or '')
+        if parsed is None:
+            return None
+        target_symbol, _target_src = parsed
+        lldb_addr = last.GetAddress()
+        file_mode = self._mode == 'pe_pdb'
+        if file_mode:
+            jmp_addr = lldb_addr.GetFileAddress()
+        else:
+            load = lldb_addr.GetLoadAddress(self._target)
+            if load == self._lldb.LLDB_INVALID_ADDRESS:
+                return None
+            jmp_addr = load - self._image_base
+        if jmp_addr == self._lldb.LLDB_INVALID_ADDRESS:
+            return None
+        # Look up the source line for the jmp itself (caller's last
+        # executed line, not the callee's entry).
+        jmp_sb = self._resolve_sb_address(jmp_addr)
+        jmp_src = ''
+        if jmp_sb.IsValid():
+            le = jmp_sb.GetLineEntry()
+            if le.IsValid():
+                spec = le.GetFileSpec()
+                fname = spec.GetFilename() or ''
+                directory = spec.GetDirectory() or ''
+                if fname:
+                    path = f'{directory}/{fname}' if directory else fname
+                    jmp_src = f'{path}:{le.GetLine()}'
+        return (target_symbol, jmp_addr, jmp_src)
 
     def function_entry_source_loc(
         self, function_name: str,

@@ -101,9 +101,17 @@ def disassemble_around(
     forward = _decode_sized(cs, text_bytes, text_vaddr, addr, context)
 
     # -- backward half: pick a start that lands on a boundary.
-    if (
+    if func_start is not None and addr <= func_start:
+        # `addr` is the function entry (or past the end of its
+        # symbol range). Nothing valid lives in `[addr - context,
+        # addr)` as far as this function's body goes, so skip the
+        # backward half entirely — reaching into the preceding
+        # function's epilogue + padding yields instructions tagged
+        # with the wrong source line.
+        back_start = addr
+    elif (
         func_start is not None
-        and 0 < addr - func_start <= context * 6
+        and addr - func_start <= context * 6
         and func_start >= text_vaddr
     ):
         back_start = func_start
