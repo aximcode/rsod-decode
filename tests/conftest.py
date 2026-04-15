@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from rsod_decode.app import create_app
-from rsod_decode.decoder import analyze_rsod
-from rsod_decode.symbols import load_symbols
+
+# Point persistent storage at a throwaway dir BEFORE any rsod_decode
+# module gets imported, so the test suite never touches the
+# developer's real ~/.rsod-debug/.
+_TEST_DATA_DIR = tempfile.mkdtemp(prefix='rsod-test-data-')
+os.environ['RSOD_DATA_DIR'] = _TEST_DATA_DIR
+
+from rsod_decode.app import create_app  # noqa: E402
+from rsod_decode.decoder import analyze_rsod  # noqa: E402
+from rsod_decode.symbols import load_symbols  # noqa: E402
 
 from ._datasets import (
     DATASET_SPECS,

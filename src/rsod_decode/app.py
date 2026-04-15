@@ -1,10 +1,12 @@
 """Flask API for the RSOD debugger web UI.
 
-Phase 1: In-memory session storage, file uploads to temp dir.
+Sessions persist via SQLite at `~/.rsod-debug/sessions.db`; the
+in-memory `_sessions` dict acts as a hot cache. On cache miss,
+`/api/session/<id>` hydrates from disk by re-running
+`service.run_analysis` against the stored inputs.
 """
 from __future__ import annotations
 
-import re
 import shutil
 import tempfile
 import uuid
@@ -14,9 +16,9 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from werkzeug.utils import secure_filename
 
+from . import data_dir as _data_dir, storage
 from .models import SymbolSource, clean_path, binary_for_frame, find_source_file
 from .corefile import write_corefile
-from .decoder import analyze_rsod
 from .gdb_bridge import GdbSession
 from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
 from .serializers import (
@@ -24,22 +26,215 @@ from .serializers import (
     crash_info_to_dict, binary_for_session, frame_to_dict, registers_to_dict,
 )
 from .service import (
-    advance_past_brace_line, reinit_backend as _service_reinit_backend,
+    AnalysisContext, advance_past_brace_line,
+    reinit_backend as _service_reinit_backend,
     resolve_frame_vars, run_analysis,
 )
 from .session import (
-    Session, cleanup_session, gdb_available, get_session, lldb_available,
-    pop_session, register_session, store_session,
+    Session, delete_session as _delete_session,
+    gdb_available, get_session, lldb_available,
+    pop_session, store_session,
 )
 from .symbols import SymbolLoadError, is_pe, load_symbols
 
 
 def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
-    """Look up a session by ID, returning (session, None) or (None, 404-response)."""
+    """Look up a session, falling back to SQLite hydration on miss.
+
+    Returns (session, None) on hit, (None, 404-response) otherwise.
+    Hydration replays `service.run_analysis` against the stored
+    inputs so permalinks and evicted sessions come back transparently.
+    """
     session = get_session(session_id)
+    if session is not None:
+        return session, None
+    app = _flask_app()
+    try:
+        session = _hydrate_session(app, session_id)
+    except FileNotFoundError as e:
+        return None, (jsonify(error=str(e)), 410)
     if session is None:
         return None, (jsonify(error='session not found'), 404)
+    store_session(session)
     return session, None
+
+
+def _flask_app() -> Flask:
+    """Return the current Flask app (within request context)."""
+    from flask import current_app
+    return current_app._get_current_object()  # type: ignore[attr-defined]
+
+
+# =============================================================================
+# Shared upload / analysis / persistence pipeline
+# =============================================================================
+
+def _copy_uploads_to_disk(
+    files_dir: Path, rsod_file, sym_file, extra_files: list,
+) -> tuple[Path, list[Path], str]:
+    """Copy a POST /api/session upload into `files_dir`.
+
+    Returns (primary_path, extra_paths, rsod_text). Raises on I/O
+    error — the caller is responsible for rolling back the directory.
+    """
+    files_dir.mkdir(parents=True, exist_ok=True)
+    rsod_path = files_dir / 'rsod.txt'
+    rsod_file.save(str(rsod_path))
+    primary = files_dir / secure_filename(sym_file.filename or 'symbols')
+    sym_file.save(str(primary))
+    extras: list[Path] = []
+    for f in extra_files:
+        p = files_dir / secure_filename(f.filename or 'extra')
+        f.save(str(p))
+        extras.append(p)
+    rsod_text = rsod_path.read_text(encoding='utf-8', errors='replace')
+    return primary, extras, rsod_text
+
+
+def _analyze_from_disk(
+    app: Flask,
+    *,
+    rsod_text: str,
+    primary_path: Path,
+    extra_paths: list[Path],
+    base_override: int | None,
+    dwarf_prefix: str | None,
+) -> tuple[AnalysisContext, Path | None, Path | None, list[Path]]:
+    """Run symbol loading + analysis on already-persisted files.
+
+    Returns `(ctx, companion_path, pdb_path, remaining_extras)`. The
+    three path return values reflect how `_pair_map_with_pe` and
+    `_pop_pdb_for` classified the input set, so the caller can
+    persist a matching session_files row for each.
+    """
+    companion, remaining_extras = _pair_map_with_pe(primary_path, extra_paths)
+    pe_for_pdb = companion if companion and is_pe(companion) else (
+        primary_path if is_pe(primary_path) else None)
+    pdb_path: Path | None = None
+    if pe_for_pdb is not None:
+        pdb_path, remaining_extras = _pop_pdb_for(
+            pe_for_pdb.stem, remaining_extras)
+
+    source = load_symbols(
+        primary_path,
+        dwarf_prefix=dwarf_prefix,
+        repo_root=app.config.get('REPO_ROOT'),
+        companion_path=companion,
+        pdb_path=pdb_path if companion is None else None)
+
+    extra_sources: dict[str, SymbolSource] = {}
+    for p in remaining_extras:
+        s = load_symbols(
+            p, dwarf_prefix=dwarf_prefix,
+            repo_root=app.config.get('REPO_ROOT'))
+        extra_sources[p.stem.lower()] = s
+
+    # NOTE: temp_dir is deliberately None. `evict_from_memory` wipes
+    # `session.temp_dir` on eviction — setting it to the persistent
+    # files dir here would nuke `~/.rsod-debug/files/<id>/` on LRU
+    # rollover. Short-lived artifacts (GDB terminal corefile) get
+    # their own `tempfile.mkdtemp()` in the WS handler on demand.
+    ctx = run_analysis(
+        rsod_text, source, extra_sources,
+        base_override=base_override,
+        symbol_search_paths=app.config.get('SYMBOL_SEARCH_PATHS'),
+        temp_dir=None,
+        elf_path=primary_path,
+        pe_path=pe_for_pdb,
+        pdb_path=pdb_path,
+        backend='auto',
+        source_roots=_source_search_roots(app),
+    )
+    return ctx, companion, pdb_path, remaining_extras
+
+
+def persist_session(
+    *,
+    session_id: str,
+    created_at: str,
+    ctx: AnalysisContext,
+    rsod_text: str,
+    primary_path: Path,
+    companion_path: Path | None,
+    pdb_path: Path | None,
+    remaining_extras: list[Path],
+    base_override: int | None,
+    dwarf_prefix: str | None,
+) -> None:
+    """Insert one row + session_files entries for a freshly-uploaded session.
+
+    Callers must have already copied the files into
+    `data_dir.session_files_dir_for(session_id)` — only filenames
+    (basenames relative to that dir) are stored in `session_files`.
+    Used by both the HTTP upload handler and the CLI pre-load path.
+    """
+    ci = ctx.result.crash_info
+    files: list[storage.FileEntry] = [
+        storage.FileEntry(
+            filename=primary_path.name, file_type='primary',
+            rel_path=primary_path.name),
+    ]
+    if companion_path is not None:
+        files.append(storage.FileEntry(
+            filename=companion_path.name, file_type='companion',
+            rel_path=companion_path.name))
+    if pdb_path is not None:
+        files.append(storage.FileEntry(
+            filename=pdb_path.name, file_type='pdb',
+            rel_path=pdb_path.name))
+    for p in remaining_extras:
+        files.append(storage.FileEntry(
+            filename=p.name, file_type='extra', rel_path=p.name))
+
+    image_name = ci.image_name or primary_path.stem
+    storage.save_session(
+        session_id=session_id,
+        created_at=created_at,
+        rsod_text=rsod_text,
+        rsod_format=ctx.result.rsod_format or '',
+        image_name=image_name,
+        image_base=ctx.image_base,
+        exception_desc=ci.exception_desc or '',
+        crash_pc=ci.crash_pc,
+        crash_symbol=ci.crash_symbol or '',
+        frame_count=len(ctx.result.frames),
+        backend=ctx.backend,
+        base_override=base_override,
+        dwarf_prefix=dwarf_prefix,
+        files=files,
+    )
+
+
+def _hydrate_session(app: Flask, session_id: str) -> Session | None:
+    """Reconstruct a Session from SQLite + on-disk files.
+
+    Returns None if no row exists. Raises `FileNotFoundError` if the
+    row exists but the files dir has been partially removed out of
+    band.
+    """
+    inputs = storage.hydrate_inputs(session_id)
+    if inputs is None:
+        return None
+
+    extras = list(inputs.extra_paths)
+    # hydrate_inputs already split companion/pdb; rebuild the flat list
+    # that _analyze_from_disk re-classifies — it's idempotent because
+    # the classifier is a pure function of the file names.
+    if inputs.companion_path is not None:
+        extras.append(inputs.companion_path)
+    if inputs.pdb_path is not None:
+        extras.append(inputs.pdb_path)
+
+    ctx, _, _, _ = _analyze_from_disk(
+        app,
+        rsod_text=inputs.rsod_text,
+        primary_path=inputs.primary_path,
+        extra_paths=extras,
+        base_override=inputs.base_override,
+        dwarf_prefix=inputs.dwarf_prefix or app.config.get('DWARF_PREFIX'),
+    )
+    return Session.from_analysis_context(
+        ctx, session_id, created_at=inputs.created_at)
 
 
 def _source_search_roots(app: Flask) -> list[Path]:
@@ -72,6 +267,11 @@ def create_app(repo_root: Path | None = None,
     app.config['SYMBOL_SEARCH_PATHS'] = symbol_search_paths
     app.config['SOURCE_PATHS'] = source_paths or []
 
+    # Initialize persistent session store. Idempotent: creates
+    # ~/.rsod-debug/sessions.db (or $RSOD_DATA_DIR) on first run,
+    # runs migrations on subsequent runs.
+    storage.init_db()
+
     # -----------------------------------------------------------------
     # POST /api/session — upload RSOD + symbols, create session
     # -----------------------------------------------------------------
@@ -82,92 +282,59 @@ def create_app(repo_root: Path | None = None,
         if 'symbol_file' not in request.files:
             return jsonify(error='symbol_file required'), 400
 
-        rsod_file = request.files['rsod_log']
-        sym_file = request.files['symbol_file']
-
-        # Save uploads to temp dir with sanitized filenames
-        temp_dir = Path(tempfile.mkdtemp(prefix='rsod-'))
-        rsod_path = temp_dir / secure_filename(rsod_file.filename or 'rsod.txt')
-        sym_path = temp_dir / secure_filename(sym_file.filename or 'symbols')
-        rsod_file.save(str(rsod_path))
-        sym_file.save(str(sym_path))
-
-        # Save extra symbol files
-        extra_paths: list[Path] = []
-        for f in request.files.getlist('extra_symbols[]'):
-            p = temp_dir / secure_filename(f.filename or 'extra')
-            f.save(str(p))
-            extra_paths.append(p)
-
-        # Detect a MAP+EFI pair for MSVC builds: if the primary or one of
-        # the extras is the PE companion of the other, fold it into the
-        # loader as companion_path instead of treating it as a separate
-        # module. Also pick up a matching .pdb for PDB-backed LLDB.
-        companion, extra_paths = _pair_map_with_pe(sym_path, extra_paths)
-        pe_for_pdb = companion if companion and is_pe(companion) else (
-            sym_path if is_pe(sym_path) else None)
-        pdb_path: Path | None = None
-        if pe_for_pdb is not None:
-            pdb_path, extra_paths = _pop_pdb_for(
-                pe_for_pdb.stem, extra_paths)
-
-        # Load symbols. When we have a .efi primary + .pdb but no .map,
-        # load_symbols() will derive the symbol table from the PDB via
-        # a short-lived LLDB session.
-        try:
-            source = load_symbols(
-                sym_path,
-                dwarf_prefix=app.config['DWARF_PREFIX'],
-                repo_root=app.config['REPO_ROOT'],
-                companion_path=companion,
-                pdb_path=pdb_path if companion is None else None)
-        except SymbolLoadError as e:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            return jsonify(error=str(e)), 400
-
-        extra_sources: dict[str, SymbolSource] = {}
-        for p in extra_paths:
-            try:
-                s = load_symbols(p,
-                                 dwarf_prefix=app.config['DWARF_PREFIX'],
-                                 repo_root=app.config['REPO_ROOT'])
-            except SymbolLoadError as e:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return jsonify(error=str(e)), 400
-            extra_sources[p.stem.lower()] = s
-
-        # Read RSOD text
-        rsod_text = rsod_path.read_text(encoding='utf-8', errors='replace')
-
-        # Base override from form data
-        base_override = None
+        base_override: int | None = None
         base_str = request.form.get('base')
         if base_str:
             try:
                 base_override = int(base_str, 16)
             except ValueError:
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 return jsonify(error=f'invalid base address: {base_str}'), 400
 
-        # Run the shared analysis pipeline: parse + backend init
-        # (lldb → gdb → pyelftools auto) + source_loc backfill + tail
-        # call reconstruction. All of this used to be inlined here.
-        ctx = run_analysis(
-            rsod_text, source, extra_sources,
-            base_override=base_override,
-            symbol_search_paths=app.config['SYMBOL_SEARCH_PATHS'],
-            temp_dir=temp_dir,
-            elf_path=sym_path,
-            pe_path=pe_for_pdb,
-            pdb_path=pdb_path,
-            backend='auto',
-            source_roots=_source_search_roots(app),
-        )
-
         session_id = uuid.uuid4().hex[:12]
+        files_dir = _data_dir.session_files_dir_for(session_id)
+        try:
+            primary_path, extra_paths, rsod_text = _copy_uploads_to_disk(
+                files_dir,
+                request.files['rsod_log'],
+                request.files['symbol_file'],
+                request.files.getlist('extra_symbols[]'),
+            )
+        except OSError as e:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            return jsonify(error=f'upload failed: {e}'), 500
+
+        try:
+            ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
+                app,
+                rsod_text=rsod_text,
+                primary_path=primary_path,
+                extra_paths=extra_paths,
+                base_override=base_override,
+                dwarf_prefix=app.config.get('DWARF_PREFIX'),
+            )
+        except SymbolLoadError as e:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            return jsonify(error=str(e)), 400
+        except Exception as e:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            raise
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        try:
+            persist_session(
+                session_id=session_id, created_at=created_at, ctx=ctx,
+                rsod_text=rsod_text,
+                primary_path=primary_path, companion_path=companion,
+                pdb_path=pdb_path, remaining_extras=remaining_extras,
+                base_override=base_override,
+                dwarf_prefix=app.config.get('DWARF_PREFIX'),
+            )
+        except Exception:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            raise
+
         session = Session.from_analysis_context(
-            ctx, session_id,
-            created_at=datetime.now(timezone.utc).isoformat())
+            ctx, session_id, created_at=created_at)
         store_session(session)
 
         return jsonify(
@@ -646,15 +813,37 @@ def create_app(repo_root: Path | None = None,
         return jsonify(backend=session.backend)
 
     # -----------------------------------------------------------------
-    # DELETE /api/session/<id> — cleanup
+    # GET /api/history — list recent sessions (SQLite-backed)
+    # -----------------------------------------------------------------
+    @app.get('/api/history')
+    def get_history():
+        limit = min(request.args.get('limit', default=100, type=int), 500)
+        before = request.args.get('before', type=str)
+        rows = storage.list_sessions(limit=limit, before=before)
+        return jsonify(sessions=[{
+            'id': r.id,
+            'created_at': r.created_at,
+            'image_name': r.image_name,
+            'exception_desc': r.exception_desc,
+            'crash_pc': r.crash_pc,
+            'crash_symbol': r.crash_symbol,
+            'frame_count': r.frame_count,
+            'backend': r.backend,
+        } for r in rows])
+
+    # -----------------------------------------------------------------
+    # DELETE /api/session/<id> — drop in-memory + SQLite + files dir
     # -----------------------------------------------------------------
     @app.delete('/api/session/<session_id>')
-    def delete_session(session_id: str):
+    def delete_session_route(session_id: str):
         session = pop_session(session_id)
-        if not session:
-            return jsonify(error='session not found'), 404
-        cleanup_session(session)
-        return jsonify(deleted=True)
+        if session is not None:
+            _delete_session(session)
+            return jsonify(deleted=True)
+        # Session may only exist on disk (evicted or cross-restart).
+        if storage.delete_session(session_id):
+            return jsonify(deleted=True)
+        return jsonify(error='session not found'), 404
 
     # -----------------------------------------------------------------
     # WebSocket /ws/gdb/<session_id> — GDB terminal bridge

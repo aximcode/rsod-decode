@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import socket
 import sys
 import uuid
@@ -22,7 +23,8 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .app import create_app
+from . import data_dir as _data_dir
+from .app import create_app, persist_session
 from .session import Session, register_session
 from .symbols import SymbolLoadError, load_symbols
 
@@ -137,45 +139,69 @@ def main() -> None:
     if args.rsod_log and args.symbol_file:
         _log(f"Loading {args.rsod_log.name} + {args.symbol_file.name}...")
 
-        # MSVC/EPSA: detect a MAP+EFI companion pair in the extras, and
-        # pick up a matching .pdb for PDB-backed LLDB.
-        from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
-        from .symbols import is_pe
-        sym_extras = list(args.sym)
-        companion, sym_extras = _pair_map_with_pe(args.symbol_file, sym_extras)
-        pe_for_pdb = companion if companion and is_pe(companion) else (
-            args.symbol_file if is_pe(args.symbol_file) else None)
-        pdb_path: Path | None = None
-        if pe_for_pdb is not None:
-            pdb_path, sym_extras = _pop_pdb_for(pe_for_pdb.stem, sym_extras)
-
-        try:
-            source = load_symbols(
-                args.symbol_file,
-                dwarf_prefix=args.dwarf_prefix,
-                repo_root=repo_root,
-                companion_path=companion,
-                pdb_path=pdb_path if companion is None else None)
-        except SymbolLoadError as e:
-            sys.exit(f"Error: {e}")
-
-        extra_sources = {}
-        for p in sym_extras:
-            try:
-                s = load_symbols(p, dwarf_prefix=args.dwarf_prefix,
-                                 repo_root=repo_root)
-            except SymbolLoadError as e:
-                sys.exit(f"Error: {e}")
-            extra_sources[p.stem.lower()] = s
-
-        rsod_text = args.rsod_log.read_text(encoding='utf-8', errors='replace')
-
         base_override = None
         if args.base:
             try:
                 base_override = int(args.base, 16)
             except ValueError:
                 sys.exit(f"Error: invalid base address: {args.base}")
+
+        # Copy the CLI inputs into the persistent files dir up-front so
+        # the live session and any future hydration after a restart
+        # both read from the same location. Everything downstream —
+        # load_symbols, run_analysis, persist_session — runs against
+        # the copies, not the user's original paths.
+        session_id = uuid.uuid4().hex[:12]
+        files_dir = _data_dir.session_files_dir_for(session_id)
+        files_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (files_dir / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
+            primary_path = files_dir / args.symbol_file.name
+            shutil.copy2(args.symbol_file, primary_path)
+            extra_paths: list[Path] = []
+            for src in args.sym:
+                dst = files_dir / src.name
+                shutil.copy2(src, dst)
+                extra_paths.append(dst)
+        except OSError as e:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            sys.exit(f"Error copying inputs to {files_dir}: {e}")
+
+        # MSVC/EPSA: detect a MAP+EFI companion pair in the extras, and
+        # pick up a matching .pdb for PDB-backed LLDB.
+        from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
+        from .symbols import is_pe
+        companion, remaining_extras = _pair_map_with_pe(primary_path, extra_paths)
+        pe_for_pdb = companion if companion and is_pe(companion) else (
+            primary_path if is_pe(primary_path) else None)
+        pdb_path: Path | None = None
+        if pe_for_pdb is not None:
+            pdb_path, remaining_extras = _pop_pdb_for(
+                pe_for_pdb.stem, remaining_extras)
+
+        try:
+            source = load_symbols(
+                primary_path,
+                dwarf_prefix=args.dwarf_prefix,
+                repo_root=repo_root,
+                companion_path=companion,
+                pdb_path=pdb_path if companion is None else None)
+        except SymbolLoadError as e:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            sys.exit(f"Error: {e}")
+
+        extra_sources = {}
+        for p in remaining_extras:
+            try:
+                s = load_symbols(p, dwarf_prefix=args.dwarf_prefix,
+                                 repo_root=repo_root)
+            except SymbolLoadError as e:
+                shutil.rmtree(files_dir, ignore_errors=True)
+                sys.exit(f"Error: {e}")
+            extra_sources[p.stem.lower()] = s
+
+        rsod_text = (files_dir / 'rsod.txt').read_text(
+            encoding='utf-8', errors='replace')
 
         cli_source_roots: list[Path] = []
         if repo_root is not None:
@@ -187,17 +213,29 @@ def main() -> None:
             rsod_text, source, extra_sources,
             base_override=base_override,
             symbol_search_paths=args.symbol_paths or None,
-            elf_path=args.symbol_file.resolve(),
-            pe_path=pe_for_pdb.resolve() if pe_for_pdb is not None else None,
-            pdb_path=pdb_path.resolve() if pdb_path is not None else None,
+            elf_path=primary_path,
+            pe_path=pe_for_pdb,
+            pdb_path=pdb_path,
             backend=args.backend,
             source_roots=cli_source_roots,
         )
 
-        session_id = uuid.uuid4().hex[:12]
+        created_at = datetime.now(timezone.utc).isoformat()
+        try:
+            persist_session(
+                session_id=session_id, created_at=created_at, ctx=ctx,
+                rsod_text=rsod_text,
+                primary_path=primary_path, companion_path=companion,
+                pdb_path=pdb_path, remaining_extras=remaining_extras,
+                base_override=base_override,
+                dwarf_prefix=args.dwarf_prefix,
+            )
+        except Exception as e:
+            shutil.rmtree(files_dir, ignore_errors=True)
+            sys.exit(f"Error persisting session: {e}")
+
         sess = Session.from_analysis_context(
-            ctx, session_id,
-            created_at=datetime.now(timezone.utc).isoformat())
+            ctx, session_id, created_at=created_at)
         register_session(sess)
 
         _log(f'Using {sess.backend} backend')

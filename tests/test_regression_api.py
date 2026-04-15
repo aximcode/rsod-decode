@@ -5,7 +5,7 @@ import re
 import pytest
 
 from ._datasets import DATASET_SPECS
-from .conftest import ApiSessionContext
+from .conftest import ApiSessionContext, create_api_session
 
 
 pytestmark = [pytest.mark.api]
@@ -334,3 +334,59 @@ def test_eval_rejected_without_gdb(api_session: ApiSessionContext, client) -> No
 
     response = client.post(f"/api/eval/{api_session.session_id}/0", json={"expr": "ctx"})
     assert response.status_code == 400
+
+
+def test_session_persistence_across_restart(client, app) -> None:
+    """Upload → simulate restart → hydrate → assert frames match.
+
+    Uses the edk2_aa64 dataset because it does not require an MSVC
+    PDB (PDB path is conditional on LLDB) so the pyelftools hydration
+    path is exercised even when system lldb is absent.
+    """
+    spec = DATASET_SPECS["edk2_aa64"]
+    ctx = create_api_session(client, spec)
+    session_id = ctx.session_id
+
+    first = client.get(f"/api/session/{session_id}")
+    assert first.status_code == 200
+    first_body = first.get_json()
+
+    # Hydration path: drop the in-memory session, then hit the same
+    # endpoint on a FRESH Flask app (same storage dir), simulating
+    # a process restart. The new client must recover the session from
+    # SQLite and re-run service.run_analysis against the stored inputs.
+    from rsod_decode.session import _sessions, evict_from_memory
+    from rsod_decode.app import create_app
+    evicted = _sessions.pop(session_id, None)
+    assert evicted is not None
+    evict_from_memory(evicted)
+
+    fresh_app = create_app(
+        repo_root=app.config["REPO_ROOT"],
+        dwarf_prefix=app.config["DWARF_PREFIX"],
+        source_paths=app.config.get("SOURCE_PATHS") or None,
+    )
+    fresh_app.config["TESTING"] = True
+    fresh_client = fresh_app.test_client()
+
+    hydrated = fresh_client.get(f"/api/session/{session_id}")
+    assert hydrated.status_code == 200, hydrated.get_json()
+    hydrated_body = hydrated.get_json()
+
+    # Frames should round-trip: same count, same addresses, same symbols.
+    assert len(hydrated_body["frames"]) == len(first_body["frames"])
+    for a, b in zip(first_body["frames"], hydrated_body["frames"]):
+        assert a["address"] == b["address"]
+        assert a.get("symbol") == b.get("symbol")
+
+    # History endpoint should list the session.
+    hist = fresh_client.get("/api/history").get_json()
+    assert any(s["id"] == session_id for s in hist["sessions"])
+
+    # Cleanup via DELETE — should also remove the files dir.
+    from rsod_decode import data_dir as _data_dir
+    files_dir = _data_dir.session_files_dir_for(session_id)
+    assert files_dir.exists()
+    resp = fresh_client.delete(f"/api/session/{session_id}")
+    assert resp.status_code == 200
+    assert not files_dir.exists()

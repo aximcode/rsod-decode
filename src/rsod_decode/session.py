@@ -145,12 +145,18 @@ def store_session(session: Session) -> None:
     """Store a session, evicting the oldest if at capacity."""
     if len(_sessions) >= MAX_SESSIONS:
         oldest_id = next(iter(_sessions))
-        cleanup_session(_sessions.pop(oldest_id))
+        evict_from_memory(_sessions.pop(oldest_id))
     _sessions[session.id] = session
 
 
-def cleanup_session(session: Session) -> None:
-    """Close file handles, kill GDB, and remove temp files for a session."""
+def evict_from_memory(session: Session) -> None:
+    """Close backends + clear frame cache. Leaves disk state intact.
+
+    Called by LRU eviction and on explicit delete. Persistent files
+    under `~/.rsod-debug/files/<id>/` are NOT touched — only the
+    short-lived `temp_dir` (used by the GDB terminal for corefiles)
+    is cleaned up.
+    """
     if session.gdb:
         session.gdb.close()
         session.gdb = None
@@ -177,3 +183,17 @@ def cleanup_session(session: Session) -> None:
             src.binary.close()
     if session.temp_dir and session.temp_dir.exists():
         shutil.rmtree(session.temp_dir, ignore_errors=True)
+    session.frame_cache.clear()
+
+
+def delete_session(session: Session) -> None:
+    """Evict from memory + drop SQLite row + remove persistent files dir."""
+    from . import storage
+    evict_from_memory(session)
+    storage.delete_session(session.id)
+
+
+# Back-compat alias — anything still importing the old name gets the
+# memory-eviction behavior. Persistent delete callers must use
+# `delete_session(session)` explicitly.
+cleanup_session = evict_from_memory
