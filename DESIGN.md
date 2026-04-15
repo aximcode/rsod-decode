@@ -420,54 +420,85 @@ Three-tier approach for maximum compatibility:
 
 Launch:
 ```
-rsod-debug                     # native window (pywebview)
-RSOD_NO_WEBVIEW=1 rsod-debug   # force browser mode
-rsod-debug --port 9090         # custom port
+rsod serve                         # opens browser to localhost:5000
+rsod serve --no-browser            # headless (curl/Playwright)
+rsod serve --port 9090             # custom port
+rsod serve rsod.txt app.so -v      # pre-load a session on startup
 ```
 
 ## .pyzw Packaging
 
-Only the CLI analyzer (`rsod-decode`) is shipped as a standalone
-zipapp. `rsod-debug` (the Flask web UI + bundled frontend) stays an
-editable install — it has a different distribution story and is
-out of scope for the zipapp build.
+Both the CLI and web UI ship in a single unified `rsod.pyzw` zipapp.
+`rsod decode` runs the text-report CLI; `rsod serve` launches the
+Flask web UI and opens a browser tab. Imports are lazy in the
+`rsod_decode.__main__` dispatcher so each subcommand only pays the
+startup cost of its own code path.
 
 Build:
 ```
-python build_pyz.py → rsod-decode.pyzw   # ~2 MB, ~1.8 MB observed
+cd frontend && npm run build   # produces frontend/dist/ (~600 KB)
+python build_pyz.py            # → rsod.pyzw (~2.6 MB)
 ```
 
-Contents:
-- `rsod_decode/` package (CLI code path only; same source as the
-  editable install, unchanged)
-- Pure-Python deps bundled inside the zip: pyelftools, cxxfilt, pefile
-- `capstone/` bundled in the zip but extracted on first run — its
-  `libcapstone.so` is loaded via `ctypes.CDLL` using a
-  `__file__`-relative path, so zipimport can't serve it
+`build_pyz.py` refuses to run when `frontend/dist/index.html` is
+missing — the React build is a hard precondition, not automated.
+
+Contents (layout inside the zip):
+```
+rsod.pyzw/
+├── __main__.py              bootstrap (extract + dispatch)
+├── rsod_decode/             application code
+├── flask/ werkzeug/ jinja2/ markupsafe/ blinker/
+├── itsdangerous/ click/
+├── flask_sock/ simple_websocket/ wsproto/ h11/
+├── elftools/ capstone/ cxxfilt/ pefile.py pygdbmi/
+└── frontend/dist/           React build output
+```
+
+Dependencies are staged with `pip install --target build/pyzw-staging
+--no-compile --no-deps`, listing the full transitive closure
+explicitly. `--no-deps` keeps the bundle deterministic across
+rebuilds; the explicit list in `build_pyz._expand_deps()` is the
+single source of truth for what lands in the artifact.
 
 Excluded on purpose:
-- Flask / werkzeug / flask-sock / simple-websocket — web-only; the
-  CLI transitive import closure does not touch them (verified via
-  `assert 'flask' not in sys.modules` after `import rsod_decode.cli`)
-- `pywebview`, `playwright`, `pygdbmi` — web/dev-only
-- LLDB Python bindings — runtime-loaded from the host's system install
-  via `lldb_loader.py`; the shim returns `None` gracefully when
-  absent, so the pyzw still runs on hosts without LLDB (ELF fixtures
-  work, PE+PDB path degrades)
-- `tests/`, `tests/fixtures/`, `frontend/`, any `.dist-info` metadata
+- `pywebview`, `playwright` — the web UI opens a browser tab via
+  stdlib `webbrowser`; no native-window binding is bundled
+- LLDB Python bindings — C extension tied to a specific LLVM
+  version, discovered at runtime from the host's system install via
+  `lldb_loader.py`. The loader returns `None` gracefully when the
+  module is absent, so the pyzw still runs on LLDB-less hosts (ELF
+  fixtures resolve fine; the PE+PDB path degrades to pyelftools).
+- `tests/`, `tests/fixtures/`, `.venv/`, `.git/`
+- `.dist-info` / `.egg-info` metadata (pruned after `pip install`)
 
 First-run behavior:
-- `__main__.py` hashes the zipapp and extracts any `NATIVE_PACKAGES`
-  (currently just `capstone`) to
-  `~/.cache/rsod-decode/libs/<hash16>/`, then prepends that dir to
-  `sys.path` and invokes `rsod_decode.cli:main`. Subsequent runs
-  skip extraction when the `.extracted` marker is present.
+- `__main__.py` hashes the zipapp's bytes (sha256, first 16 hex
+  chars) and extracts two prefixes — `capstone/` and
+  `frontend/dist/` — into `~/.cache/rsod-decode/libs/<hash16>/`.
+  Capstone is extracted because `libcapstone.so` is loaded via
+  `ctypes.CDLL` through a `__file__`-relative path that zipimport
+  can't serve; `frontend/dist/` is extracted because Flask's
+  `send_from_directory` needs a filesystem path for index.html +
+  assets.
+- The extraction dir is prepended to `sys.path` and
+  `RSOD_FRONTEND_DIST` is set in the environment. `server.py`'s
+  `resource_paths.frontend_dist()` checks that env var first before
+  falling back to the editable-install layout.
+- Subsequent runs skip extraction when a `.extracted` marker exists
+  in the cache dir. Rebuilding the pyzw changes the content hash,
+  so users automatically get fresh extraction without touching the
+  old cache.
 
 Distribution constraints:
-- The bundled `libcapstone.so` makes the pyzw **architecture-specific**
-  — a Linux x86_64 build only runs on Linux x86_64. Build separate
-  pyzw artifacts per target platform if cross-distribution is needed.
-- Requires Python 3.10+ on the target host (same as editable install).
+- `libcapstone.so` makes the pyzw **architecture-specific**: a
+  Linux-x86_64 build runs only on Linux x86_64. Build separate
+  artifacts per platform if cross-distribution matters.
+- Python 3.10+ on the target host (same as editable install).
+- System LLDB is optional but gives the CLI + web UI access to
+  callsite-arg reconstruction, PE+PDB minidump unwinding, and live
+  variable value resolution. Without it both subcommands still run,
+  just with the pyelftools fallback.
 
 ## Session Storage
 

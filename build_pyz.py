@@ -1,156 +1,228 @@
 #!/usr/bin/env python3
-"""Build rsod-decode.pyzw — a standalone zipapp for the CLI analyzer.
+"""Build rsod.pyzw — unified standalone zipapp (decode + serve).
 
-Bundles the rsod_decode package plus its pure-Python dependencies
-(pyelftools, cxxfilt, pefile, capstone) into a single executable zip.
-Entry point is rsod_decode.cli:main.
+Bundles the rsod_decode package, its Python dependencies, and the
+built React frontend into a single executable zip. Entry point is
+`rsod_decode.__main__:main` which dispatches to `decode` (CLI text
+report) or `serve` (Flask web UI) based on argv.
 
-ARCHITECTURE-SPECIFIC. capstone ships a native `libcapstone.so` that
-is loaded via ctypes (not Python's zipimport), so the resulting pyzw
-only runs on the same OS + CPU as the build host. On Linux x86_64
-in this tree, that means the pyzw runs on Linux x86_64 only.
+Uses `pip install --target` to stage pure-Python deps — same pattern
+as stenote's build_pyz.py. capstone (a ctypes-backed package with
+`libcapstone.so`) and `frontend/dist` (Flask needs a filesystem path
+for send_from_directory) are extracted to `~/.cache/rsod-decode/`
+on first run by the bootstrap __main__.py.
 
-Packages that need real filesystem access (ctypes, __file__-relative
-resource lookups) are listed in NATIVE_PACKAGES and get extracted to
-~/.cache/rsod-decode/libs/<hash>/ on first run by the bootstrap
-__main__.py. Pure-Python packages stay inside the zip and load via
-zipimport.
+ARCHITECTURE-SPECIFIC: `libcapstone.so` is bundled, so the output
+only runs on the same OS + CPU as the build host (Linux x86_64 in
+this tree).
 
-What we do NOT bundle:
+Precondition: the React frontend must be built first
+  `cd frontend && npm install && npm run build`
+— build_pyz fails fast if `frontend/dist/index.html` is missing.
 
-  - Flask / werkzeug / flask-sock / simple-websocket — the web UI's
-    entry point (rsod-debug) stays an editable install, not a pyzw.
-  - LLDB Python bindings — C extension tied to a specific LLVM
-    version. The existing lldb_loader.py shim searches system paths
-    at runtime and returns None gracefully when absent; that behavior
-    works fine from inside a zipapp.
-  - gdb_backend.py / gdb_bridge.py / pygdbmi — web-only, not reached
-    by the CLI's transitive import closure.
-  - tests/, tests/fixtures/, frontend/, .venv/, .git/
-  - .dist-info metadata dirs
+What we DO NOT bundle:
+  - lldb Python bindings — C extension tied to a specific LLVM
+    version, discovered at runtime from the host's system install
+    via `lldb_loader.py`. Works fine from inside a zipapp because
+    the loader searches filesystem paths, not sys.path.
+  - pywebview / playwright — web/dev-only
+  - tests/, tests/fixtures/, .venv/, .git/, *.dist-info
 """
 from __future__ import annotations
 
-import importlib.util
 import shutil
+import subprocess
 import sys
 import zipapp
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 STAGING = ROOT / "build" / "pyzw-staging"
-OUT = ROOT / "rsod-decode.pyzw"
+OUT = ROOT / "rsod.pyzw"
 
-# Pure-Python third-party packages copied into the zip verbatim.
-PURE_PACKAGES = ["elftools", "cxxfilt", "pefile"]
-
-# Packages that contain native code (ctypes-loaded .so files or
-# __file__-relative resources). These are bundled in the zip but the
-# bootstrap __main__.py extracts them to a cache dir on first run
-# because zipimport can't serve ctypes.CDLL.
-NATIVE_PACKAGES = ["capstone"]
-
-IGNORE = shutil.ignore_patterns(
-    "__pycache__", "*.pyc", "*.pyo", "*.pyi",
-    "tests", "test", "*.dist-info", "*.egg-info",
+# Packages pulled in via `pip install --target`. Transitive deps
+# (werkzeug, jinja2, markupsafe, itsdangerous, click, blinker, h11,
+# wsproto, simple-websocket, ...) come along automatically.
+PIP_DEPS = (
+    "flask>=3.0",
+    "flask-sock>=0.7",
+    "pyelftools>=0.30",
+    "capstone>=5.0",
+    "cxxfilt>=0.3",
+    "pefile>=2023.0",
+    "pygdbmi>=0.11",
 )
 
+# Packages that need a real filesystem path at runtime. The bootstrap
+# extracts anything whose zip path starts with one of these prefixes
+# into `~/.cache/rsod-decode/libs/<hash>/` on first run.
+#
+# - `capstone/` contains `lib/libcapstone.so` loaded via ctypes.CDLL
+#   using a __file__-relative path. zipimport can't serve it.
+# - `frontend/dist/` is served by Flask's `send_from_directory`
+#   which needs a filesystem path.
+EXTRACT_PREFIXES = ("capstone/", "frontend/dist/")
 
-def _copy_package(name: str, dest_parent: Path) -> None:
-    spec = importlib.util.find_spec(name)
-    if spec is None or spec.origin is None:
-        raise RuntimeError(f"cannot locate package {name!r} in current env")
-    if spec.submodule_search_locations:
-        src = Path(spec.origin).parent
-        shutil.copytree(src, dest_parent / src.name,
-                        dirs_exist_ok=True, ignore=IGNORE)
-    else:
-        shutil.copy2(spec.origin, dest_parent / Path(spec.origin).name)
+# Patterns pruned from the staging dir after pip install. `tests` in
+# transitive deps is noise; .dist-info metadata is unused at runtime.
+PRUNE_GLOBS = ("*.dist-info", "*.egg-info", "__pycache__", "*.pyc",
+               "*.pyo", "*.pyi", "tests", "test")
 
 
-# The bootstrap __main__.py lives at the root of the zip. Written as a
-# string so we can template NATIVE_PACKAGES into it at build time.
-_BOOTSTRAP_TEMPLATE = '''\
+_BOOTSTRAP = '''\
 # Auto-generated by build_pyz.py — do not edit.
-# Extracts bundled native packages to a cache dir, then delegates to
-# rsod_decode.cli:main.
+# Extracts ctypes-backed packages and static resources out of the
+# zipapp into a content-addressed cache dir, then delegates to
+# rsod_decode.__main__:main for subcommand dispatch.
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 import zipfile
 from pathlib import Path
 
-NATIVE_PACKAGES = {native_packages!r}
+EXTRACT_PREFIXES = ("capstone/", "frontend/dist/")
 
 
-def _extract_native_packages() -> None:
-    """Extract ctypes-backed packages out of the zipapp into a cache dir.
+def _extract_resources() -> None:
+    """First-run extraction of native pkgs + static assets.
 
-    capstone (and any other package in NATIVE_PACKAGES) loads a shared
-    library via ctypes.CDLL using a __file__-relative path, which
-    fails under zipimport. Extracting the whole package to a real
-    filesystem location and prepending that dir to sys.path lets the
-    standard import machinery find it first.
+    Content-addressed by the zipapp's sha256: rebuilding the pyzw
+    forces re-extraction automatically. Cached under
+    `~/.cache/rsod-decode/libs/<hash16>/`.
     """
     zpath = Path(sys.argv[0]).resolve()
     if not zpath.exists() or not zipfile.is_zipfile(zpath):
-        return  # running from staging dir, not a zipapp — dev mode
-    digest = hashlib.sha256()
+        return  # dev mode (running from staging dir)
+
+    h = hashlib.sha256()
     with zpath.open("rb") as f:
-        while True:
-            chunk = f.read(65536)
-            if not chunk:
-                break
-            digest.update(chunk)
-    cache = Path.home() / ".cache" / "rsod-decode" / "libs" / digest.hexdigest()[:16]
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    cache = (Path.home() / ".cache" / "rsod-decode" / "libs"
+             / h.hexdigest()[:16])
     marker = cache / ".extracted"
+
     if not marker.exists():
         cache.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zpath) as zf:
             for name in zf.namelist():
-                top = name.split("/", 1)[0]
-                if top in NATIVE_PACKAGES:
+                if any(name.startswith(p) for p in EXTRACT_PREFIXES):
                     zf.extract(name, cache)
         marker.touch()
+
     sys.path.insert(0, str(cache))
+    os.environ.setdefault("RSOD_FRONTEND_DIST",
+                          str(cache / "frontend" / "dist"))
 
 
-_extract_native_packages()
+_extract_resources()
 
-from rsod_decode.cli import main  # noqa: E402
+from rsod_decode.__main__ import main  # noqa: E402
 
 raise SystemExit(main())
 '''
 
 
-def main() -> None:
+def _ensure_frontend_built() -> None:
+    index = ROOT / "frontend" / "dist" / "index.html"
+    if not index.exists():
+        sys.exit(
+            "frontend/dist/index.html missing. Run "
+            "`cd frontend && npm install && npm run build` first.")
+
+
+def _clean_staging() -> None:
     if STAGING.exists():
         shutil.rmtree(STAGING)
     STAGING.mkdir(parents=True)
 
-    # Application code.
-    shutil.copytree(ROOT / "src" / "rsod_decode", STAGING / "rsod_decode",
-                    ignore=IGNORE)
 
-    # Third-party deps.
-    for pkg in PURE_PACKAGES + NATIVE_PACKAGES:
-        _copy_package(pkg, STAGING)
+def _copy_package() -> None:
+    shutil.copytree(
+        ROOT / "src" / "rsod_decode", STAGING / "rsod_decode",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
-    # Bootstrap entry point.
-    bootstrap = _BOOTSTRAP_TEMPLATE.format(native_packages=NATIVE_PACKAGES)
-    (STAGING / "__main__.py").write_text(bootstrap, encoding="utf-8")
 
+def _copy_frontend() -> None:
+    shutil.copytree(
+        ROOT / "frontend" / "dist", STAGING / "frontend" / "dist")
+
+
+def _pip_install_deps() -> None:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "--target", str(STAGING),
+        "--no-compile", "--no-deps", "--quiet",
+        # --no-deps keeps the transitive closure deterministic; list
+        # everything we care about explicitly so we control what lands
+        # in the bundle.
+        *_expand_deps(),
+    ])
+
+
+def _expand_deps() -> list[str]:
+    """Explicit transitive closure so --no-deps stays reproducible.
+
+    pip install --no-deps with this list bundles everything the CLI
+    and web UI actually need. The concrete versions float with the
+    venv's resolver — we pin only minimums in PIP_DEPS above.
+    """
+    return [
+        # Flask + its real transitive deps
+        "flask>=3.0", "werkzeug>=3.0", "jinja2>=3.1", "markupsafe>=2.1",
+        "itsdangerous>=2.1", "click>=8.1", "blinker>=1.7",
+        # flask-sock for /ws/lldb + /ws/gdb terminal routes
+        "flask-sock>=0.7", "simple-websocket>=1.0", "wsproto>=1.2",
+        "h11>=0.14",
+        # Analysis backends
+        "pyelftools>=0.30", "capstone>=5.0", "cxxfilt>=0.3",
+        "pefile>=2023.0", "pygdbmi>=0.11",
+    ]
+
+
+def _prune() -> None:
+    removed = 0
+    for pattern in PRUNE_GLOBS:
+        for path in STAGING.rglob(pattern):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+            removed += 1
+    if removed:
+        print(f"  pruned {removed} staging entries")
+
+
+def _write_bootstrap() -> None:
+    (STAGING / "__main__.py").write_text(_BOOTSTRAP, encoding="utf-8")
+
+
+def _build_archive() -> None:
     if OUT.exists():
         OUT.unlink()
     zipapp.create_archive(
         STAGING, target=OUT,
         interpreter="/usr/bin/env python3",
-        compressed=True,
-    )
+        compressed=True)
     OUT.chmod(0o755)
+
+
+def main() -> None:
+    _ensure_frontend_built()
+    _clean_staging()
+    _copy_package()
+    _copy_frontend()
+    _pip_install_deps()
+    _prune()
+    _write_bootstrap()
+    _build_archive()
     size_mb = OUT.stat().st_size / (1024 * 1024)
-    print(f"built {OUT.name} ({size_mb:.1f} MB) from staging {STAGING}")
+    print(f"built {OUT.name} ({size_mb:.1f} MB) from {STAGING}")
 
 
 if __name__ == "__main__":

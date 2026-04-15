@@ -23,8 +23,7 @@ dev = ["pytest>=8.0"]
 browser = ["playwright>=1.40"]
 
 [project.scripts]
-rsod-decode = "rsod_decode.cli:main"
-rsod-debug = "rsod_decode.server:main"
+rsod = "rsod_decode.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

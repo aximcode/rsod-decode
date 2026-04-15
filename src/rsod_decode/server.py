@@ -24,30 +24,11 @@ from pathlib import Path
 
 from .app import create_app
 from .session import Session, register_session
-from .decoder import analyze_rsod
 from .symbols import SymbolLoadError, load_symbols
 
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
-
-
-def _try_gdb_backend() -> bool:
-    """Check if GDB and pygdbmi are available."""
-    try:
-        from .gdb_bridge import find_gdb
-        if not find_gdb():
-            return False
-        import pygdbmi  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _try_lldb_backend() -> bool:
-    """Check if the system lldb Python module is importable."""
-    from .lldb_loader import import_lldb
-    return import_lldb() is not None
 
 
 def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -134,7 +115,8 @@ def main() -> None:
     app = create_app(repo_root=repo_root, dwarf_prefix=args.dwarf_prefix,
                      symbol_search_paths=args.symbol_paths or None,
                      source_paths=args.source_paths or None)
-    dist_dir = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
+    from .resource_paths import frontend_dist
+    dist_dir = frontend_dist()
 
     if dist_dir.is_dir():
         from flask import send_from_directory
@@ -195,101 +177,32 @@ def main() -> None:
             except ValueError:
                 sys.exit(f"Error: invalid base address: {args.base}")
 
-        result = analyze_rsod(rsod_text, source, extra_sources, base_override,
-                              symbol_search_paths=args.symbol_paths or None)
-
-        session_id = uuid.uuid4().hex[:12]
-        sess = Session(
-            id=session_id,
-            result=result,
-            source=source,
-            extra_sources=extra_sources,
-            rsod_text=rsod_text,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            elf_path=args.symbol_file.resolve(),
-            pe_path=pe_for_pdb.resolve() if pe_for_pdb is not None else None,
-            pdb_path=pdb_path.resolve() if pdb_path is not None else None,
-        )
-
-        # Pick a richer backend. Preference order mirrors the POST
-        # /api/session path in app.py: lldb → gdb → pyelftools. Any
-        # explicit --backend choice overrides the auto-detect.
-        frame_data = [(f.frame_fp, f.address) for f in result.frames]
-        want = args.backend
-        lldb_ok = _try_lldb_backend()
-        gdb_ok = _try_gdb_backend()
-
-        if want == 'lldb' or (want == 'auto' and lldb_ok):
-            try:
-                from .lldb_backend import LldbBackend
-                if pe_for_pdb is not None and pdb_path is not None:
-                    sess.lldb_dwarf = LldbBackend.from_pe_pdb(
-                        pe_for_pdb.resolve(), pdb_path.resolve(),
-                        result.crash_info.registers,
-                        result.crash_info.crash_pc,
-                        result.stack_base, result.stack_mem,
-                        sess.img_base, frames=frame_data)
-                    sess.backend = 'lldb'
-                    _log('Using LLDB backend (PE+PDB)')
-                elif pe_for_pdb is None:
-                    sess.lldb_dwarf = LldbBackend(
-                        args.symbol_file.resolve(),
-                        result.crash_info.registers,
-                        result.crash_info.crash_pc,
-                        result.stack_base, result.stack_mem,
-                        sess.img_base, frames=frame_data)
-                    sess.backend = 'lldb'
-                    _log('Using LLDB backend (ELF+DWARF)')
-                else:
-                    _log('LLDB backend unavailable: PE without a matching .pdb')
-            except Exception as e:
-                _log(f"LLDB backend failed: {e}")
-
-        # GDB is ELF-only — skip for PE sessions so the CLI doesn't
-        # report a spurious "Magic number does not match" error.
-        if sess.backend == 'pyelftools' and pe_for_pdb is None and (
-                want == 'gdb' or (want == 'auto' and gdb_ok)):
-            try:
-                from .gdb_backend import GdbBackend
-                sess.gdb_dwarf = GdbBackend(
-                    args.symbol_file.resolve(),
-                    result.crash_info.registers,
-                    result.crash_info.crash_pc,
-                    result.stack_base, result.stack_mem,
-                    sess.img_base, frames=frame_data)
-                sess.backend = 'gdb'
-                _log('Using GDB backend')
-            except Exception as e:
-                _log(f"GDB backend failed, falling back to pyelftools: {e}")
-
-        if sess.backend == 'pyelftools':
-            _log('Using pyelftools backend')
-
-        # Same source_loc backfill + tail-call reconstruction as the
-        # POST /api/session path. The backfill is necessary for
-        # PE+PDB sessions where the decoder's initial resolve pass
-        # sees only the stub PEBinary surface; the reconstruction
-        # re-materializes any frames MSVC's tail-call optimizer
-        # elided so the UI backtrace matches the source call chain.
-        # `roots` feeds both the backfill's brace-line normalizer
-        # and the reconstructor's synthetic-frame normalizer so
-        # single-instruction tail-call wrappers don't leave the
-        # highlight sitting on a bare `{`.
-        from .app import (
-            _backfill_source_loc_from_richer_backend,
-            _reconstruct_tail_call_frames,
-        )
         cli_source_roots: list[Path] = []
         if repo_root is not None:
             cli_source_roots.append(repo_root)
         cli_source_roots.extend(args.source_paths or [])
-        _backfill_source_loc_from_richer_backend(sess, cli_source_roots)
-        _reconstruct_tail_call_frames(sess, cli_source_roots)
 
+        from .service import run_analysis
+        ctx = run_analysis(
+            rsod_text, source, extra_sources,
+            base_override=base_override,
+            symbol_search_paths=args.symbol_paths or None,
+            elf_path=args.symbol_file.resolve(),
+            pe_path=pe_for_pdb.resolve() if pe_for_pdb is not None else None,
+            pdb_path=pdb_path.resolve() if pdb_path is not None else None,
+            backend=args.backend,
+            source_roots=cli_source_roots,
+        )
+
+        session_id = uuid.uuid4().hex[:12]
+        sess = Session.from_analysis_context(
+            ctx, session_id,
+            created_at=datetime.now(timezone.utc).isoformat())
         register_session(sess)
 
-        _log(f"Session {session_id}: {len(result.frames)} frames, "
-             f"{result.resolved_count} addresses resolved")
+        _log(f'Using {sess.backend} backend')
+        _log(f"Session {session_id}: {len(ctx.result.frames)} frames, "
+             f"{ctx.result.resolved_count} addresses resolved")
 
     # Build URLs for all accessible addresses
     session_hash = f"/#session/{session_id}" if session_id else ""
