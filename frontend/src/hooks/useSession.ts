@@ -17,18 +17,16 @@ export function useSession() {
     sessionIdRef.current = state.status === 'loaded' ? state.sessionId : null
   }, [state])
 
-  // Clean up session on page unload
-  useEffect(() => {
-    const cleanup = () => {
-      if (sessionIdRef.current) {
-        fetch(`/api/session/${sessionIdRef.current}`, { method: 'DELETE', keepalive: true })
-      }
-    }
-    window.addEventListener('beforeunload', cleanup)
-    return () => window.removeEventListener('beforeunload', cleanup)
-  }, [])
+  // Sessions persist across restarts (SQLite at ~/.rsod-debug/).
+  // Page refresh / tab close used to DELETE the session via a
+  // `beforeunload` handler — that defeats the whole point of the
+  // persistent store, so it's gone now. Delete is an explicit user
+  // action via the CrashBanner Delete button.
 
-  // Load an existing session by ID (for pre-loaded sessions via URL hash)
+  // Load an existing session by ID. Used for:
+  //  - permalink hydration on mount (via the hash route)
+  //  - clicking a HistoryPanel row
+  //  - after a dedup-hit /api/session response (importSession too)
   const loadSession = useCallback(async (sessionId: string) => {
     setState({ status: 'uploading' })
     try {
@@ -157,15 +155,30 @@ export function useSession() {
     }
   }, [])
 
-  const reset = useCallback(async () => {
-    const sid = sessionIdRef.current
+  // Close the current view without touching persistent storage. The
+  // session stays in SQLite so the user can reopen it from history
+  // or via its permalink. Back to the upload screen.
+  const closeView = useCallback(() => {
     sessionIdRef.current = null
-    if (sid) {
-      api.deleteSession(sid).catch(() => {})
-    }
     window.location.hash = ''
     setState({ status: 'idle' })
   }, [])
 
-  return { state, upload, selectFrame, reset, switchBackend }
+  // Permanently drop the current session: DELETE the row + files on
+  // disk, then return to the upload screen. Bound to the Delete
+  // button in CrashBanner; no other code path calls this.
+  const deleteCurrent = useCallback(async () => {
+    const sid = sessionIdRef.current
+    if (sid) {
+      try { await api.deleteSession(sid) } catch { /* already gone is fine */ }
+    }
+    sessionIdRef.current = null
+    window.location.hash = ''
+    setState({ status: 'idle' })
+  }, [])
+
+  return {
+    state, upload, selectFrame, switchBackend,
+    loadSession, closeView, deleteCurrent,
+  }
 }

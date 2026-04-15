@@ -120,3 +120,15 @@ export interface UploadOptions {
   tag?: string
   commit?: string
 }
+
+export interface HistoryEntry {
+  id: string
+  created_at: string
+  image_name: string
+  exception_desc: string
+  crash_pc: number | null
+  crash_symbol: string
+  frame_count: number
+  backend: string
+  imported_from: string | null
+}

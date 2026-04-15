@@ -1,13 +1,16 @@
 import { useCallback, useRef, useState } from 'react'
+import * as api from '../api'
 import type { UploadOptions } from '../types'
+import { HistoryPanel } from './HistoryPanel'
 
 interface Props {
   onUpload: (rsod: File | Blob, sym: File, extras?: File[], opts?: UploadOptions) => void
+  onOpenSession: (sessionId: string) => void
   uploading: boolean
   error?: string
 }
 
-export function UploadForm({ onUpload, uploading, error }: Props) {
+export function UploadForm({ onUpload, onOpenSession, uploading, error }: Props) {
   const [rsodFile, setRsodFile] = useState<File | null>(null)
   const [symFile, setSymFile] = useState<File | null>(null)
   const [extraFiles, setExtraFiles] = useState<File[]>([])
@@ -17,7 +20,31 @@ export function UploadForm({ onUpload, uploading, error }: Props) {
   const [tag, setTag] = useState('')
   const [commit, setCommit] = useState('')
   const [dragOver, setDragOver] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [importError, setImportError] = useState<string | null>(null)
+  // Bump to force HistoryPanel to re-fetch after an import or
+  // whenever the upload screen renders fresh.
+  const [historyKey, setHistoryKey] = useState(0)
   const dropRef = useRef<HTMLDivElement>(null)
+  const importInputRef = useRef<HTMLInputElement>(null)
+
+  const handleImport = useCallback(async (file: File) => {
+    setImporting(true)
+    setImportError(null)
+    try {
+      const res = await api.importSession(file)
+      setHistoryKey(k => k + 1)
+      // Drop straight into the imported session so the user sees it
+      // immediately — importSession returns a session_id that's
+      // already persisted, so hydrating it goes through the same
+      // fast path as clicking a history row.
+      onOpenSession(res.session_id)
+    } catch (e) {
+      setImportError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setImporting(false)
+    }
+  }, [onOpenSession])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -191,21 +218,57 @@ export function UploadForm({ onUpload, uploading, error }: Props) {
           )}
         </div>
 
-        {/* Submit */}
-        <button
-          type="submit"
-          disabled={!canSubmit}
-          className="w-full py-3 rounded-lg font-medium text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed bg-red-700 hover:bg-red-600 text-white"
-        >
-          {uploading ? (
-            <span className="flex items-center justify-center gap-2">
-              <span className="animate-spin inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />
-              Analyzing...
-            </span>
-          ) : (
-            'Analyze RSOD'
-          )}
-        </button>
+        {/* Submit + import bundle */}
+        <div className="flex items-stretch gap-3">
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            className="flex-1 py-3 rounded-lg font-medium text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed bg-red-700 hover:bg-red-600 text-white"
+          >
+            {uploading ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />
+                Analyzing...
+              </span>
+            ) : (
+              'Analyze RSOD'
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => importInputRef.current?.click()}
+            disabled={importing}
+            className="px-4 py-3 rounded-lg font-medium text-sm border border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 transition-colors disabled:opacity-40"
+            title="Import an .rsod.zip bundle exported from another install"
+          >
+            {importing ? 'Importing…' : 'Import bundle'}
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".zip,.rsod.zip"
+            onChange={e => {
+              const f = e.target.files?.[0]
+              if (f) void handleImport(f)
+              e.target.value = ''
+            }}
+            className="hidden"
+          />
+        </div>
+
+        {importError && (
+          <div className="bg-red-900/50 border border-red-700 rounded-lg p-3 text-red-200 text-sm">
+            Import failed: {importError}
+          </div>
+        )}
+
+        {/* History — always visible, collapses gracefully when empty */}
+        <div className="pt-2">
+          <HistoryPanel
+            onOpen={onOpenSession}
+            refreshKey={historyKey}
+          />
+        </div>
       </form>
     </div>
   )

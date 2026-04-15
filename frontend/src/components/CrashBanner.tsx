@@ -1,10 +1,14 @@
+import { useState } from 'react'
+import * as api from '../api'
 import type { CrashSummary, LbrEntry } from '../types'
 
 type BackendId = 'pyelftools' | 'gdb' | 'lldb'
 
 interface Props {
+  sessionId: string
   crash: CrashSummary
-  onNewAnalysis: () => void
+  onCloseView: () => void
+  onDelete: () => void
   backend: string
   gdbAvailable: boolean
   lldbAvailable: boolean
@@ -18,9 +22,38 @@ function hex(n: number | null): string {
 }
 
 export function CrashBanner({
-  crash, onNewAnalysis, backend, gdbAvailable, lldbAvailable,
+  sessionId, crash, onCloseView, onDelete,
+  backend, gdbAvailable, lldbAvailable,
   onSwitchBackend, backendSwitching, lbr,
 }: Props) {
+  const [exporting, setExporting] = useState(false)
+
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      const { blob, filename } = await api.exportSession(sessionId)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e) {
+      window.alert(`Export failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleDelete = () => {
+    if (!window.confirm(
+      `Delete session ${sessionId.slice(0, 8)}? This removes the persisted files on disk.`,
+    )) return
+    onDelete()
+  }
+
   const backends: { id: BackendId; label: string; enabled: boolean }[] = [
     { id: 'pyelftools', label: 'pyelf', enabled: true },
     { id: 'gdb',        label: 'gdb',   enabled: gdbAvailable  || backend === 'gdb'  },
@@ -82,12 +115,30 @@ export function CrashBanner({
         </div>
 
         <div className="flex flex-col gap-1.5 items-end shrink-0">
-          <button
-            onClick={onNewAnalysis}
-            className="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-2 py-1 hover:border-zinc-500 transition-colors"
-          >
-            New Analysis
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={onCloseView}
+              className="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-2 py-1 hover:border-zinc-500 transition-colors"
+              title="Back to upload screen (session stays in history)"
+            >
+              New Analysis
+            </button>
+            <button
+              onClick={handleExport}
+              disabled={exporting}
+              className="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-2 py-1 hover:border-zinc-500 transition-colors disabled:opacity-50"
+              title="Download this session as an .rsod.zip bundle"
+            >
+              {exporting ? 'Exporting…' : 'Export'}
+            </button>
+            <button
+              onClick={handleDelete}
+              className="text-xs text-red-500 hover:text-red-300 border border-red-900 rounded px-2 py-1 hover:border-red-600 transition-colors"
+              title="Permanently delete this session (files + DB row)"
+            >
+              Delete
+            </button>
+          </div>
           <div className="flex items-center gap-1 text-xs">
             <span className="text-zinc-500 mr-1">backend:</span>
             {backends.map(b => {

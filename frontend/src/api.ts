@@ -2,6 +2,7 @@ import type {
   CreateSessionResponse,
   ExpandField,
   FrameDetail,
+  HistoryEntry,
   Instruction,
   SessionData,
   SourceLine,
@@ -168,4 +169,46 @@ export async function deleteSession(
   sessionId: string,
 ): Promise<{ deleted: boolean }> {
   return request(`/api/session/${sessionId}`, { method: 'DELETE' })
+}
+
+export async function getHistory(
+  limit = 100,
+): Promise<{ sessions: HistoryEntry[] }> {
+  return request(`/api/history?limit=${limit}`)
+}
+
+export async function exportSession(sessionId: string): Promise<{
+  blob: Blob
+  filename: string
+}> {
+  // Bypass request<T>() since the response body is a zip, not JSON.
+  // Pull the filename from Content-Disposition so the browser save
+  // dialog shows the crash-<date>-<short>.rsod.zip name the backend
+  // chose instead of a generic 'export.zip'.
+  const res = await fetch(`/api/export/${sessionId}`)
+  if (!res.ok) {
+    let message = `HTTP ${res.status}`
+    try {
+      const body = await res.json() as { error?: string }
+      if (body.error) message = body.error
+    } catch { /* body wasn't JSON */ }
+    throw new ApiError(res.status, message)
+  }
+  const blob = await res.blob()
+  const disposition = res.headers.get('Content-Disposition') ?? ''
+  const match = disposition.match(/filename="?([^"]+)"?/)
+  const filename = match?.[1] ?? `session-${sessionId}.rsod.zip`
+  return { blob, filename }
+}
+
+export async function importSession(file: File): Promise<{
+  session_id: string
+  imported_from: string | null
+  crash_summary: unknown
+  frame_count: number
+  deduplicated?: boolean
+}> {
+  const form = new FormData()
+  form.append('file', file)
+  return request('/api/import', { method: 'POST', body: form })
 }

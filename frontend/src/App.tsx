@@ -11,7 +11,10 @@ import { GdbPanel } from './components/GdbPanel'
 type ConsoleTab = 'lldb' | 'gdb'
 
 export function App() {
-  const { state, upload, selectFrame, reset, switchBackend } = useSession()
+  const {
+    state, upload, selectFrame, switchBackend,
+    loadSession, closeView, deleteCurrent,
+  } = useSession()
   const [consoleOpen, setConsoleOpen] = useState(false)
   const [consoleHeight, setConsoleHeight] = useState(256)
   const [consoleTab, setConsoleTab] = useState<ConsoleTab>('lldb')
@@ -45,6 +48,7 @@ export function App() {
     return (
       <UploadForm
         onUpload={upload}
+        onOpenSession={loadSession}
         uploading={state.status === 'uploading'}
         error={state.status === 'error' ? state.message : undefined}
       />
@@ -54,8 +58,10 @@ export function App() {
   return (
     <div className="flex flex-col h-screen">
       <CrashBanner
+        sessionId={state.sessionId}
         crash={state.data.crash_summary}
-        onNewAnalysis={reset}
+        onCloseView={closeView}
+        onDelete={deleteCurrent}
         backend={state.data.backend}
         gdbAvailable={state.data.gdb_available}
         lldbAvailable={state.data.lldb_available}
