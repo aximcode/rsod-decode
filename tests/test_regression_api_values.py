@@ -1037,6 +1037,55 @@ def test_api_tail_call_reconstruction_psa_x64_forcecrash(
             f"expected trigger_gp_fault.vector == 0xd via callsite "
             f"backfill, got {params0.get('vector')}")
 
+        # Frame 4 (initialize_test) is physical but suffers from the
+        # MSVC spill-slot reuse issue — LLDB reports config/build_id
+        # with no value at the param scope. The callsite-arg backfill
+        # walks `fForceCrashIfRequested`'s `call run_crashtest` site
+        # and then `run_crashtest`'s body (where `lea [rip+0xf12d7],
+        # %rdx` loads the build_id string address) so both params
+        # should be recovered. The build_id pointer targets the PE
+        # .rdata string "crashtest-v3".
+        fr4 = client.get(
+            f"/api/frame/{ctx.session_id}/4").get_json()
+        assert fr4["symbol"] == "initialize_test"
+        params4 = {p["name"]: p for p in fr4["params"]}
+        assert params4["config"]["value"] == 0x25fff190, (
+            f"initialize_test.config backfill failed: "
+            f"{params4.get('config')}")
+        assert params4["build_id"]["value"] == 0x1800f7438, (
+            f"initialize_test.build_id backfill failed: "
+            f"{params4.get('build_id')}")
+        assert params4["build_id"]["string_preview"] == "crashtest-v3", (
+            f"expected build_id preview 'crashtest-v3', got "
+            f"{params4['build_id'].get('string_preview')!r}")
+
+        # Frame 5 (run_crashtest, synthetic) — `argc` is the
+        # cross-frame propagation case: the chase in
+        # `fForceCrashIfRequested` hits `mov %edi, %edx` → `mov %ecx,
+        # %edi` → function entry %ecx = caller arg0. The outer-to-
+        # inner resolution pass makes fForceCrashIfRequested's own
+        # `callsite_params[0] == 0x3` (recovered from fUEFIPSAEntry's
+        # `mov [rsp+64], %ecx`) available for substitution here.
+        fr5 = client.get(
+            f"/api/frame/{ctx.session_id}/5").get_json()
+        assert fr5["symbol"] == "run_crashtest"
+        params5 = {p["name"]: p for p in fr5["params"]}
+        assert params5["config"]["value"] == 0x25fff190
+        assert params5["argc"]["value"] == 0x3, (
+            f"expected run_crashtest.argc == 0x3 via cross-frame "
+            f"propagation, got {params5.get('argc')}")
+
+        # Frame 6 (fForceCrashIfRequested) — its own argc value
+        # comes from fUEFIPSAEntry's call-site setup, via the
+        # callsite-arg backfill on every physical child.
+        fr6 = client.get(
+            f"/api/frame/{ctx.session_id}/6").get_json()
+        assert fr6["symbol"] == "fForceCrashIfRequested"
+        params6 = {p["name"]: p for p in fr6["params"]}
+        assert params6["argc"]["value"] == 0x3, (
+            f"expected fForceCrashIfRequested.argc == 0x3 via "
+            f"callsite backfill, got {params6.get('argc')}")
+
         # `run_crashtest` (frame 5) is the classic wrapper: 5
         # instructions ending in a tail-call jmp. Pin that shape
         # as a sanity check on the function-range clamping.

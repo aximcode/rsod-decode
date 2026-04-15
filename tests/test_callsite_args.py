@@ -145,9 +145,11 @@ def test_resolve_lea_rsp_direct() -> None:
     assert out['r8'].value == 0x8020
 
 
-def test_resolve_rip_relative_lea() -> None:
+def test_resolve_rip_relative_lea_via_register_chase() -> None:
     # `leaq 0xf1302(%rip), %rax` at addr 0x18000612f; next insn at 0x180006136.
     # Effective address = 0x180006136 + 0xf1302 = 0x1800f7438.
+    # The `mov %rax, %rdx` chases %rax one hop back, picks up the
+    # lea, and propagates the ip-rel address forward.
     insns = [
         (0x18000612f, 'leaq', '0xf1302(%rip), %rax'),
         (0x180006136, 'movq', '%rax, %rdx'),
@@ -155,11 +157,32 @@ def test_resolve_rip_relative_lea() -> None:
     ]
     out = resolve_callsite_args(insns, call_index=2, body_rsp=0x1000,
                                 memory_reader=_noop_reader)
-    # rdx resolves via register copy from rax; rax via rip-rel lea.
-    assert out['rdx'].kind == KIND_REGISTER
-    # rax isn't an MSVC arg register, so we don't resolve it, but the
-    # rdx entry's source string records the register copy.
+    assert out['rdx'].kind == KIND_IP_REL
+    assert out['rdx'].value == 0x1800f7438
+    # Provenance chain is preserved in the source string so the UI
+    # can hover-explain the derivation.
     assert '%rax' in out['rdx'].source
+    assert 'lea' in out['rdx'].source
+
+
+def test_register_chase_bails_at_function_start() -> None:
+    # `mov %ecx, %edi` saves the incoming ecx, then later
+    # `mov %edi, %edx` copies it to the arg reg — we can trace
+    # %edi one hop back to %ecx but %ecx was never written inside
+    # the function, so we end at KIND_REGISTER with a chain like
+    # `mov %edi ← mov %ecx`.
+    insns = [
+        (0x100, 'movl', '%ecx, %edi'),
+        (0x102, 'movl', '%edi, %edx'),
+        (0x104, 'callq', '0x200'),
+    ]
+    out = resolve_callsite_args(insns, call_index=2, body_rsp=None,
+                                memory_reader=_noop_reader)
+    assert out['rdx'].kind == KIND_REGISTER
+    assert out['rdx'].value is None
+    # The provenance chain should record both hops.
+    assert 'rdi' in out['rdx'].source
+    assert 'rcx' in out['rdx'].source
 
 
 def test_resolve_stack_value_via_memory_reader() -> None:

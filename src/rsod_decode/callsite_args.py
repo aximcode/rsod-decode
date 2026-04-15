@@ -56,6 +56,17 @@ class CallsiteArg:
     kind: str             # one of the KIND_* constants
     value: int | None     # resolved address/literal, or None if unknown
     source: str           # short provenance string for UI tooltips
+    # When a register-copy chain bottoms out at an unwritten arg
+    # register in the enclosing function (i.e. the value was inherited
+    # from whatever the function's own caller placed in that register
+    # at entry), this field carries the arg index 0..3 (rcx/rdx/r8/r9).
+    # The reconstructor uses it to cross-reference the parent frame's
+    # own callsite_params for cross-frame value propagation:
+    #   run_crashtest.argc    (register-chained to fForceCrashIfRequested's
+    #                          entry %ecx, arg0)
+    #     → fForceCrashIfRequested.callsite_params[0] == 0x3
+    #     → run_crashtest.argc = 0x3
+    entry_arg_index: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +274,17 @@ class _ResolverCtx:
     r11_anchored: bool
 
 
+# How deep we chase register copies (`mov %rcx, %edx`) backward through
+# the same function. MSVC often saves an incoming parameter into a
+# non-volatile register (``mov %ecx, %edi``) and later shuffles it
+# into another arg register at a call site (``mov %edi, %edx``); one
+# hop catches that idiom. We stop at the function prologue so we never
+# loop forever and we don't pretend to resolve values that originated
+# in the function's own parameters (which would themselves need an
+# outer-caller's callsite walk to recover).
+_MAX_REG_CHASE_DEPTH = 2
+
+
 def _resolve_address(
     operand: Operand, insn_addr: int, insn_size: int, ctx: _ResolverCtx,
 ) -> tuple[int | None, str]:
@@ -313,6 +335,159 @@ def _destination_canonical(ops: str) -> tuple[str | None, Operand | None, Operan
     return dst.reg, src, dst
 
 
+def _resolve_instruction_write(
+    instructions: list[Instr],
+    idx: int,
+    target_reg: str,
+    ctx: _ResolverCtx,
+    depth: int,
+) -> CallsiteArg | None:
+    """Decode ``instructions[idx]`` as a write to ``target_reg`` and
+    return a ``CallsiteArg`` describing what value it deposited, or
+    ``None`` if the instruction doesn't write ``target_reg`` (or the
+    write isn't decodable).
+
+    ``depth`` caps recursive register-copy chasing (``mov %edi, %edx``
+    → look back for ``mov %ecx, %edi``). The top-level call passes
+    ``_MAX_REG_CHASE_DEPTH``; each recursion decrements by 1 and
+    stops at 0.
+    """
+    addr, mnem, ops = instructions[idx]
+    mnem_l = mnem.lower()
+    insn_size = _instr_size(instructions, idx)
+
+    if mnem_l in ('xor', 'xorl', 'xorq', 'xorw', 'xorb'):
+        dst_reg, src, _dst = _destination_canonical(ops)
+        if (dst_reg == target_reg and src is not None
+                and src.kind == 'reg' and src.reg == dst_reg):
+            return CallsiteArg(
+                reg=target_reg, kind=KIND_ZERO, value=0,
+                source=f'xor {target_reg},{target_reg}')
+        return None
+
+    if mnem_l in ('mov', 'movl', 'movq', 'movw', 'movb',
+                  'movabs', 'movabsq', 'movsxd', 'movzx',
+                  'movslq', 'movzbl', 'movzwl'):
+        dst_reg, src, _dst = _destination_canonical(ops)
+        if dst_reg != target_reg or src is None:
+            return None
+        if src.kind == 'imm':
+            return CallsiteArg(
+                reg=target_reg, kind=KIND_IMMEDIATE, value=src.value,
+                source=f'mov ${src.value:#x}')
+        if src.kind == 'reg' and src.reg:
+            chased = _chase_register(
+                instructions, idx - 1, src.reg, ctx, depth - 1)
+            if chased is not None:
+                # Preserve the provenance chain so tooltips can show
+                # where the value originated, and carry through any
+                # ``entry_arg_index`` if the chain bottomed out at an
+                # unwritten arg register.
+                return CallsiteArg(
+                    reg=target_reg, kind=chased.kind,
+                    value=chased.value,
+                    source=f'mov %{src.reg} ← {chased.source}',
+                    entry_arg_index=chased.entry_arg_index)
+            return CallsiteArg(
+                reg=target_reg, kind=KIND_REGISTER, value=None,
+                source=f'mov %{src.reg}')
+        if src.kind == 'mem':
+            abs_addr, why = _resolve_address(src, addr, insn_size, ctx)
+            if abs_addr is None:
+                return CallsiteArg(
+                    reg=target_reg, kind=KIND_UNKNOWN, value=None,
+                    source=f'mov {why}')
+            if src.reg == 'rip':
+                val = _read_u64(abs_addr, ctx)
+                return CallsiteArg(
+                    reg=target_reg,
+                    kind=KIND_STACK_VALUE if val is not None
+                    else KIND_IP_REL,
+                    value=val if val is not None else abs_addr,
+                    source=f'mov {why}')
+            val = _read_u64(abs_addr, ctx)
+            if val is not None:
+                return CallsiteArg(
+                    reg=target_reg, kind=KIND_STACK_VALUE, value=val,
+                    source=f'mov {why}')
+            return CallsiteArg(
+                reg=target_reg, kind=KIND_UNKNOWN, value=None,
+                source=f'mov {why} (unreadable)')
+        return None
+
+    if mnem_l in ('lea', 'leal', 'leaq'):
+        dst_reg, src, _dst = _destination_canonical(ops)
+        if dst_reg != target_reg or src is None or src.kind != 'mem':
+            return None
+        abs_addr, why = _resolve_address(src, addr, insn_size, ctx)
+        if abs_addr is None:
+            return CallsiteArg(
+                reg=target_reg, kind=KIND_UNKNOWN, value=None,
+                source=f'lea {why}')
+        kind = KIND_IP_REL if src.reg == 'rip' else KIND_STACK_PTR
+        return CallsiteArg(
+            reg=target_reg, kind=kind, value=abs_addr,
+            source=f'lea {why}')
+
+    # Any other instruction that touches `target_reg` (add, sub, shl,
+    # or, etc.) — we can't model arithmetic without a full dataflow
+    # walker, so report UNKNOWN so the caller stops scanning earlier
+    # (potentially stale) definitions.
+    dst_reg, _src, _dst = _destination_canonical(ops)
+    if dst_reg == target_reg and mnem_l not in ('cmp', 'test'):
+        return CallsiteArg(
+            reg=target_reg, kind=KIND_UNKNOWN, value=None,
+            source=f'{mnem_l} ... (not tracked)')
+    return None
+
+
+_ENTRY_ARG_INDEX: dict[str, int] = {
+    'rcx': 0, 'rdx': 1, 'r8': 2, 'r9': 3,
+}
+
+
+def _chase_register(
+    instructions: list[Instr],
+    start_idx: int,
+    target_reg: str,
+    ctx: _ResolverCtx,
+    depth: int,
+) -> CallsiteArg | None:
+    """Walk backward from ``start_idx`` looking for the most recent
+    write to ``target_reg``. Returns the decoded write, or a synthetic
+    "entry arg" CallsiteArg when the chain hits the function start
+    without finding a write AND ``target_reg`` is one of the MSVC x64
+    int-argument registers — that signals "the value is whatever the
+    function's own caller placed in that register at entry", which
+    the reconstructor can cross-reference against the parent frame's
+    ``callsite_params``.
+    """
+    if depth <= 0 or start_idx < 0:
+        return _entry_arg_sentinel(target_reg)
+    for idx in range(start_idx, -1, -1):
+        arg = _resolve_instruction_write(
+            instructions, idx, target_reg, ctx, depth)
+        if arg is not None:
+            return arg
+    return _entry_arg_sentinel(target_reg)
+
+
+def _entry_arg_sentinel(reg: str) -> CallsiteArg | None:
+    """Return a CallsiteArg for `reg` interpreted as "unmodified at
+    function entry" — i.e. inherited from the caller's own setup.
+    Only meaningful for MSVC x64 int-arg registers (rcx/rdx/r8/r9);
+    returns None for anything else (callee-saved / non-ABI regs).
+    """
+    idx = _ENTRY_ARG_INDEX.get(reg)
+    if idx is None:
+        return None
+    return CallsiteArg(
+        reg=reg, kind=KIND_REGISTER, value=None,
+        source=f'caller arg{idx} (%{reg} unmodified at entry)',
+        entry_arg_index=idx,
+    )
+
+
 def resolve_callsite_args(
     instructions: list[Instr],
     call_index: int,
@@ -329,6 +504,13 @@ def resolve_callsite_args(
     the call was about to execute — the caller is responsible for
     supplying it (from ``SBFrame.GetSP()`` for physical frames, or from
     an inherited chain value for tail-called wrappers).
+
+    Register-copy chasing: when the walker sees ``mov %rdi, %rdx`` it
+    recursively looks back for a write to ``%rdi`` so the MSVC idiom
+    of saving an incoming parameter to a non-volatile register and
+    later shuffling it into an arg register at a call site resolves
+    to the underlying value (or at least a richer provenance chain).
+    The recursion is bounded by ``_MAX_REG_CHASE_DEPTH``.
 
     Returns a dict keyed by canonical argument register name. Registers
     the walker couldn't resolve are omitted; the caller can use the
@@ -351,107 +533,16 @@ def resolve_callsite_args(
     for idx in range(call_index - 1, -1, -1):
         if not remaining:
             break
-        addr, mnem, ops = instructions[idx]
-        mnem_l = mnem.lower()
-        insn_size = _instr_size(instructions, idx)
-
-        # xor reg, reg → zero (only if both operands are the same reg)
-        if mnem_l in ('xor', 'xorl', 'xorq', 'xorw', 'xorb'):
-            dst_reg, src, dst = _destination_canonical(ops)
-            if dst_reg and dst_reg in remaining and src and src.kind == 'reg' \
-                    and src.reg == dst_reg:
-                resolved[dst_reg] = CallsiteArg(
-                    reg=dst_reg, kind=KIND_ZERO, value=0,
-                    source=f'xor {dst_reg},{dst_reg}')
-                remaining.discard(dst_reg)
+        # For each instruction, probe it against every arg register
+        # still in play. `_resolve_instruction_write` returns None for
+        # instructions that don't write the register, so at most one
+        # register moves from `remaining` to `resolved` per instruction.
+        for reg in list(remaining):
+            arg = _resolve_instruction_write(
+                instructions, idx, reg, ctx, _MAX_REG_CHASE_DEPTH)
+            if arg is None:
                 continue
-
-        if mnem_l in ('mov', 'movl', 'movq', 'movw', 'movb',
-                      'movabs', 'movabsq', 'movsxd', 'movzx',
-                      'movslq', 'movzbl', 'movzwl'):
-            dst_reg, src, _dst_op = _destination_canonical(ops)
-            if not dst_reg or dst_reg not in remaining or src is None:
-                continue
-            if src.kind == 'imm':
-                resolved[dst_reg] = CallsiteArg(
-                    reg=dst_reg, kind=KIND_IMMEDIATE, value=src.value,
-                    source=f'mov ${src.value:#x}')
-                remaining.discard(dst_reg)
-                continue
-            if src.kind == 'reg':
-                # Register-to-register copy. Without a full dataflow
-                # walker we can only report this as provenance — the
-                # concrete value lives in the source register, which
-                # may itself have been set earlier in this function or
-                # inherited from the caller.
-                resolved[dst_reg] = CallsiteArg(
-                    reg=dst_reg, kind=KIND_REGISTER, value=None,
-                    source=f'mov %{src.reg}')
-                remaining.discard(dst_reg)
-                continue
-            if src.kind == 'mem':
-                abs_addr, why = _resolve_address(src, addr, insn_size, ctx)
-                if abs_addr is None:
-                    resolved[dst_reg] = CallsiteArg(
-                        reg=dst_reg, kind=KIND_UNKNOWN, value=None,
-                        source=f'mov {why}')
-                    remaining.discard(dst_reg)
-                    continue
-                if src.reg == 'rip':
-                    # RIP-relative read of a memory location. We read 8
-                    # bytes at the absolute address to produce the value
-                    # the load would have delivered.
-                    val = _read_u64(abs_addr, ctx)
-                    resolved[dst_reg] = CallsiteArg(
-                        reg=dst_reg,
-                        kind=KIND_STACK_VALUE if val is not None
-                        else KIND_IP_REL,
-                        value=val if val is not None else abs_addr,
-                        source=f'mov {why}')
-                    remaining.discard(dst_reg)
-                    continue
-                val = _read_u64(abs_addr, ctx)
-                if val is not None:
-                    resolved[dst_reg] = CallsiteArg(
-                        reg=dst_reg, kind=KIND_STACK_VALUE, value=val,
-                        source=f'mov {why}')
-                else:
-                    resolved[dst_reg] = CallsiteArg(
-                        reg=dst_reg, kind=KIND_UNKNOWN, value=None,
-                        source=f'mov {why} (unreadable)')
-                remaining.discard(dst_reg)
-                continue
-            continue
-
-        if mnem_l in ('lea', 'leal', 'leaq'):
-            dst_reg, src, _dst_op = _destination_canonical(ops)
-            if not dst_reg or dst_reg not in remaining or src is None:
-                continue
-            if src.kind != 'mem':
-                continue
-            abs_addr, why = _resolve_address(src, addr, insn_size, ctx)
-            if abs_addr is None:
-                resolved[dst_reg] = CallsiteArg(
-                    reg=dst_reg, kind=KIND_UNKNOWN, value=None,
-                    source=f'lea {why}')
-            else:
-                kind = KIND_IP_REL if src.reg == 'rip' else KIND_STACK_PTR
-                resolved[dst_reg] = CallsiteArg(
-                    reg=dst_reg, kind=kind, value=abs_addr,
-                    source=f'lea {why}')
-            remaining.discard(dst_reg)
-            continue
-
-        # Any other instruction that WRITES an arg register (add, sub,
-        # shl, or, etc.) invalidates our ability to resolve it backwards
-        # without a full dataflow model. Record an unknown and drop the
-        # register from the remaining set so we don't scoop up an
-        # earlier (stale) definition.
-        dst_reg, _src, _dst_op = _destination_canonical(ops)
-        if dst_reg and dst_reg in remaining and mnem_l not in ('cmp', 'test'):
-            resolved[dst_reg] = CallsiteArg(
-                reg=dst_reg, kind=KIND_UNKNOWN, value=None,
-                source=f'{mnem_l} ... (not tracked)')
-            remaining.discard(dst_reg)
+            resolved[reg] = arg
+            remaining.discard(reg)
 
     return resolved

@@ -539,14 +539,18 @@ def create_app(repo_root: Path | None = None,
             result['params'] = [_var_to_dict(v, ctx) for v in params]
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
 
-            # Crash-frame bonus: the tail-call reconstructor may have
-            # recovered register-held parameters from the wrapper
-            # chain that `jmp`'d into this frame (e.g. `vector=0xd`
-            # for `trigger_gp_fault`, set up by `dispatch_crash`
-            # right before the jmp). Merge those into the standard
-            # param list wherever the backend couldn't read a value
-            # — it's still the same declared parameter, just now
-            # with a concrete value.
+            # Tail-call backfill: the reconstructor may have
+            # recovered parameter values the backend couldn't read —
+            # register-held scalars on the crash frame (e.g.
+            # `vector=0xd` for `trigger_gp_fault`, set up by
+            # `dispatch_crash` right before the jmp), or spill-slot-
+            # reused pointers on downstream physical frames (e.g.
+            # `config`/`build_id` on `initialize_test`, recovered via
+            # the call-site walk through the `run_crashtest` wrapper
+            # and its own arg-register setup). Merge into the
+            # standard param list wherever the backend returned None
+            # — it's still the same declared parameter, just with a
+            # concrete value now.
             if frame.callsite_params:
                 by_name = {p['name']: p for p in result['params']}
                 for recovered in frame.callsite_params:
@@ -562,6 +566,13 @@ def create_app(repo_root: Path | None = None,
                         # still says "eax" / "xmm9" / etc.).
                         if recovered.location:
                             dst['location'] = recovered.location
+                    # C-string previews (build_id = "crashtest-v3")
+                    # are read via backend memory and stashed on
+                    # the VarInfo.string_preview; always carry them
+                    # through when the merged destination lacks one.
+                    if not dst.get('string_preview') and \
+                            recovered.string_preview:
+                        dst['string_preview'] = recovered.string_preview
 
             # Infer unresolved params from ancestor frames (pyelftools only).
             # GDB/LLDB backends resolve entry_values themselves.

@@ -58,6 +58,18 @@ def _kind_to_location(arg: CallsiteArg) -> str:
     return f'{arg.kind} ({arg.source})'
 
 
+def _looks_like_char_pointer(type_name: str) -> bool:
+    """Heuristic: does this type name denote a pointer to a character
+    type whose dereference would produce a NUL-terminated string?
+    Matches `const char *`, `char *`, `unsigned char *`, etc., plus
+    the MSVC `CHAR *`/`CHAR16 *` aliases.
+    """
+    t = type_name.replace(' ', '')
+    if not t.endswith('*'):
+        return False
+    return 'char' in t.lower() or 'CHAR' in t
+
+
 def _callsite_args_to_varinfos(
     backend: LldbBackend,
     function_name: str,
@@ -73,6 +85,10 @@ def _callsite_args_to_varinfos(
     ``ctx = 0x...`` instead of ``RCX = 0x...``. Fifth+ parameters and
     floating-point arguments are not reconstructed today — they'd
     need stack-spill analysis and XMM state respectively.
+
+    For ``char *``-ish params with a resolved pointer value, we also
+    read a short C-string preview via the backend so the UI shows
+    ``build_id = 0x1800f7438 "crashtest-v3"``.
     """
     params = backend.get_function_parameters(function_name)
     out: list[VarInfo] = []
@@ -80,14 +96,21 @@ def _callsite_args_to_varinfos(
         reg = ARG_REGS_CANONICAL[i]
         arg = working_set.get(reg)
         if arg is None or arg.kind == KIND_UNKNOWN or arg.value is None:
+            loc = f'{reg.upper()} (tail-call, unresolved)'
+            if arg is not None and arg.source:
+                loc = f'{reg.upper()} ({arg.source})'
             out.append(VarInfo(
-                name=name, type_name=type_name,
-                location=f'{reg.upper()} (tail-call, unresolved)'))
+                name=name, type_name=type_name, location=loc))
             continue
-        out.append(VarInfo(
+        var = VarInfo(
             name=name, type_name=type_name,
             value=arg.value,
-            location=f'{reg.upper()} ({arg.source})'))
+            location=f'{reg.upper()} ({arg.source})')
+        if _looks_like_char_pointer(type_name):
+            preview = backend._read_cstring_via_process(arg.value)
+            if preview:
+                var.string_preview = preview
+        out.append(var)
     return out
 
 
@@ -103,119 +126,153 @@ def reconstruct_tail_calls(
     instruction and child's entry. The synthetic frames are spliced
     in ascending index order and the whole list is re-indexed from 0.
 
-    The function mutates nothing; it returns a new list. If the
-    backend has no way to find the call annotation, pairs are
-    emitted unchanged.
+    Every child — whether or not a tail-call chain was inserted —
+    also receives ``callsite_params``: the argument-register working
+    set that the child sees at entry, derived by walking the parent's
+    call instruction backward plus any intermediate wrapper-body
+    modifications. This lets ``/api/frame`` surface parameter values
+    that LLDB itself can't read (register-held scalars on the crash
+    frame, spill-slot-reused pointers on downstream physical frames
+    like ``initialize_test``).
+
+    Pairs are resolved **outer-to-inner** (oldest caller first) so
+    that when a chase chain bottoms out at an unmodified entry
+    argument register, the parent frame's ``callsite_params`` have
+    already been computed and can be cross-referenced for cross-frame
+    value propagation (recovers ``run_crashtest.argc`` from
+    ``fForceCrashIfRequested.callsite_params[0]`` which in turn was
+    recovered from ``fUEFIPSAEntry``'s call site).
+
+    The function mutates the child frames' ``callsite_params`` fields
+    and returns a new list (synthetics spliced in). Original frame
+    objects are updated in place.
     """
     if len(frames) < 2:
         return list(frames)
 
-    out: list[FrameInfo] = [frames[0]]
-    for i in range(len(frames) - 1):
+    synthetics_between: dict[int, list[FrameInfo]] = {}
+
+    # Pass 1: resolve callsite args + synthetic chains outer → inner,
+    # so each pair's `parent.callsite_params` is already populated
+    # when the next pair's child tries to cross-ref.
+    for i in range(len(frames) - 2, -1, -1):
         child = frames[i]
         parent = frames[i + 1]
 
-        # Skip when either frame has no resolvable symbol. Can't
-        # reconstruct a chain without knowing the child's name, and
-        # we can't query the call site without parent's function.
         child_sym = child.symbol.name if child.symbol else None
         parent_sym = parent.symbol.name if parent.symbol else None
 
-        if child_sym and parent.address:
-            synthetic = _chain_between(
-                backend,
-                parent=parent,
-                child=child,
-                parent_function=parent_sym,
-                child_symbol=child_sym,
-            )
-            # Synthetic frames are caller-to-callee order: the first
-            # entry is what `parent` directly called, the last entry
-            # tail-called `child`. They all sit between parent and
-            # child in the backtrace — indices higher than child's
-            # (deeper on stack), lower than parent's.
-            for s in synthetic:
-                out.append(s)
+        if not child_sym or not parent.address:
+            synthetics_between[i] = []
+            continue
 
-        out.append(parent)
+        synthetic, child_entry_args = _resolve_chain_and_args(
+            backend,
+            parent=parent,
+            child=child,
+            parent_function=parent_sym,
+            child_symbol=child_sym,
+        )
+        synthetics_between[i] = synthetic
 
-    # Re-index so frame.index matches list position.
+        if child_entry_args:
+            # Cross-frame propagation: for any arg the chase left
+            # flagged as "unmodified entry register N of parent",
+            # substitute the parent's own callsite_params[N] (which
+            # has already been computed in a prior iteration of
+            # this outer-to-inner pass).
+            _propagate_entry_args_from_parent(
+                child_entry_args, parent)
+            child.callsite_params = _callsite_args_to_varinfos(
+                backend, child_sym, child_entry_args)
+
+    # Pass 2: build the output frame list in crash-first order with
+    # synthetic frames spliced in.
+    out: list[FrameInfo] = [frames[0]]
+    for i in range(len(frames) - 1):
+        for s in synthetics_between.get(i, []):
+            out.append(s)
+        out.append(frames[i + 1])
+
     for new_idx, f in enumerate(out):
         f.index = new_idx
     return out
 
 
-def _chain_between(
+def _propagate_entry_args_from_parent(
+    working_set: dict[str, CallsiteArg],
+    parent: FrameInfo,
+) -> None:
+    """Mutate ``working_set``: for any entry whose chain bottomed out
+    at an unmodified arg register of the enclosing function, look up
+    that register's value in ``parent.callsite_params`` (indexed by
+    ``entry_arg_index``) and substitute it.
+
+    Only fires when the parent already has ``callsite_params`` filled
+    in (i.e. the outer-to-inner pass has already processed it). No-op
+    otherwise — we simply leave the chain unresolved.
+    """
+    if not parent.callsite_params:
+        return
+    for reg, arg in list(working_set.items()):
+        if arg.value is not None:
+            continue
+        idx = arg.entry_arg_index
+        if idx is None or idx >= len(parent.callsite_params):
+            continue
+        parent_var = parent.callsite_params[idx]
+        if parent_var.value is None:
+            continue
+        # Substitute the value but keep the original provenance
+        # string so tooltips show the full chain.
+        working_set[reg] = CallsiteArg(
+            reg=reg,
+            kind=arg.kind,
+            value=parent_var.value,
+            source=(
+                f'{arg.source} → {parent.symbol.name if parent.symbol else "caller"}'
+                f'.{parent_var.name}'),
+            entry_arg_index=idx,
+        )
+
+
+def _resolve_chain_and_args(
     backend: LldbBackend,
     parent: FrameInfo,
     child: FrameInfo,
     parent_function: str | None,
     child_symbol: str,
-) -> list[FrameInfo]:
-    """Build the intermediate synthetic frames between parent and child.
+) -> tuple[list[FrameInfo], dict[str, CallsiteArg]]:
+    """Build synthetic frames between parent and child AND return the
+    argument-register working set the child sees at entry.
 
-    Walks at most `_MAX_HOPS` tail calls forward from parent's direct
-    callee until the chain meets `child_symbol`. Each synthetic
-    frame's location is pinned to its tail-call `jmp` instruction —
-    the last thing the function executed before handing control
-    off to the next link — rather than the function entry. This is
-    what the UI should highlight in Source/Disassembly, because
-    "where execution was" at the moment of elision is the jmp, not
-    the prologue.
-
-    Callsite argument reconstruction: the physical parent's ``call``
-    instruction sets up ``RCX``/``RDX``/``R8``/``R9`` for the first
-    wrapper. A "working set" of those register values is carried
-    through the chain, and each wrapper's own backward walk (from
-    its terminating ``jmp``) overrides any register it modifies
-    (e.g. ``dispatch_crash``'s ``movl $0xd, %ecx`` before the
-    ``jmp trigger_gp_fault``). Each synthetic frame's
-    ``callsite_params`` captures the working set **at the moment
-    of entry into that frame** — i.e. *before* its own body runs.
+    - Bootstraps the working set from the physical parent's ``call``
+      instruction (what it loaded into ``RCX``/``RDX``/``R8``/``R9``
+      right before entering the first callee).
+    - If ``direct_callee == child_symbol`` we return the bootstrap
+      working set with no synthetic frames — that's the normal
+      "one physical call, no tail-elision" case and the child still
+      wants those reconstructed entry registers for backfill.
+    - If the chain reaches ``child_symbol`` through 1..N tail-called
+      wrappers, builds synthetic FrameInfos for each, snapshots the
+      working set at every wrapper's entry (so each synthetic frame
+      sees what it was *given*, not what it passes forward), and
+      merges in any arg-register writes the wrapper itself made
+      before its own terminating ``jmp``.
+    - The final working set returned to the caller is what the
+      child sees at its entry (after every wrapper in the chain
+      has run).
     """
     parent_return_addr = parent.address
     parent_module = parent.module
 
     direct = backend.find_callee_at_return_addr(
         parent_return_addr, parent_function)
-    if direct is None:
-        return []
-    direct_name, _direct_src = direct
-
-    # Direct callee is already the child — nothing to reconstruct.
-    if direct_name == child_symbol:
-        return []
-
-    # Walk the tail-call chain starting from `direct_name`. At each
-    # step, `tail_call_target` returns the jmp's target symbol plus
-    # the (addr, source_loc) of the jmp instruction itself. We
-    # record one (name, jmp_addr, jmp_src) tuple per synthetic
-    # frame: `name` is the function we're sitting in, `jmp_*` is
-    # its tail-call site.
-    chain: list[tuple[str, int, str]] = []
-    current = direct_name
-    for _ in range(_MAX_HOPS):
-        tail = backend.tail_call_target(current)
-        if tail is None:
-            # `current` has a real ret or an indirect jmp — the
-            # chain doesn't reach `child_symbol` via tail calls.
-            # Drop the whole reconstruction rather than inserting
-            # a dangling partial chain.
-            return []
-        target_name, jmp_addr, jmp_src = tail
-        chain.append((current, jmp_addr, jmp_src))
-        if target_name == child_symbol:
-            break
-        current = target_name
-    else:
-        # Ran out of hops without reaching the child. Drop.
-        return []
 
     # Bootstrap the callsite-arg working set from the physical
-    # parent's call instruction (the one that entered the first
-    # wrapper). `parent_body_rsp` is the post-prologue RSP at the
-    # moment of that call — fetched from LLDB's unwind of the
-    # parent frame.
+    # parent's call instruction. ``parent_body_rsp`` is the
+    # post-prologue RSP at the moment of that call, fetched from
+    # LLDB's unwind of the parent frame.
     parent_body_rsp = backend.frame_body_rsp(parent.address)
     parent_call_addr = backend.call_site_addr_for_return(parent.address)
     working_set: dict[str, CallsiteArg] = {}
@@ -223,41 +280,69 @@ def _chain_between(
         working_set.update(backend.resolve_callsite_args(
             parent_call_addr, body_rsp=parent_body_rsp))
 
-    # Every wrapper in the chain shares one stack pointer value:
-    # the initial `call` pushed a return address (8 bytes), and
-    # none of the pure-jmp wrappers touches RSP afterwards. So
-    # each wrapper's own body walks with `body_rsp = parent_body_rsp - 8`.
+    # No parseable call site at all — nothing to return.
+    if direct is None:
+        return [], working_set
+
+    direct_name, _direct_src = direct
+
+    # Direct call (no tail-elision). The child receives the
+    # bootstrap working set verbatim at its entry.
+    if direct_name == child_symbol:
+        return [], working_set
+
+    # Walk the tail-call chain starting from ``direct_name``. Each
+    # step: ``tail_call_target`` returns the jmp's target symbol
+    # plus the (addr, source_loc) of the jmp instruction itself.
+    chain: list[tuple[str, int, str]] = []
+    current = direct_name
+    for _ in range(_MAX_HOPS):
+        tail = backend.tail_call_target(current)
+        if tail is None:
+            # ``current`` has a real ret or an indirect jmp — the
+            # chain doesn't reach ``child_symbol`` via tail calls.
+            # Drop the whole reconstruction rather than inserting a
+            # dangling partial chain (the bootstrap working_set
+            # still applies to the physical call, so return it).
+            return [], working_set
+        target_name, jmp_addr, jmp_src = tail
+        chain.append((current, jmp_addr, jmp_src))
+        if target_name == child_symbol:
+            break
+        current = target_name
+    else:
+        return [], working_set
+
+    # Every wrapper in the chain shares one stack-pointer value: the
+    # initial ``call`` pushed a return address (8 bytes), and no
+    # pure-jmp wrapper touches RSP afterwards. Wrapper body walks
+    # therefore use ``body_rsp = parent_body_rsp - 8``.
     wrapper_body_rsp = (
         parent_body_rsp - 8 if parent_body_rsp is not None else None)
 
-    # `chain` is in caller-to-callee order. For each entry we know:
-    #   - `name`: the function we're sitting in (the wrapper itself)
-    #   - `jmp_addr`: the wrapper's own terminating jmp site
-    # The working_set captured above holds the args AT ENTRY to the
-    # first wrapper. We snapshot that for `chain[0]`, then walk each
-    # wrapper's own body from its jmp to pick up any register
-    # modifications before recording the NEXT wrapper's entry args.
-    per_frame_args: list[dict[str, CallsiteArg]] = []
-    for step_idx, (name, jmp_addr, _jmp_src) in enumerate(chain):
-        # Entry args for this wrapper = current working_set snapshot.
-        per_frame_args.append(dict(working_set))
-        # Walk the wrapper's own body from its terminating jmp, and
-        # update the working set with anything the wrapper writes.
-        # The resolver stops scanning a register once it finds a
-        # write, so this gives us "registers modified somewhere in
-        # the wrapper before the jmp".
-        if step_idx < len(chain) - 1 or True:
-            wrapper_args = backend.resolve_callsite_args(
-                jmp_addr, body_rsp=wrapper_body_rsp)
-            for reg, arg in wrapper_args.items():
-                if arg.value is not None and arg.kind != KIND_UNKNOWN:
-                    working_set[reg] = arg
+    # Cross-frame propagate before we even start building wrapper
+    # snapshots: the very first wrapper's entry regs are whatever the
+    # physical parent's call instruction set up, and those may
+    # themselves depend on the parent's own incoming args.
+    _propagate_entry_args_from_parent(working_set, parent)
 
-    # Build FrameInfo objects. Order: collected chain goes
-    # caller→callee, but the backtrace walks innermost→outermost,
-    # so we emit in reverse so `synthetic_frames[0]` is the deepest
-    # (closest to `child`) and `synthetic_frames[-1]` is closest to
-    # `parent`.
+    # For each wrapper we snapshot the working set *before* walking
+    # the wrapper's own body — that's what the wrapper sees at its
+    # entry. Then we update the working set with any registers the
+    # wrapper writes before its terminating jmp, so the next link
+    # in the chain inherits the modified state.
+    per_frame_args: list[dict[str, CallsiteArg]] = []
+    for (name, jmp_addr, _jmp_src) in chain:
+        per_frame_args.append(dict(working_set))
+        wrapper_args = backend.resolve_callsite_args(
+            jmp_addr, body_rsp=wrapper_body_rsp)
+        for reg, arg in wrapper_args.items():
+            if arg.value is not None and arg.kind != KIND_UNKNOWN:
+                working_set[reg] = arg
+
+    # Build FrameInfo objects. ``chain`` is caller→callee; the
+    # backtrace walks innermost→outermost, so emit in reverse so
+    # ``synthetic_frames[0]`` is closest to ``child``.
     synthetic_frames: list[FrameInfo] = []
     for (name, jmp_addr, jmp_src), entry_args in reversed(
             list(zip(chain, per_frame_args))):
@@ -279,27 +364,4 @@ def _chain_between(
             callsite_params=callsite_params,
         ))
 
-    # Bonus: if the child is the crash frame, also fill its
-    # `callsite_params` — its entry registers are what the last
-    # wrapper in the chain set up right before its `jmp`. This
-    # recovers register-held scalar params (e.g. trigger_gp_fault's
-    # `vector=0xd`) that LLDB can't read from the crash-time
-    # register snapshot because the callee hasn't spilled them.
-    if child.is_crash_frame and child_symbol:
-        _attach_crash_frame_callsite_params(
-            backend, child, child_symbol, working_set)
-
-    return synthetic_frames
-
-
-def _attach_crash_frame_callsite_params(
-    backend: LldbBackend,
-    frame: FrameInfo,
-    function_name: str,
-    working_set: dict[str, CallsiteArg],
-) -> None:
-    """Populate the crash frame's `callsite_params` from the tail-call
-    chain's final working set (the registers set up by the wrapper
-    that jmp'd into it)."""
-    frame.callsite_params = _callsite_args_to_varinfos(
-        backend, function_name, working_set)
+    return synthetic_frames, working_set
