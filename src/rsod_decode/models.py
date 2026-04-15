@@ -89,6 +89,13 @@ class FrameInfo:
     # UI can show symbol/source/disasm but variable values are
     # unavailable because no spill slots exist.
     is_synthetic: bool = False
+    # Synthesized parameter values for tail-called wrappers,
+    # reconstructed by walking backward from the caller's call/jmp
+    # instruction and decoding the MSVC x64 argument-register setup.
+    # Populated by `tail_call_reconstructor.py` for synthetic frames
+    # (and, when the crash PC sits in a tail-called leaf, for the
+    # crash frame itself). Empty otherwise.
+    callsite_params: list['VarInfo'] = field(default_factory=list)
 
 
 @dataclass

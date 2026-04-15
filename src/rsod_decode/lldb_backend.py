@@ -992,6 +992,117 @@ class LldbBackend:
                     jmp_src = f'{path}:{le.GetLine()}'
         return (target_symbol, jmp_addr, jmp_src)
 
+    def frame_body_rsp(self, addr: int) -> int | None:
+        """Return the body-RSP (``SBFrame.GetSP()``) for the LLDB-unwound
+        frame whose PC matches ``addr``, or None if no match.
+
+        Used by the tail-call reconstructor to bootstrap the callsite
+        argument resolver: we need the physical caller's post-prologue
+        RSP to evaluate ``lea reg, [rsp+N]`` / ``[r11+N]`` operands.
+        """
+        frame = self._frame_for(addr)
+        if frame is None or not frame.IsValid():
+            return None
+        return frame.GetSP()
+
+    def get_function_parameters(
+        self, function_name: str,
+    ) -> list[tuple[str, str]]:
+        """Return ``(name, type_name)`` for each declared parameter of
+        ``function_name`` in ABI order, or an empty list if the function
+        or its block variables can't be located.
+
+        Uses ``SBFunction.GetBlock().GetVariables(target, args=True,
+        locals=False, statics=False)`` which exposes the PDB's
+        ``S_LOCAL`` parameter records — we need the names (not just
+        the types from ``SBFunctionType``) so the reconstructor can
+        map argument registers to the user-facing parameter name.
+        """
+        sctxs = self._target.FindFunctions(function_name)
+        if not sctxs.GetSize():
+            return []
+        fn = sctxs.GetContextAtIndex(0).GetFunction()
+        if not fn.IsValid():
+            return []
+        block = fn.GetBlock()
+        if not block.IsValid():
+            return []
+        values = block.GetVariables(self._target, True, False, False)
+        out: list[tuple[str, str]] = []
+        for i in range(values.GetSize()):
+            v = values.GetValueAtIndex(i)
+            name = v.GetName() or ''
+            type_name = v.GetTypeName() or ''
+            if name:
+                out.append((name, type_name))
+        return out
+
+    def resolve_callsite_args(
+        self, call_addr: int, body_rsp: int | None = None,
+        fp: int | None = None,
+    ) -> dict[str, Any]:
+        """Reconstruct MSVC x64 argument registers at a call/jmp site.
+
+        Walks backward from the instruction at ``call_addr`` (in the
+        decoder-facing address space) through the enclosing function's
+        body, decoding writes to ``RCX`` / ``RDX`` / ``R8`` / ``R9``.
+        ``body_rsp`` is the post-prologue RSP at the moment the call
+        was about to execute — for a physical frame this is
+        ``SBFrame.GetSP()``; for a tail-called wrapper the caller
+        computes it from its chain context. ``fp`` is the frame pointer
+        if distinct from the stack pointer.
+
+        Returns the dict produced by
+        :func:`callsite_args.resolve_callsite_args`. Registers the
+        resolver couldn't decode are omitted.
+        """
+        from .callsite_args import (
+            Instr, resolve_callsite_args as _resolve)
+
+        sb = self._target.ResolveLoadAddress(call_addr + self._addr_slide)
+        if not sb.IsValid():
+            return {}
+        fn = sb.GetFunction()
+        if fn.IsValid():
+            start_sb = fn.GetStartAddress()
+            end_sb = fn.GetEndAddress()
+        else:
+            sym = sb.GetSymbol()
+            if not sym.IsValid():
+                return {}
+            start_sb = sym.GetStartAddress()
+            end_sb = sym.GetEndAddress()
+        if not start_sb.IsValid() or not end_sb.IsValid():
+            return {}
+        start = start_sb.GetFileAddress()
+        end = end_sb.GetFileAddress()
+        if start == self._lldb.LLDB_INVALID_ADDRESS \
+                or end == self._lldb.LLDB_INVALID_ADDRESS:
+            return {}
+
+        sb_insns = self._iter_function_instructions(start, end)
+        instructions: list[Instr] = []
+        call_index: int | None = None
+        for insn in sb_insns:
+            load = insn.GetAddress().GetLoadAddress(self._target)
+            if load == self._lldb.LLDB_INVALID_ADDRESS:
+                continue
+            addr = load - self._addr_slide
+            mn = insn.GetMnemonic(self._target) or ''
+            ops = insn.GetOperands(self._target) or ''
+            instructions.append((addr, mn, ops))
+            if addr == call_addr:
+                call_index = len(instructions) - 1
+        if call_index is None or not instructions:
+            return {}
+
+        def reader(addr: int, size: int) -> bytes | None:
+            return self.read_memory(addr, size)
+
+        return _resolve(
+            instructions, call_index=call_index,
+            body_rsp=body_rsp, memory_reader=reader, fp=fp)
+
     def function_entry_source_loc(
         self, function_name: str,
     ) -> tuple[int, str] | None:

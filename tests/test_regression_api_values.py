@@ -983,9 +983,11 @@ def test_api_tail_call_reconstruction_psa_x64_forcecrash(
         }
         assert synth_indices == {1, 2, 3, 5}
 
-        # Every synthetic frame should have a psaentry.c
-        # source_loc and its /api/frame response should have
-        # empty params/locals (no stack frame = no spill slots).
+        # Every synthetic frame should have a psaentry.c source_loc.
+        # Locals are always empty (no physical stack frame = no spill
+        # slots), but params are reconstructed by walking the MSVC x64
+        # argument-register setup in the caller's call/jmp site — see
+        # `tail_call_reconstructor._callsite_args_to_varinfos`.
         for idx in sorted(synth_indices):
             fr = client.get(
                 f"/api/frame/{ctx.session_id}/{idx}").get_json()
@@ -993,8 +995,47 @@ def test_api_tail_call_reconstruction_psa_x64_forcecrash(
             assert "psaentry.c" in (fr.get("source_loc") or ""), (
                 f"synthetic frame {idx} {fr.get('symbol')!r} has "
                 f"unexpected source_loc {fr.get('source_loc')!r}")
-            assert fr["params"] == []
             assert fr["locals"] == []
+            # Reconstructed params: at least one entry per synthetic
+            # frame in the psa_x64_forcecrash chain. Each wrapper
+            # takes a single `ctx`/`config` pointer arg, so the list
+            # has exactly one entry for frames 1..3 and 5.
+            assert len(fr["params"]) >= 1, (
+                f"synthetic frame {idx} has no callsite params: "
+                f"{fr['params']}")
+
+        # Tail-call frames 1..3 (dispatch_crash, validate_environment,
+        # prepare_crash_context) all take `ctx: CrashContext *`. The
+        # resolver should land on the same stack address (frame 4's
+        # `initialize_test` ctx local = RSP+0x28) for every one.
+        ctx_addrs: set[int] = set()
+        for idx in (1, 2, 3):
+            fr = client.get(
+                f"/api/frame/{ctx.session_id}/{idx}").get_json()
+            assert fr["symbol"] in (
+                "dispatch_crash",
+                "validate_environment",
+                "prepare_crash_context"), fr["symbol"]
+            params = {p["name"]: p for p in fr["params"]}
+            assert "ctx" in params, (
+                f"frame {idx} {fr['symbol']!r} missing ctx param")
+            assert params["ctx"]["value"] is not None
+            ctx_addrs.add(params["ctx"]["value"])
+        assert len(ctx_addrs) == 1, (
+            f"synthetic frames 1..3 pointed at different ctx "
+            f"addresses: {[hex(a) for a in ctx_addrs]}")
+
+        # Frame 0 (trigger_gp_fault, the crash PC) is physical, but
+        # its `vector` parameter lives in RCX (MSVC passed 0xd in
+        # `dispatch_crash` right before the jmp). The crash-frame
+        # callsite-arg backfill should surface that.
+        fr0 = client.get(
+            f"/api/frame/{ctx.session_id}/0").get_json()
+        assert fr0["symbol"] == "trigger_gp_fault"
+        params0 = {p["name"]: p for p in fr0["params"]}
+        assert params0.get("vector", {}).get("value") == 0xd, (
+            f"expected trigger_gp_fault.vector == 0xd via callsite "
+            f"backfill, got {params0.get('vector')}")
 
         # `run_crashtest` (frame 5) is the classic wrapper: 5
         # instructions ending in a tail-call jmp. Pin that shape

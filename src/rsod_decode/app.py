@@ -514,7 +514,14 @@ def create_app(repo_root: Path | None = None,
         # tables instead of showing stale register snapshots
         # from whoever's actually occupying RSP/RBP at the time.
         if frame.is_synthetic:
-            result['params'] = []
+            # Synthetic tail-call wrappers have no physical stack
+            # frame, but the reconstructor may have reconstructed
+            # their entry-register values by walking the caller's
+            # call/jmp setup. Render those as the frame's param list
+            # so the UI shows `ctx = 0x...`, `vector = 0xd`, etc.
+            ctx = _build_frame_ctx(frame, session, img_base)
+            result['params'] = [
+                _var_to_dict(v, ctx) for v in frame.callsite_params]
             result['locals'] = []
             result['globals'] = []
         elif binary and frame.address:
@@ -531,6 +538,30 @@ def create_app(repo_root: Path | None = None,
             locals_ = binary.get_locals(lookup_pc)
             result['params'] = [_var_to_dict(v, ctx) for v in params]
             result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
+
+            # Crash-frame bonus: the tail-call reconstructor may have
+            # recovered register-held parameters from the wrapper
+            # chain that `jmp`'d into this frame (e.g. `vector=0xd`
+            # for `trigger_gp_fault`, set up by `dispatch_crash`
+            # right before the jmp). Merge those into the standard
+            # param list wherever the backend couldn't read a value
+            # — it's still the same declared parameter, just now
+            # with a concrete value.
+            if frame.callsite_params:
+                by_name = {p['name']: p for p in result['params']}
+                for recovered in frame.callsite_params:
+                    dst = by_name.get(recovered.name)
+                    if dst is None:
+                        result['params'].append(
+                            _var_to_dict(recovered, ctx))
+                        continue
+                    if dst.get('value') is None and recovered.value is not None:
+                        dst['value'] = recovered.value
+                        # Record provenance in the location string
+                        # without clobbering the original (which
+                        # still says "eax" / "xmm9" / etc.).
+                        if recovered.location:
+                            dst['location'] = recovered.location
 
             # Infer unresolved params from ancestor frames (pyelftools only).
             # GDB/LLDB backends resolve entry_values themselves.
