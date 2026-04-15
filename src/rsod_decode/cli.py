@@ -56,6 +56,10 @@ def main() -> None:
     parser.add_argument('--dwarf-prefix', type=str, default=None,
                         help='Path prefix to strip from DWARF source paths '
                              '(auto-detected if not specified)')
+    parser.add_argument('--backend', default='auto',
+                        choices=['auto', 'lldb', 'gdb', 'pyelftools'],
+                        help='DWARF backend for variable resolution. '
+                             '"auto" picks lldb > gdb > pyelftools.')
     args = parser.parse_args()
 
     if not args.rsod_log.exists():
@@ -113,7 +117,8 @@ def main() -> None:
         decode_rsod(args.rsod_log, args.symbol_file, out_path,
                     base_override, args.verbose, args.sym,
                     source_root, git_ref, repo_root,
-                    dwarf_prefix=args.dwarf_prefix)
+                    dwarf_prefix=args.dwarf_prefix,
+                    backend=args.backend)
     except SymbolLoadError as e:
         sys.exit(f"Error: {e}")
 

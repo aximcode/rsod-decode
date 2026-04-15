@@ -28,6 +28,7 @@ from .symbols import load_symbols
 
 if TYPE_CHECKING:
     from .models import BinaryBackend
+    from .service import AnalysisContext, BackendChoice
 from .decoders import FormatDecoder, detect_format
 from .decoders.base import (
     parse_stack_dump,
@@ -99,18 +100,30 @@ def _format_vars(
     vars_: list[VarInfo], registers: dict[str, int],
     frame: FrameInfo, label: str,
 ) -> list[str]:
-    """Format a list of VarInfo (params or locals) with register values."""
+    """Format a list of VarInfo (params or locals).
+
+    Prefers `VarInfo.value` when the backend pre-resolved it (LLDB /
+    GDB / callsite recovery); otherwise falls back to looking up
+    `reg_name` in the crash-time register snapshot for pyelftools.
+    String previews from backend memory reads are appended inline
+    when present.
+    """
     if not vars_:
         return []
     func_name = frame.symbol.name.split('(')[0].rsplit('::', 1)[-1] if frame.symbol else '???'
     lines = [f'--- {label} (frame #{frame.index}: {func_name}) ---']
     for v in vars_:
         val_str = ''
-        if v.reg_name and v.reg_name in registers:
+        if v.value is not None:
+            val = v.value & 0xFFFFFFFFFFFFFFFF
+            dec = f"  ({val})" if val < 0x10000 else ''
+            val_str = f' = 0x{val:016X}{dec}'
+        elif v.reg_name and v.reg_name in registers:
             val = registers[v.reg_name]
             dec = f"  ({val})" if val < 0x10000 else ''
             val_str = f' = 0x{val:016X}{dec}'
-        lines.append(f"  {v.name:<15s} ({v.type_name:<20s}) {v.location}{val_str}")
+        preview = f'  "{v.string_preview}"' if v.string_preview else ''
+        lines.append(f"  {v.name:<15s} ({v.type_name:<20s}) {v.location}{val_str}{preview}")
     return lines
 
 
@@ -606,15 +619,20 @@ def decode_rsod(
     source_root: Path | list[Path] | None,
     git_ref: GitRef | None = None, repo_root: Path | None = None,
     dwarf_prefix: str | None = None,
+    backend: BackendChoice = 'auto',
 ) -> None:
-    """Read RSOD log + symbol file, write annotated + enhanced output."""
-    # MSVC/EPSA pairing: if an extra is the .efi companion of a primary
-    # .map (or vice versa), fold it into the primary loader instead of
-    # adding it as a separate module. Also pick up a matching .pdb so
-    # load_symbols() can derive a richer symbol table via LLDB when no
-    # .map is available.
+    """Read RSOD log + symbol file, write annotated + enhanced output.
+
+    `backend` controls which DWARF backend is used for variable
+    resolution. `'auto'` picks lldb → gdb → pyelftools in that order.
+    The richer backends give the CLI the same callsite-arg
+    reconstruction and runtime variable values the web UI has always
+    had — instantiated through the shared service pipeline.
+    """
     from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
+    from .service import run_analysis
     from .symbols import is_pe
+
     companion, extra_sym_paths = _pair_map_with_pe(sym_path, list(extra_sym_paths))
     pe_for_pdb = companion if companion and is_pe(companion) else (
         sym_path if is_pe(sym_path) else None)
@@ -634,9 +652,41 @@ def decode_rsod(
         extra_sources[p.stem.lower()] = s
 
     rsod_text = log_path.read_text(encoding='utf-8', errors='replace')
-    result = analyze_rsod(rsod_text, source, extra_sources, base_override)
 
-    # Assemble output
+    src_roots: list[Path] = []
+    if isinstance(source_root, (list, tuple)):
+        src_roots.extend(source_root)
+    elif source_root is not None:
+        src_roots.append(source_root)
+
+    ctx = run_analysis(
+        rsod_text, source, extra_sources,
+        base_override=base_override,
+        elf_path=sym_path if pe_for_pdb is None else None,
+        pe_path=pe_for_pdb,
+        pdb_path=pdb_path,
+        backend=backend,
+        source_roots=src_roots,
+    )
+    try:
+        _write_text_report(
+            ctx, out_path, verbose, source_root, git_ref, repo_root)
+    finally:
+        ctx.close()
+
+
+def _write_text_report(
+    ctx: AnalysisContext,
+    out_path: Path,
+    verbose: bool,
+    source_root: Path | list[Path] | None,
+    git_ref: GitRef | None,
+    repo_root: Path | None,
+) -> None:
+    """Render the analysis context as a text report."""
+    from .service import resolve_frame_vars
+
+    result = ctx.result
     out: list[str] = []
     out.extend(format_crash_summary(result.crash_info, git_ref))
     out.append('')
@@ -644,28 +694,25 @@ def decode_rsod(
     out.append('')
     out.extend(format_backtrace(result.frames, result.call_verified))
 
-    # Verbose sections for frame #0
     if verbose and result.frames:
         f0 = result.frames[0]
 
-        if source.binary:
-            params = format_params(
-                source.binary, f0.address, result.crash_info.registers, f0)
-            if params:
-                out.append('')
-                out.extend(params)
+        params, locals_, _globals = resolve_frame_vars(ctx, 0)
+        if params:
+            out.append('')
+            out.extend(_format_vars(
+                params, result.crash_info.registers, f0, 'Parameters'))
+        if locals_:
+            out.append('')
+            out.extend(_format_vars(
+                locals_, result.crash_info.registers, f0, 'Locals'))
 
-            locals_ = format_locals(
-                source.binary, f0.address, result.crash_info.registers, f0)
-            if locals_:
+        active = ctx.active_binary_for_frame(f0)
+        if active is not None and f0.address:
+            disasm = format_disassembly(active, f0.address)
+            if disasm:
                 out.append('')
-                out.extend(locals_)
-
-            if f0.address:
-                disasm = format_disassembly(source.binary, f0.address)
-                if disasm:
-                    out.append('')
-                    out.extend(disasm)
+                out.extend(disasm)
 
         if (source_root or git_ref) and f0.source_loc:
             src = format_source_context(

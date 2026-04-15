@@ -96,6 +96,55 @@ def test_psa_x64_forcecrash_symbols_from_pdb_only() -> None:
 
 
 @pytest.mark.lldb
+def test_psa_x64_forcecrash_cli_params_resolved(tmp_path) -> None:
+    """decode_rsod(backend='lldb') produces LLDB-resolved params.
+
+    Phase A regression pin: prior to the service.py extraction the
+    CLI ran pyelftools-only, so the verbose Parameters section on
+    trigger_gp_fault showed only a location string. After Phase A,
+    decode_rsod goes through service.run_analysis which instantiates
+    LldbBackend + the callsite-arg reconstructor, so the output now
+    contains the recovered `vector = 0x0D` (set up by dispatch_crash
+    right before the tail-call jmp). Asserting the resolved hex
+    value proves the LLDB code path is actually being exercised.
+    """
+    from pathlib import Path
+    from rsod_decode.lldb_loader import import_lldb
+    from rsod_decode.decoder import decode_rsod
+
+    if import_lldb() is None:
+        pytest.skip("lldb Python module not available")
+
+    base = Path(__file__).parent / "fixtures" / "psa_x64_forcecrash"
+    pdb = base / "psa_x64.pdb"
+    if not pdb.exists():
+        pytest.skip("psa_x64_forcecrash.pdb not present")
+
+    out = tmp_path / "lldb.txt"
+    decode_rsod(
+        log_path=base / "rsod_psa_x64.txt",
+        sym_path=base / "psa_x64.efi",
+        out_path=out,
+        base_override=None,
+        verbose=True,
+        extra_sym_paths=[pdb],
+        source_root=None,
+        backend='lldb',
+    )
+    text = out.read_text()
+    # Baseline symbol resolution still works.
+    assert 'trigger_gp_fault' in text
+    assert 'initialize_test' in text
+    # New: LLDB-resolved Parameters section shows the recovered
+    # `vector` value from the tail-call arg reconstructor.
+    assert '--- Parameters (frame #0: trigger_gp_fault) ---' in text
+    assert 'vector' in text
+    # `0xD` comes from `mov $0xd, %rcx` in dispatch_crash's tail call.
+    # Accept either the decimal-comment form or the raw hex.
+    assert ('= 0x000000000000000D' in text) or ('(13)' in text)
+
+
+@pytest.mark.lldb
 def test_psa_x64_forcecrash_cli_pdb_routing(tmp_path) -> None:
     """decode_rsod must thread a .pdb extra through to load_symbols.
 

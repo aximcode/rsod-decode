@@ -23,6 +23,10 @@ from .serializers import (
     _RE_MEM_LOC, _build_frame_ctx, _var_to_dict,
     crash_info_to_dict, binary_for_session, frame_to_dict, registers_to_dict,
 )
+from .service import (
+    advance_past_brace_line, reinit_backend as _service_reinit_backend,
+    resolve_frame_vars, run_analysis,
+)
 from .session import (
     Session, cleanup_session, gdb_available, get_session, lldb_available,
     pop_session, register_session, store_session,
@@ -38,26 +42,9 @@ def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
     return session, None
 
 
-# `//` and `/*` are unambiguous comment markers. We deliberately
-# do NOT include `*` here even though continuation lines of block
-# comments start with it — `*ptr` dereference expressions also
-# start with it, and distinguishing requires tracking block-
-# comment state across lines. We accept that a multi-line block
-# comment inside the advance window could lead to a skip-miss
-# (returning the `*` continuation as "code"), which in practice
-# almost never happens because normal C doesn't put block-comment
-# bodies between `{` and the first real statement.
-_COMMENT_START_PREFIXES = ('//', '/*')
-# `(void)argc;` et al. — MSVC-friendly unused-parameter suppression
-# that shows up right inside function bodies. We skip these when
-# advancing past a bare `{` so the highlight lands on the first
-# genuinely executable statement, not the cast-to-void.
-_UNUSED_PARAM_RE = re.compile(r'^\(void\)\w+\s*;\s*(?://.*)?$')
-
-
 def _source_search_roots(app: Flask) -> list[Path]:
     """Return the ordered list of source-tree roots to feed to
-    `find_source_file` / `_advance_past_brace_line`. Mirrors the
+    `find_source_file` / `advance_past_brace_line`. Mirrors the
     order used by `/api/source`: REPO_ROOT first, then each
     `--source-path` the operator configured.
     """
@@ -67,176 +54,6 @@ def _source_search_roots(app: Flask) -> list[Path]:
         roots.append(repo_root)
     roots.extend(app.config.get('SOURCE_PATHS') or [])
     return roots
-
-
-def _advance_past_brace_line(
-    source_loc: str, roots: list[Path],
-) -> str:
-    """Normalize a `file:line` past an opening-brace-only line.
-
-    MSVC's PDB frequently maps a faulting or tail-call `jmp`
-    instruction back to the function's opening `{` rather than
-    the first executable statement — especially for single-
-    instruction tail-call wrappers and for the first instruction
-    of any function. That gives the UI a highlight sitting on
-    `{` instead of on the line the code is actually running.
-
-    This helper reads the source file (when reachable via
-    `roots`), and if the `file:line` target is a line whose
-    stripped contents are just `{` (or empty, or a comment),
-    walks forward up to 8 lines looking for the first line
-    containing real code. Returns the original `source_loc`
-    unchanged when the file isn't reachable or the line already
-    contains real code, so stale offsets never silently shift.
-    """
-    if not source_loc or ':' not in source_loc:
-        return source_loc
-    file_part, line_part = source_loc.rsplit(':', 1)
-    try:
-        target_line = int(line_part)
-    except ValueError:
-        return source_loc
-    if target_line < 1:
-        return source_loc
-
-    abs_path = Path(file_part)
-    src_path: Path | None = None
-    if abs_path.is_absolute() and abs_path.is_file():
-        src_path = abs_path
-    else:
-        src_path = find_source_file(roots, file_part, target_line)
-    if src_path is None:
-        return source_loc
-
-    try:
-        lines = src_path.read_text(
-            encoding='utf-8', errors='replace').splitlines()
-    except OSError:
-        return source_loc
-
-    def _is_code(text: str) -> bool:
-        t = text.strip()
-        if not t:
-            return False
-        if t in ('{', '}'):
-            return False
-        if t.startswith(_COMMENT_START_PREFIXES):
-            return False
-        if _UNUSED_PARAM_RE.match(t):
-            return False
-        return True
-
-    idx = target_line - 1
-    if idx >= len(lines):
-        return source_loc
-    if _is_code(lines[idx]):
-        return source_loc
-
-    for delta in range(1, 9):
-        probe = idx + delta
-        if probe >= len(lines):
-            break
-        if _is_code(lines[probe]):
-            return f'{file_part}:{target_line + delta}'
-    return source_loc
-
-
-def _backfill_source_loc_from_richer_backend(
-    session: Session, roots: list[Path] | None = None,
-) -> None:
-    """Fill missing per-frame `source_loc` and `symbol` via the
-    session's richer backend.
-
-    The decoder's source_loc resolution pass only sees the static
-    pyelftools / PEBinary surface — for PE+PDB sessions it returns
-    nothing because PEBinary stubs `resolve_addresses`. Once the
-    richer LLDB (or GDB) backend is attached to the session we can
-    re-run the lookup for any frames that are still missing a
-    source_loc and populate them from line-table-aware data.
-
-    Both crash frames and non-crash frames key off `call_addr - 1`
-    here: for crash frames `call_addr == address`, so this is
-    identical to `address - 1` which is still inside the faulting
-    instruction's range; for non-crash frames `call_addr - 1` lands
-    inside the call instruction in the caller — a pre-call PC that
-    the PDB maps to the source line that issued the call. That's
-    the line the user expects to see highlighted when they inspect
-    a frame ("where was the caller when it handed off control").
-    Using the raw return address (`frame.address`) would map to the
-    *next* source line because MSVC's line table associates the
-    post-call PC with whatever statement follows it — usually the
-    function's closing brace.
-
-    We also synthesize a `MapSymbol` from the richer backend's
-    function name when `frame.symbol` is missing, so downstream
-    consumers (tail-call reconstructor, serializer) see a populated
-    symbol even for addresses the static .map didn't know about.
-
-    When `roots` is supplied, every newly-assigned source_loc is
-    passed through `_advance_past_brace_line` so MSVC's habit of
-    mapping tail-call jmps and leaf-function instructions to the
-    function's opening `{` gets normalized to the first real
-    statement.
-    """
-    backend = session.lldb_dwarf or session.gdb_dwarf
-    if backend is None:
-        return
-    from .models import MapSymbol
-    roots = list(roots or [])
-    for f in session.result.frames:
-        if f.source_loc and f.symbol:
-            continue
-        target = (f.call_addr - 1) if f.call_addr else f.address
-        if not target:
-            continue
-        info = backend.resolve_address(target)
-        if info is None:
-            continue
-        if info.source_loc and not f.source_loc:
-            f.source_loc = _advance_past_brace_line(info.source_loc, roots)
-        if info.function and f.symbol is None:
-            f.symbol = MapSymbol(
-                address=f.address, name=info.function,
-                object_file=f.module or '', is_function=True)
-
-
-def _reconstruct_tail_call_frames(
-    session: Session, roots: list[Path] | None = None,
-) -> None:
-    """Re-materialize frames elided by compiler tail-call optimization.
-
-    Walks the existing frame list through the LLDB backend's
-    disassembly-annotation surface and splices in synthetic
-    FrameInfo entries for any tail-called function that sat between
-    an adjacent (child, parent) pair. Safe to call repeatedly —
-    synthetic frames are marked `is_synthetic=True` so we skip them
-    on subsequent passes. Does nothing when no LLDB backend is
-    attached or when no tail calls are detected.
-
-    When `roots` is supplied, each synthetic frame's source_loc is
-    passed through `_advance_past_brace_line` so 1-instruction
-    wrapper functions don't leave the UI highlighting a bare `{`.
-    """
-    if session.lldb_dwarf is None:
-        return
-    from .lldb_backend import LldbBackend
-    if not isinstance(session.lldb_dwarf, LldbBackend):
-        return
-    from .tail_call_reconstructor import reconstruct_tail_calls
-
-    # Operate on the original (non-synthetic) frames only, so we
-    # don't feed previously-inserted synthetic frames back in if
-    # the caller runs the pass twice.
-    original = [f for f in session.result.frames if not f.is_synthetic]
-    rebuilt = reconstruct_tail_calls(original, session.lldb_dwarf)
-    if len(rebuilt) == len(original):
-        return
-    if roots:
-        for f in rebuilt:
-            if f.is_synthetic and f.source_loc:
-                f.source_loc = _advance_past_brace_line(f.source_loc, roots)
-    session.result.frames = rebuilt
-    session.frame_cache.clear()
 
 
 # =============================================================================
@@ -332,86 +149,31 @@ def create_app(repo_root: Path | None = None,
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 return jsonify(error=f'invalid base address: {base_str}'), 400
 
-        # Analyze using the shared core
-        analysis = analyze_rsod(rsod_text, source, extra_sources, base_override,
-                               symbol_search_paths=app.config['SYMBOL_SEARCH_PATHS'])
-
-        # Store session
-        session_id = uuid.uuid4().hex[:12]
-        session = Session(
-            id=session_id,
-            result=analysis,
-            source=source,
-            extra_sources=extra_sources,
-            rsod_text=rsod_text,
-            created_at=datetime.now(timezone.utc).isoformat(),
+        # Run the shared analysis pipeline: parse + backend init
+        # (lldb → gdb → pyelftools auto) + source_loc backfill + tail
+        # call reconstruction. All of this used to be inlined here.
+        ctx = run_analysis(
+            rsod_text, source, extra_sources,
+            base_override=base_override,
+            symbol_search_paths=app.config['SYMBOL_SEARCH_PATHS'],
             temp_dir=temp_dir,
             elf_path=sym_path,
             pe_path=pe_for_pdb,
             pdb_path=pdb_path,
+            backend='auto',
+            source_roots=_source_search_roots(app),
         )
 
-        # Auto-initialize a richer backend if available. Preference
-        # order: lldb (ELF corefile or PE+PDB) → gdb (ELF only) →
-        # pyelftools. PE+PDB needs both .efi and .pdb; plain PE sessions
-        # without a PDB silently fall back to pyelftools/PEBinary.
-        frame_data = [(f.frame_fp, f.address) for f in analysis.frames]
-        if lldb_available():
-            try:
-                from .lldb_backend import LldbBackend
-                if pe_for_pdb is not None and pdb_path is not None:
-                    session.lldb_dwarf = LldbBackend.from_pe_pdb(
-                        pe_for_pdb, pdb_path,
-                        analysis.crash_info.registers,
-                        analysis.crash_info.crash_pc,
-                        analysis.stack_base, analysis.stack_mem,
-                        session.img_base, frames=frame_data)
-                    session.backend = 'lldb'
-                elif pe_for_pdb is None:
-                    session.lldb_dwarf = LldbBackend(
-                        sym_path, analysis.crash_info.registers,
-                        analysis.crash_info.crash_pc,
-                        analysis.stack_base, analysis.stack_mem,
-                        session.img_base, frames=frame_data)
-                    session.backend = 'lldb'
-            except Exception:
-                pass
-        # GDB can only target ELF+DWARF; PE sessions are guaranteed to
-        # fail inside write_corefile/add-symbol-file, so don't even try.
-        if session.backend == 'pyelftools' and gdb_available() \
-                and pe_for_pdb is None:
-            try:
-                from .gdb_backend import GdbBackend
-                session.gdb_dwarf = GdbBackend(
-                    sym_path, analysis.crash_info.registers,
-                    analysis.crash_info.crash_pc,
-                    analysis.stack_base, analysis.stack_mem,
-                    session.img_base, frames=frame_data)
-                session.backend = 'gdb'
-            except Exception:
-                pass
-
-        # PE+PDB source_loc backfill. The decoder's re-resolve pass in
-        # `analyze_rsod` uses `binary_for_frame` which returns the
-        # static PEBinary for psa_x64.efi — PEBinary has no line info.
-        # Once the richer LLDB backend is attached, walk the frames
-        # and populate missing `source_loc` entries from the PDB.
-        source_roots = _source_search_roots(app)
-        _backfill_source_loc_from_richer_backend(session, source_roots)
-
-        # Synthesize frames elided by tail-call optimization. MSVC
-        # happily collapses thin wrappers into `jmp` chains so the
-        # runtime stack is shallower than the source call chain;
-        # LLDB's disassembly annotations let us reconstruct the
-        # missing links and mark them `is_synthetic=True`.
-        _reconstruct_tail_call_frames(session, source_roots)
-
+        session_id = uuid.uuid4().hex[:12]
+        session = Session.from_analysis_context(
+            ctx, session_id,
+            created_at=datetime.now(timezone.utc).isoformat())
         store_session(session)
 
         return jsonify(
             session_id=session_id,
-            crash_summary=crash_info_to_dict(analysis.crash_info),
-            frame_count=len(analysis.frames),
+            crash_summary=crash_info_to_dict(ctx.result.crash_info),
+            frame_count=len(ctx.result.frames),
         ), 201
 
     # -----------------------------------------------------------------
@@ -459,145 +221,56 @@ def create_app(repo_root: Path | None = None,
         frame = session.result.frames[frame_index]
         result: dict = frame_to_dict(frame)
 
-        binary = binary_for_session(session, frame)
+        # Shared pipeline: raw params/locals/globals from the active
+        # backend, with tail-call recovered values merged at the
+        # VarInfo level. `service.resolve_frame_vars` owns all the
+        # backend-selection + merge + globals-evaluation logic that
+        # used to live inline here.
+        params, locals_, globals_ = resolve_frame_vars(
+            session.as_analysis_context(), frame_index)
+
         img_base = session.img_base
-        # Synthetic (tail-call reconstructed) frames have no
-        # physical stack frame, so there are no spill slots to
-        # read params/locals from — even though the function
-        # itself is a real PDB/DWARF entity with declared
-        # parameters. Short-circuit here so the UI renders empty
-        # tables instead of showing stale register snapshots
-        # from whoever's actually occupying RSP/RBP at the time.
-        if frame.is_synthetic:
-            # Synthetic tail-call wrappers have no physical stack
-            # frame, but the reconstructor may have reconstructed
-            # their entry-register values by walking the caller's
-            # call/jmp setup. Render those as the frame's param list
-            # so the UI shows `ctx = 0x...`, `vector = 0xd`, etc.
-            ctx = _build_frame_ctx(frame, session, img_base)
-            result['params'] = [
-                _var_to_dict(v, ctx) for v in frame.callsite_params]
-            result['locals'] = []
-            result['globals'] = []
-        elif binary and frame.address:
-            ctx = _build_frame_ctx(frame, session, img_base)
-            # For non-crash frames, use call_addr - 1 for DWARF location
-            # lookup.  The return address lands in DW_OP_entry_value ranges
-            # (unresolvable for caller-saved regs).  Subtracting 1 from the
-            # call instruction address puts us inside the previous range
-            # where the variable is still on the stack (DW_OP_fbreg).
-            lookup_pc = frame.address
-            if not frame.is_crash_frame and frame.call_addr:
-                lookup_pc = frame.call_addr - 1
-            params = binary.get_params(lookup_pc)
-            locals_ = binary.get_locals(lookup_pc)
-            result['params'] = [_var_to_dict(v, ctx) for v in params]
-            result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
+        ctx = _build_frame_ctx(frame, session, img_base)
+        result['params'] = [_var_to_dict(v, ctx) for v in params]
+        result['locals'] = [_var_to_dict(v, ctx) for v in locals_]
+        result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
 
-            # Tail-call backfill: the reconstructor may have
-            # recovered parameter values the backend couldn't read —
-            # register-held scalars on the crash frame (e.g.
-            # `vector=0xd` for `trigger_gp_fault`, set up by
-            # `dispatch_crash` right before the jmp), or spill-slot-
-            # reused pointers on downstream physical frames (e.g.
-            # `config`/`build_id` on `initialize_test`, recovered via
-            # the call-site walk through the `run_crashtest` wrapper
-            # and its own arg-register setup). Merge into the
-            # standard param list wherever the backend returned None
-            # — it's still the same declared parameter, just with a
-            # concrete value now.
-            if frame.callsite_params:
-                by_name = {p['name']: p for p in result['params']}
-                for recovered in frame.callsite_params:
-                    dst = by_name.get(recovered.name)
-                    if dst is None:
-                        result['params'].append(
-                            _var_to_dict(recovered, ctx))
+        # Infer unresolved params from ancestor frames (pyelftools only).
+        # GDB/LLDB backends resolve entry_values themselves, so skip the
+        # cross-frame walk when a richer backend is active. This remains
+        # web-only because the CLI doesn't render the drill-down that
+        # this fallback improves.
+        if session.backend not in ('gdb', 'lldb') \
+                and not frame.is_synthetic and frame.address:
+            for p in result['params']:
+                if p['value'] is not None:
+                    continue
+                if _RE_MEM_LOC.match(p['location']):
+                    continue
+                for anc_idx in range(frame_index + 1,
+                                     len(session.result.frames)):
+                    anc = session.result.frames[anc_idx]
+                    anc_binary = binary_for_frame(
+                        anc, session.source, session.extra_sources)
+                    if not anc_binary or not anc.address:
                         continue
-                    if dst.get('value') is None and recovered.value is not None:
-                        dst['value'] = recovered.value
-                        # Record provenance in the location string
-                        # without clobbering the original (which
-                        # still says "eax" / "xmm9" / etc.).
-                        if recovered.location:
-                            dst['location'] = recovered.location
-                    # C-string previews (build_id = "crashtest-v3")
-                    # are read via backend memory and stashed on
-                    # the VarInfo.string_preview; always carry them
-                    # through when the merged destination lacks one.
-                    if not dst.get('string_preview') and \
-                            recovered.string_preview:
-                        dst['string_preview'] = recovered.string_preview
-                    # Expandable pointer-to-struct: the reconstructor
-                    # may have built a synthetic SBValue via
-                    # `CreateValueFromAddress` for pointers the base
-                    # LLDB walk couldn't expand (spill-slot reuse).
-                    # Carry through is_expandable/expand_addr/var_key
-                    # so the UI's expand arrow wires into the cached
-                    # value through /api/expand.
-                    if recovered.is_expandable and recovered.var_key \
-                            and not dst.get('var_key'):
-                        dst['is_expandable'] = True
-                        dst['expand_addr'] = recovered.expand_addr
-                        dst['var_key'] = recovered.var_key
-
-            # Infer unresolved params from ancestor frames (pyelftools only).
-            # GDB/LLDB backends resolve entry_values themselves.
-            if session.backend not in ('gdb', 'lldb'):
-                for p in result['params']:
-                    if p['value'] is not None:
-                        continue
-                    if _RE_MEM_LOC.match(p['location']):
-                        continue
-                    for anc_idx in range(frame_index + 1,
-                                         len(session.result.frames)):
-                        anc = session.result.frames[anc_idx]
-                        anc_binary = binary_for_frame(
-                            anc, session.source, session.extra_sources)
-                        if not anc_binary or not anc.address:
+                    anc_pc = anc.address
+                    if not anc.is_crash_frame and anc.call_addr:
+                        anc_pc = anc.call_addr - 1
+                    anc_ctx = _build_frame_ctx(anc, session, img_base)
+                    for var in (*anc_binary.get_params(anc_pc),
+                                *anc_binary.get_locals(anc_pc)):
+                        if var.name != p['name']:
                             continue
-                        anc_pc = anc.address
-                        if not anc.is_crash_frame and anc.call_addr:
-                            anc_pc = anc.call_addr - 1
-                        anc_ctx = _build_frame_ctx(anc, session, img_base)
-                        for var in (*anc_binary.get_params(anc_pc),
-                                    *anc_binary.get_locals(anc_pc)):
-                            if var.name != p['name']:
-                                continue
-                            d = _var_to_dict(var, anc_ctx)
-                            if d['value'] is None:
-                                continue
-                            p['value'] = d['value']
-                            if p['is_expandable'] and p['expand_addr'] is None:
-                                p['expand_addr'] = d['value']
-                            break
-                        if p['value'] is not None:
-                            break
-
-            # Globals: pyelftools discovers CU-scope names, GDB backend
-            # evaluates values (if available) for runtime-accurate data.
-            pyelf_binary = binary_for_frame(
-                frame, session.source, session.extra_sources)
-            if pyelf_binary:
-                globals_ = pyelf_binary.get_globals(frame.address)
-                # Richer backends (GDB/LLDB) resolve globals to runtime
-                # values instead of ELF initializers. evaluate_globals()
-                # takes the pyelftools-discovered list as its input.
-                if session.backend == 'gdb' and session.gdb_dwarf:
-                    from .gdb_backend import GdbBackend
-                    if isinstance(session.gdb_dwarf, GdbBackend):
-                        globals_ = session.gdb_dwarf.evaluate_globals(globals_)
-                elif session.backend == 'lldb' and session.lldb_dwarf:
-                    from .lldb_backend import LldbBackend
-                    if isinstance(session.lldb_dwarf, LldbBackend):
-                        globals_ = session.lldb_dwarf.evaluate_globals(globals_)
-            else:
-                globals_ = binary.get_globals(frame.address)
-            result['globals'] = [_var_to_dict(v, ctx) for v in globals_]
-        else:
-            result['params'] = []
-            result['locals'] = []
-            result['globals'] = []
+                        d = _var_to_dict(var, anc_ctx)
+                        if d['value'] is None:
+                            continue
+                        p['value'] = d['value']
+                        if p['is_expandable'] and p['expand_addr'] is None:
+                            p['expand_addr'] = d['value']
+                        break
+                    if p['value'] is not None:
+                        break
 
         result['call_verified'] = session.result.call_verified.get(frame.address)
         if frame.frame_registers:
@@ -825,7 +498,7 @@ def create_app(repo_root: Path | None = None,
                 cached = advance_cache.get(src)
                 if cached is not None:
                     return cached
-                adjusted = _advance_past_brace_line(src, roots)
+                adjusted = advance_past_brace_line(src, roots)
                 advance_cache[src] = adjusted
                 return adjusted
 
@@ -958,74 +631,18 @@ def create_app(repo_root: Path | None = None,
 
         data = request.get_json(silent=True) or {}
         target = data.get('backend', '')
-        if target not in ('pyelftools', 'gdb', 'lldb'):
-            return jsonify(
-                error='backend must be "pyelftools", "gdb", or "lldb"'), 400
 
-        if target == session.backend:
-            return jsonify(backend=session.backend)
+        ctx = session.as_analysis_context()
+        fail = _service_reinit_backend(
+            ctx, target, source_roots=_source_search_roots(app))
+        if fail:
+            return jsonify(error=fail), 400
 
-        if target == 'gdb':
-            if not gdb_available():
-                return jsonify(error='GDB/pygdbmi not available'), 400
-            if session.pe_path is not None:
-                return jsonify(
-                    error='GDB backend requires an ELF primary; '
-                          'this session is PE+PDB'), 400
-            if not session.gdb_dwarf:
-                try:
-                    from .gdb_backend import GdbBackend
-                    frame_data = [(f.frame_fp, f.address)
-                                  for f in session.result.frames]
-                    session.gdb_dwarf = GdbBackend(
-                        session.elf_path,
-                        session.result.crash_info.registers,
-                        session.result.crash_info.crash_pc,
-                        session.result.stack_base,
-                        session.result.stack_mem,
-                        session.img_base,
-                        frames=frame_data,
-                    )
-                except Exception as e:
-                    return jsonify(error=f'Failed to start GDB backend: {e}'), 500
-
-        if target == 'lldb':
-            if not lldb_available():
-                return jsonify(error='lldb Python module not available'), 400
-            if not session.lldb_dwarf:
-                try:
-                    from .lldb_backend import LldbBackend
-                    frame_data = [(f.frame_fp, f.address)
-                                  for f in session.result.frames]
-                    if session.pe_path is not None and \
-                            session.pdb_path is not None:
-                        session.lldb_dwarf = LldbBackend.from_pe_pdb(
-                            session.pe_path,
-                            session.pdb_path,
-                            session.result.crash_info.registers,
-                            session.result.crash_info.crash_pc,
-                            session.result.stack_base,
-                            session.result.stack_mem,
-                            session.img_base,
-                            frames=frame_data,
-                        )
-                    else:
-                        session.lldb_dwarf = LldbBackend(
-                            session.elf_path,
-                            session.result.crash_info.registers,
-                            session.result.crash_info.crash_pc,
-                            session.result.stack_base,
-                            session.result.stack_mem,
-                            session.img_base,
-                            frames=frame_data,
-                        )
-                except Exception as e:
-                    return jsonify(error=f'Failed to start LLDB backend: {e}'), 500
-
-        session.backend = target
+        # Sync mutated fields back to the session.
+        session.lldb_dwarf = ctx.lldb_backend
+        session.gdb_dwarf = ctx.gdb_backend
+        session.backend = ctx.backend
         session.frame_cache.clear()
-        _backfill_source_loc_from_richer_backend(
-            session, _source_search_roots(app))
         return jsonify(backend=session.backend)
 
     # -----------------------------------------------------------------

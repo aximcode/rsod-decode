@@ -4,11 +4,15 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .decoder import AnalysisResult
 from .gdb_bridge import GdbSession, find_gdb
 from .lldb_loader import import_lldb
 from .models import SymbolSource
+
+if TYPE_CHECKING:
+    from .service import AnalysisContext
 
 
 # =============================================================================
@@ -47,6 +51,57 @@ class Session:
         if ci.crash_pc and f0 and f0[0].address:
             return ci.crash_pc - f0[0].address
         return 0
+
+    def as_analysis_context(self) -> AnalysisContext:
+        """Create a live view of this session as an AnalysisContext.
+
+        The returned context shares references to the session's
+        result/source/extras/backends, so mutations flow both ways.
+        Used by /api/backend to call service.reinit_backend on an
+        existing session.
+        """
+        from .service import AnalysisContext
+        return AnalysisContext(
+            result=self.result,
+            source=self.source,
+            extras=self.extra_sources,
+            rsod_text=self.rsod_text,
+            temp_dir=self.temp_dir,
+            elf_path=self.elf_path,
+            pe_path=self.pe_path,
+            pdb_path=self.pdb_path,
+            backend=self.backend,
+            lldb_backend=self.lldb_dwarf,
+            gdb_backend=self.gdb_dwarf,
+        )
+
+    @classmethod
+    def from_analysis_context(
+        cls, ctx: AnalysisContext, session_id: str,
+        created_at: str = '',
+    ) -> Session:
+        """Wrap a service.AnalysisContext in a web Session.
+
+        Used by the Flask upload handler and CLI pre-load path to
+        adapt the shared analysis pipeline's output to the web UI's
+        session store. The context's backends become the session's
+        lldb_dwarf / gdb_dwarf fields verbatim.
+        """
+        return cls(
+            id=session_id,
+            result=ctx.result,
+            source=ctx.source,
+            extra_sources=ctx.extras,
+            rsod_text=ctx.rsod_text,
+            created_at=created_at,
+            temp_dir=ctx.temp_dir,
+            elf_path=ctx.elf_path,
+            pe_path=ctx.pe_path,
+            pdb_path=ctx.pdb_path,
+            gdb_dwarf=ctx.gdb_backend,
+            lldb_dwarf=ctx.lldb_backend,
+            backend=ctx.backend,
+        )
 
 
 # Global session store (Phase 1: in-memory)
