@@ -201,13 +201,13 @@ def test_psa_x64_forcecrash_ground_truth_via_api(
 ) -> None:
     """PDB-backed struct expansion ground-truth.
 
-    Uploads psa_x64.efi + .map + .pdb and hits /api/expand with the
-    same `pe_type:` var_keys the frontend sends, asserting the
-    deterministic CrashContext/CrashTestConfig field values documented
-    in tests/fixtures/psa_x64_forcecrash/BUILD.md.
-
-    Struct addresses are computed relative to the crash RSP from the
-    BUILD.md stack offset table — no CFI unwinding involved.
+    Drives /api/expand through the same flow the frontend uses:
+    /api/frame/<init_idx> discovers the `ctx` local and its var_key;
+    we then walk the CrashContext → CrashTestConfig → Point pointer
+    chain asserting the deterministic field values documented in
+    tests/fixtures/psa_x64_forcecrash/BUILD.md. LLDB's PE+PDB
+    minidump path resolves the per-frame RSP via the unwinder's
+    .pdata reader, so no manual stack-offset math is needed.
     """
     if api_session.spec.key != "psa_x64_forcecrash":
         pytest.skip("ground-truth assertions only for psa_x64_forcecrash")
@@ -218,19 +218,33 @@ def test_psa_x64_forcecrash_ground_truth_via_api(
     if meta["backend"] != "lldb":
         pytest.skip(f"session backend is {meta['backend']!r}, expected lldb")
 
-    rsp = int(meta["registers"]["RSP"], 16)
-    # BUILD.md: ctx.cookie partial at RSP+0x38, cookie@CrashContext+16 →
-    # ctx starts at RSP+0x28 (= RSP + 40).
-    ctx_addr = rsp + 40
+    # Find initialize_test in the frame list; its `ctx` local holds
+    # the ground-truth CrashContext we want to validate.
+    init_idx = next(
+        (i for i, f in enumerate(meta["frames"])
+         if f["symbol"] == "initialize_test"),
+        None)
+    assert init_idx is not None, "initialize_test not in frame list"
 
-    def expand(addr: int, var_key: str) -> list[dict]:
+    frame_body = client.get(
+        f"/api/frame/{api_session.session_id}/{init_idx}").get_json()
+    locals_ = {v["name"]: v for v in frame_body["locals"]}
+    ctx_var = locals_["ctx"]
+    assert ctx_var["is_expandable"]
+    ctx_addr = ctx_var["expand_addr"]
+    ctx_key = ctx_var["var_key"]
+    assert ctx_addr is not None and ctx_key
+
+    def expand(
+        addr: int, var_key: str, frame_idx: int = init_idx,
+    ) -> list[dict]:
         resp = client.get(
-            f"/api/expand/{api_session.session_id}/0"
+            f"/api/expand/{api_session.session_id}/{frame_idx}"
             f"?addr=0x{addr:X}&var_key={var_key}&offset=0&count=32")
         assert resp.status_code == 200, resp.get_json()
         return resp.get_json()["fields"]
 
-    ctx_fields = {f["name"]: f for f in expand(ctx_addr, "pe_type:CrashContext")}
+    ctx_fields = {f["name"]: f for f in expand(ctx_addr, ctx_key)}
     assert ctx_fields["depth"]["value"] == 1
     assert ctx_fields["cookie"]["value"] == (
         0xDEAD0000CAFE0000 ^ 0xDEFFBABECAFE0000)
@@ -241,7 +255,7 @@ def test_psa_x64_forcecrash_ground_truth_via_api(
 
     config_ptr = ctx_fields["config"]["expand_addr"]
     config_key = ctx_fields["config"]["var_key"]
-    assert config_ptr is not None and config_key.startswith("pe_type:")
+    assert config_ptr is not None and config_key
 
     cfg_fields = {f["name"]: f for f in expand(config_ptr, config_key)}
     assert cfg_fields["session_id"]["value"] == 0xDEAD0000CAFE0000
@@ -251,7 +265,7 @@ def test_psa_x64_forcecrash_ground_truth_via_api(
 
     origin_addr = cfg_fields["origin"]["expand_addr"]
     origin_key = cfg_fields["origin"]["var_key"]
-    assert origin_addr is not None and origin_key.startswith("pe_type:")
+    assert origin_addr is not None and origin_key
     pt_fields = {f["name"]: f for f in expand(origin_addr, origin_key)}
     assert pt_fields["x"]["value"] == 100
     assert pt_fields["y"]["value"] == 200
@@ -296,7 +310,10 @@ def test_psa_x64_forcecrash_frame1_locals_via_api(
     ctx_var = locals_["ctx"]
     assert ctx_var["type"] == "CrashContext"
     assert ctx_var["is_expandable"] is True
-    assert ctx_var["var_key"] == "pe_type:CrashContext"
+    # var_key is an opaque routing token — unified backend emits the
+    # SBValue-cache form `v_<pc>_<name>` for every mode, so assert
+    # it's present rather than format-pinning.
+    assert ctx_var["var_key"], "ctx missing var_key for /api/expand"
     assert ctx_var["expand_addr"] is not None
 
     # Round-trip through /api/expand to prove var_key wires correctly.

@@ -42,10 +42,14 @@ _CONTEXT_AMD64 = 0x100000
 _CONTEXT_CONTROL = _CONTEXT_AMD64 | 0x1
 _CONTEXT_INTEGER = _CONTEXT_AMD64 | 0x2
 _CONTEXT_SEGMENTS = _CONTEXT_AMD64 | 0x4
-_CONTEXT_FLOATING_POINT = _CONTEXT_AMD64 | 0x8
+# FLOATING_POINT is intentionally OMITTED. The Dell RSOD register
+# dump does not carry XMM/YMM state, so the XMM save area stays
+# zeroed; advertising FP as "present" makes LLDB read the zeroes
+# as real values for params MSVC chose to pass in XMM registers
+# (e.g. `vector` in trigger_gp_fault at DW_OP_reg26 XMM9). Leaving
+# the flag off makes LLDB report those as unavailable instead.
 _CONTEXT_FULL = (
-    _CONTEXT_CONTROL | _CONTEXT_INTEGER
-    | _CONTEXT_SEGMENTS | _CONTEXT_FLOATING_POINT
+    _CONTEXT_CONTROL | _CONTEXT_INTEGER | _CONTEXT_SEGMENTS
 )
 
 # sizeof(CONTEXT_AMD64) from winnt.h

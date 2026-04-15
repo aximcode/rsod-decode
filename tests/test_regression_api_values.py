@@ -424,11 +424,17 @@ _EXPECTATIONS: dict[str, _ApiExpectations] = {
                       is_synthetic=False,
                       source_line_text="fForceCrashIfRequested(argc, argv)",
                       disasm_target_mnemonic="call",
-                      params=(("originalTxtAttr", "uint64_t"),
-                              ("originalTxtMode", "uint64_t")),
-                      locals_=(("argv", "char"),
-                               ("imageHandle", "void"),
-                               ("psSystemTable", "EFI_SYSTEM_TABLE"),
+                      # SBFrame.GetVariables splits args/locals by the
+                      # ABI: imageHandle + psSystemTable are the real
+                      # parameters, everything else lives in the locals
+                      # set (originalTxtAttr/Mode, argc, argv).
+                      # LLDB resolves typedefs to canonical types, so
+                      # uint64_t reports as "unsigned long long".
+                      params=(("imageHandle", "void"),
+                              ("psSystemTable", "EFI_SYSTEM_TABLE")),
+                      locals_=(("originalTxtAttr", "unsigned long long"),
+                               ("originalTxtMode", "unsigned long long"),
+                               ("argv", "char"),
                                ("argc", "int"))),
         },
     ),

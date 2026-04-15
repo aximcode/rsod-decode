@@ -45,143 +45,6 @@ def _is_expandable_type_name(type_name: str) -> bool:
 _CALL_MNEMONICS = ('bl', 'blr', 'blx', 'call', 'callq')
 
 
-# -----------------------------------------------------------------------
-# `image lookup -va` output parsing for PE+PDB per-frame variables.
-#
-# LLDB emits per-variable entries with DWARF-style location expressions,
-# e.g. "DW_OP_breg7 RSP+32" for stack locals and "DW_OP_reg2 RCX" for
-# register-held params. Entries may be range-scoped, meaning the
-# location only applies when the PC is inside [lo, hi). We dedupe by
-# name and pick the scope that covers the target PC.
-# -----------------------------------------------------------------------
-
-_RE_LOOKUP_VARIABLE = re.compile(
-    r'Variable: id = \{[^}]+\},\s*name = "([^"]*)",\s*type = "([^"]*)",'
-    r'.*?location = (.+?),\s*decl\s*=',
-    re.DOTALL,
-)
-_RE_LOOKUP_RANGED = re.compile(
-    r'^\s*\[0x([0-9a-fA-F]+),\s*0x([0-9a-fA-F]+)\)\s*->\s*(.+?)\s*$')
-_RE_DW_OP_REG = re.compile(r'^\s*DW_OP_reg\d+\s+(\w+)\s*$')
-_RE_DW_OP_BREG = re.compile(r'^\s*DW_OP_breg\d+\s+(\w+)([+-])(\d+)\s*$')
-_RE_LOOKUP_FUNCTYPE = re.compile(r'compiler_type = "([^"]*)"')
-
-
-def _count_func_params(sig: str) -> int:
-    """Count parameters in a C function type signature.
-
-    Uses the outermost parenthesized parameter list. Handles void and
-    empty lists; does not try to be clever about function-pointer
-    parameters, which could produce a low count in pathological cases.
-    """
-    depth = 0
-    start = -1
-    for i, ch in enumerate(sig):
-        if ch == '(':
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == ')':
-            depth -= 1
-            if depth == 0 and start >= 0:
-                inner = sig[start + 1:i].strip()
-                if not inner or inner == 'void':
-                    return 0
-                # Count top-level commas only
-                d = 0
-                count = 1
-                for c in inner:
-                    if c == '(':
-                        d += 1
-                    elif c == ')':
-                        d -= 1
-                    elif c == ',' and d == 0:
-                        count += 1
-                return count
-    return 0
-
-
-def _parse_lookup_vars(
-    output: str, pc: int,
-) -> list[dict[str, Any]]:
-    """Parse Variable lines from `image lookup -va <pc>` text output.
-
-    Returns entries in first-seen order, one per (name, location-scope)
-    pair. Each entry: {name, type_name, kind, info, applies}, where
-    kind is 'reg' (info=reg_name) or 'stack' (info=(reg, offset)).
-    `applies` is True when the location covers `pc`.
-    """
-    entries: list[dict[str, Any]] = []
-    for m in _RE_LOOKUP_VARIABLE.finditer(output):
-        name = m.group(1)
-        type_name = m.group(2).strip()
-        raw_loc = m.group(3).strip()
-
-        ranged = _RE_LOOKUP_RANGED.match(raw_loc)
-        if ranged:
-            lo = int(ranged.group(1), 16)
-            hi = int(ranged.group(2), 16)
-            expr = ranged.group(3).strip()
-            applies = lo <= pc < hi
-            has_range = True
-        else:
-            expr = raw_loc
-            applies = True
-            has_range = False
-
-        reg_m = _RE_DW_OP_REG.match(expr)
-        breg_m = _RE_DW_OP_BREG.match(expr)
-        if reg_m:
-            kind = 'reg'
-            info: Any = reg_m.group(1).upper()
-        elif breg_m:
-            reg = breg_m.group(1).upper()
-            off = int(breg_m.group(3))
-            if breg_m.group(2) == '-':
-                off = -off
-            kind = 'stack'
-            info = (reg, off)
-        else:
-            continue
-
-        entries.append({
-            'name': name,
-            'type_name': type_name,
-            'kind': kind,
-            'info': info,
-            'applies': applies,
-            'ranged': has_range,
-        })
-    return entries
-
-
-def _dedupe_lookup_vars(
-    entries: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Pick one entry per name, preferring applicable scopes.
-
-    When both an applicable ranged location and an applicable block-
-    wide location exist for the same variable, the ranged entry wins
-    (tighter scope). Unapplicable entries are only kept as fallbacks.
-    """
-    by_name: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for e in entries:
-        name = e['name']
-        cur = by_name.get(name)
-        if cur is None:
-            by_name[name] = e
-            order.append(name)
-            continue
-        # Prefer applies=True, then prefer ranged (tighter scope).
-        if e['applies'] and not cur['applies']:
-            by_name[name] = e
-        elif e['applies'] and cur['applies'] and \
-                e['ranged'] and not cur['ranged']:
-            by_name[name] = e
-    return [by_name[n] for n in order]
-
-
 class LldbBackend:
     """DWARF backend using LLDB's in-process Python API.
 
@@ -206,15 +69,21 @@ class LldbBackend:
         self._lldb = lldb
         self._elf_path = elf_path
         self._image_base = image_base
+        # Decoder-facing addresses are ELF offsets for corefile mode
+        # (bare section offsets) and absolute file addresses for PE+PDB
+        # mode (ImageBase already baked in). `_addr_slide` is the
+        # value to add on entry to reach the LLDB-side runtime address
+        # (corefile: image_base, PE+PDB: 0).
+        self._addr_slide: int = image_base
+        # ELF corefile carries the full NT_PRSTATUS gregset, so
+        # register-held scalars resolve through LLDB cleanly. PE+PDB
+        # minidumps omit FP/XMM state (absent from Dell RSODs), so
+        # register-held scalars in that mode read back as phantom
+        # zeros and must be suppressed — see `_sbvalue_to_varinfo`.
+        self._registers_fully_populated: bool = True
         self._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_'))
         self._var_objects: dict[str, Any] = {}
         self._globals_cache: list[VarInfo] | None = None
-        self._mode: str = 'corefile'
-        # PE+PDB mode stashes stack/registers for manual memory reads
-        # since no SBProcess is available. Set in from_pe_pdb().
-        self._crash_registers: dict[str, int] = registers
-        self._stack_base: int = stack_base
-        self._stack_mem: bytes = stack_mem
 
         core_path = self._tmpdir / 'crash.core'
         write_corefile(
@@ -283,8 +152,6 @@ class LldbBackend:
         return None
 
     def _frame_for(self, addr: int) -> Any | None:
-        if self._mode == 'pe_pdb':
-            return None
         idx = self._resolve_frame_idx(addr)
         if idx is None:
             return None
@@ -307,17 +174,44 @@ class LldbBackend:
         should NOT get the ▶ expansion affordance in the UI — or the
         user clicks in and sees a struct full of dashes.
         """
-        if self._mode == 'pe_pdb':
-            if self._stack_mem:
-                off = addr - self._stack_base
-                if 0 <= off and off + size <= len(self._stack_mem):
-                    return True
-            for file_addr, sec_size, _ in self._pe_sections:
-                off = addr - file_addr
-                if 0 <= off and off + size <= sec_size:
-                    return True
-            return False
         return self._has_memory(addr, size)
+
+    @staticmethod
+    def _in_scope_variables(frame_values: Any) -> list[Any]:
+        """Dedupe `SBFrame.GetVariables` output by name, preferring
+        entries with a concrete location.
+
+        LLDB's PE/PDB path leaks pre-prologue range-scoped S_LOCAL
+        records through the `in_scope_only=True` flag: the same name
+        appears twice — once without a location (``GetLoadAddress() ==
+        0xFFFF_FFFF_FFFF_FFFF`` AND ``GetValue() is None``) and once
+        with a real stack address. ELF+DWARF doesn't produce those
+        duplicates, so each name appears exactly once and we keep it
+        verbatim (even if it's optimized out — the frame-variable list
+        still needs to report the name/type).
+
+        Returns the SBValues in first-seen order with at most one
+        entry per name. Whenever a duplicate exists, the entry with a
+        concrete location (valid load address or non-None
+        ``GetValue()``) wins.
+        """
+        def has_location(v: Any) -> bool:
+            if v.GetLoadAddress() != 0xFFFFFFFFFFFFFFFF:
+                return True
+            return v.GetValue() is not None
+
+        by_name: dict[str, Any] = {}
+        order: list[str] = []
+        for i in range(frame_values.GetSize()):
+            v = frame_values.GetValueAtIndex(i)
+            name = v.GetName() or '?'
+            if name not in by_name:
+                by_name[name] = v
+                order.append(name)
+                continue
+            if has_location(v) and not has_location(by_name[name]):
+                by_name[name] = v
+        return [by_name[n] for n in order]
 
     # -----------------------------------------------------------------
     # Variable extraction
@@ -345,15 +239,27 @@ class LldbBackend:
         err = self._lldb.SBError()
         unsigned = sv.GetValueAsUnsigned(err, 0)
         num_children = sv.GetNumChildren()
+        load_addr = sv.GetLoadAddress()
+        # Register-held scalars on a PE+PDB target are unreliable:
+        # the Dell RSOD doesn't carry FP/vector state so LLDB falls
+        # back to reading zeros for unmapped registers and reports
+        # them as real "0" values. Detect register locations by the
+        # string shape — addresses start with '0x', registers are
+        # bare identifiers like 'eax' or 'xmm9'. Suppress the value
+        # so the UI/tests skip cleanly, matching the old
+        # `_pe_var_to_varinfo` behavior.
+        raw_loc = (sv.GetLocation() or '').strip()
+        is_register_held = bool(raw_loc) and not raw_loc.startswith('0x')
+        register_unreliable = (
+            is_register_held and not self._registers_fully_populated)
 
         # Scalars + pointers: trust GetValueAsUnsigned. For aggregates
         # we fill in a load address below instead.
-        if num_children == 0 or is_pointer:
+        if (num_children == 0 or is_pointer) and not register_unreliable:
             if err.Success() and sv.GetValue() is not None:
                 var.value = unsigned
 
         if (is_aggregate or is_pointer) and num_children > 0:
-            load_addr = sv.GetLoadAddress()
             valid = load_addr != self._lldb.LLDB_INVALID_ADDRESS
             if is_pointer and var.value:
                 # Stale pointer gate: drop expandability when the
@@ -381,27 +287,61 @@ class LldbBackend:
         preview = sv.GetSummary()
         if preview and preview.startswith('"') and preview.endswith('"'):
             var.string_preview = preview[1:-1]
+        if (not var.string_preview) and is_pointer and var.value and (
+                'char' in type_name):
+            # LLDB's SBValue summary returns `""` for C-string pointers
+            # targeting file-backed memory (e.g. PE .rdata) even though
+            # `process.ReadMemory` can read the bytes — a known
+            # ProcessMinidump quirk. Fall back to a manual NUL scan.
+            fallback = self._read_cstring_via_process(var.value)
+            if fallback:
+                var.string_preview = fallback
         return var
 
+    def _read_cstring_via_process(
+        self, addr: int, max_len: int = 256,
+    ) -> str | None:
+        """Read a NUL-terminated UTF-8 string from live-target memory.
+
+        `SBProcess.ReadMemory` returns ``None`` for file-backed PE
+        sections under ProcessMinidump ("could not parse memory info"
+        from the missing MemoryInfoListStream). `SBTarget.ReadMemory`
+        takes the same buffer-filled-but-error-set shape but actually
+        populates the data — trust the returned bytes when they're
+        non-empty.
+        """
+        for length in (max_len, 64, 16, 1):
+            if not self._has_memory(addr, length):
+                continue
+            err = self._lldb.SBError()
+            sb = self._lldb.SBAddress(addr, self._target)
+            data = self._target.ReadMemory(sb, length, err)
+            if not data:
+                continue
+            raw = bytes(data)
+            if not raw:
+                continue
+            nul = raw.find(b'\x00')
+            if nul >= 0:
+                raw = raw[:nul]
+            return raw.decode('utf-8', errors='replace')
+        return None
+
     def get_params(self, addr: int) -> list[VarInfo]:
-        if self._mode == 'pe_pdb':
-            return self._pe_get_variables(addr, args=True)
         frame = self._frame_for(addr)
         if frame is None:
             return []
-        values = frame.GetVariables(True, False, False, True)
-        return [self._sbvalue_to_varinfo(values.GetValueAtIndex(i), addr)
-                for i in range(values.GetSize())]
+        raw = frame.GetVariables(True, False, False, True)
+        return [self._sbvalue_to_varinfo(v, addr)
+                for v in self._in_scope_variables(raw)]
 
     def get_locals(self, addr: int) -> list[VarInfo]:
-        if self._mode == 'pe_pdb':
-            return self._pe_get_variables(addr, args=False)
         frame = self._frame_for(addr)
         if frame is None:
             return []
-        values = frame.GetVariables(False, True, False, True)
-        return [self._sbvalue_to_varinfo(values.GetValueAtIndex(i), addr)
-                for i in range(values.GetSize())]
+        raw = frame.GetVariables(False, True, False, True)
+        return [self._sbvalue_to_varinfo(v, addr)
+                for v in self._in_scope_variables(raw)]
 
     def get_globals(self, addr: int) -> list[VarInfo]:
         # The pyelftools DwarfInfo is the authority on global discovery;
@@ -410,10 +350,6 @@ class LldbBackend:
         return []
 
     def evaluate_globals(self, names: list[VarInfo]) -> list[VarInfo]:
-        if self._mode == 'pe_pdb':
-            # No SBProcess — can't evaluate runtime globals. Return the
-            # pyelftools-discovered list untouched.
-            return list(names)
         if self._globals_cache is not None:
             return self._globals_cache
         results: list[VarInfo] = []
@@ -483,14 +419,6 @@ class LldbBackend:
         offset: int = 0, count: int = 32,
     ) -> tuple[list[dict], int]:
         var_key = type_die if isinstance(type_die, str) else ''
-        # PE+PDB mode: var_key encodes a type name, e.g. "pe_type:CrashContext".
-        # Look the type up via SBModule.FindTypes, read the struct bytes at
-        # the given address, and emit one field dict per member.
-        if var_key.startswith('pe_type:'):
-            type_name = var_key[len('pe_type:'):]
-            return self._expand_pe_type(
-                type_name, addr, offset, count)
-
         sv = self._var_objects.get(var_key)
         if sv is None:
             return [], 0
@@ -549,6 +477,31 @@ class LldbBackend:
         preview = child.GetSummary()
         if preview and preview.startswith('"') and preview.endswith('"'):
             string_preview = preview[1:-1]
+        if (not string_preview) and is_pointer and value and (
+                'char' in type_name):
+            # LLDB returns `""` for C-string pointers into file-backed
+            # PE .rdata under ProcessMinidump (the summary is empty,
+            # not missing). Fall back to a manual NUL scan.
+            fallback = self._read_cstring_via_process(value)
+            if fallback:
+                string_preview = fallback
+
+        # Array preview: render small integer arrays (attempts[4] style)
+        # as `[v0, v1, v2, v3]` via SBValue's own child iteration. LLDB
+        # doesn't supply a summary string for bare C arrays.
+        if (not string_preview) and (
+                type_class == self._lldb.eTypeClassArray):
+            child_count = child.GetNumChildren()
+            if 0 < child_count <= 16:
+                parts: list[str] = []
+                for i in range(child_count):
+                    elem = child.GetChildAtIndex(i)
+                    ev = elem.GetValue()
+                    if ev is None:
+                        parts.append('?')
+                    else:
+                        parts.append(str(elem.GetValueAsUnsigned()))
+                string_preview = '[' + ', '.join(parts) + ']'
 
         return {
             'name': name,
@@ -572,15 +525,20 @@ class LldbBackend:
         stack_base: int = 0, stack_mem: bytes = b'',
         image_base: int = 0,
     ) -> bytes | None:
-        if self._mode == 'pe_pdb':
-            return self._read_memory_static(addr, size)
         if not self._has_memory(addr, size):
             return None
         err = self._lldb.SBError()
-        data = self._process.ReadMemory(addr, size, err)
-        if not err.Success() or data is None:
+        # SBTarget.ReadMemory works across file-backed PE sections
+        # under ProcessMinidump where SBProcess.ReadMemory returns
+        # None — use it for both modes so the read path is uniform.
+        sb = self._lldb.SBAddress(addr, self._target)
+        data = self._target.ReadMemory(sb, size, err)
+        if not data:
             return None
-        return bytes(data)
+        raw = bytes(data)
+        if not raw:
+            return None
+        return raw
 
     def read_int(
         self, addr: int, size: int,
@@ -612,14 +570,7 @@ class LldbBackend:
         stack_base: int = 0, stack_mem: bytes = b'',
         image_base: int = 0,
     ) -> list[int | None]:
-        if self._mode == 'pe_pdb':
-            result: list[int | None] = [None] * size
-            for i in range(size):
-                b = self._read_memory_static(addr + i, 1)
-                if b is not None and len(b) == 1:
-                    result[i] = b[0]
-            return result
-        result = [None] * size
+        result: list[int | None] = [None] * size
         i = 0
         while i < size:
             if not self._has_memory(addr + i):
@@ -645,16 +596,11 @@ class LldbBackend:
     ) -> list[tuple[int, str, str]]:
         """Disassemble a window centred on `addr`.
 
-        Corefile mode: `addr` is an ELF offset; runtime = addr+slide and
-        we report back in ELF-offset space so the serializer can compare
-        against `frame.address`.
-
-        PE+PDB mode: `addr` is already the absolute file address (PE
-        links with ImageBase baked in, no slide), so we pass it
-        through. SBAddress construction differs per mode — corefile
-        targets have a valid load-address list, PE+PDB targets don't,
-        so we go through `_resolve_sb_address` which knows the
-        difference.
+        Decoder-facing addresses are ELF offsets for corefile mode and
+        absolute file addresses for PE+PDB mode. `_addr_slide` reconciles
+        the two: ``runtime = addr + _addr_slide`` is the live-target
+        load address. The return list is back in the decoder's address
+        space so the serializer can compare against `frame.address`.
 
         Forward-decoding always starts at `addr`, guaranteeing the
         target shows up as an `insn.address == addr` entry. Backward
@@ -663,8 +609,7 @@ class LldbBackend:
         alignment would otherwise be lost on variable-length x86 and
         the caller's `is_target` highlight would never match.
         """
-        file_mode = self._mode == 'pe_pdb'
-        runtime = addr if file_mode else addr + self._image_base
+        runtime = addr + self._addr_slide
 
         # Find the enclosing function's range. The backward window is
         # anchored on the function start when it's within reach, and
@@ -685,12 +630,8 @@ class LldbBackend:
                 start_sb = sym.GetStartAddress()
                 end_sb = sym.GetEndAddress()
             if start_sb.IsValid() and end_sb.IsValid():
-                fs = (
-                    start_sb.GetFileAddress() if file_mode
-                    else start_sb.GetLoadAddress(self._target))
-                fe = (
-                    end_sb.GetFileAddress() if file_mode
-                    else end_sb.GetLoadAddress(self._target))
+                fs = start_sb.GetLoadAddress(self._target)
+                fe = end_sb.GetLoadAddress(self._target)
                 if fs != self._lldb.LLDB_INVALID_ADDRESS and fs > 0:
                     func_start_rt = fs
                 if fe != self._lldb.LLDB_INVALID_ADDRESS and fe > fs:
@@ -712,10 +653,7 @@ class LldbBackend:
             back_count = context * 2
 
         def _read_from(start_rt: int, count: int) -> Any:
-            if file_mode:
-                sb = self._target.ResolveFileAddress(start_rt)
-            else:
-                sb = self._lldb.SBAddress(start_rt, self._target)
+            sb = self._lldb.SBAddress(start_rt, self._target)
             if not sb.IsValid():
                 return None
             return self._target.ReadInstructions(sb, count)
@@ -735,9 +673,7 @@ class LldbBackend:
             for i in range(instructions.GetSize()):
                 insn = instructions.GetInstructionAtIndex(i)
                 lldb_addr = insn.GetAddress()
-                use = (
-                    lldb_addr.GetFileAddress() if file_mode
-                    else lldb_addr.GetLoadAddress(self._target))
+                use = lldb_addr.GetLoadAddress(self._target)
                 if use == self._lldb.LLDB_INVALID_ADDRESS:
                     continue
                 if use < lo or use >= hi or use in seen:
@@ -745,8 +681,7 @@ class LldbBackend:
                 seen.add(use)
                 mnemonic = insn.GetMnemonic(self._target) or ''
                 operands = insn.GetOperands(self._target) or ''
-                offset_addr = use if file_mode else use - self._image_base
-                insns.append((offset_addr, mnemonic, operands))
+                insns.append((use - self._addr_slide, mnemonic, operands))
 
         # Backward half: only keep instructions strictly below runtime.
         if back_count > 0:
@@ -759,9 +694,7 @@ class LldbBackend:
         return insns
 
     def is_call_before(self, addr: int) -> bool:
-        if self._mode == 'pe_pdb':
-            return False
-        runtime = addr + self._image_base
+        runtime = addr + self._addr_slide
         sb_addr = self._lldb.SBAddress(runtime - 8, self._target)
         instructions = self._target.ReadInstructions(sb_addr, 2)
         if instructions.GetSize() == 0:
@@ -771,21 +704,16 @@ class LldbBackend:
         return mnemonic in _CALL_MNEMONICS
 
     def _resolve_sb_address(self, addr: int) -> Any:
-        """Resolve a frame address to an SBAddress in a mode-aware way.
+        """Resolve a decoder-facing address to an SBAddress.
 
-        Corefile mode: `addr` is an ELF offset; add the module slide and
-        use `ResolveLoadAddress` which walks the process-slid section
-        list. PE+PDB mode: `addr` is already an absolute file address
-        (PE links with ImageBase baked in and we never called
-        SetModuleLoadAddress), so `ResolveFileAddress` is the right
-        lookup — `ResolveLoadAddress` silently returns an SBAddress
-        with a null symbol and invalid line entry for a process-less
-        target.
+        Decoder addresses are ELF offsets for corefile mode and
+        absolute PE file addresses for PE+PDB mode. `_addr_slide` is
+        the value needed to reach the runtime load address in each
+        case (``image_base`` / ``0``). Both modes have a
+        process-backed target after LoadCore, so `ResolveLoadAddress`
+        works uniformly.
         """
-        if self._mode == 'pe_pdb':
-            return self._target.ResolveFileAddress(addr)
-        runtime = addr + self._image_base
-        return self._target.ResolveLoadAddress(runtime)
+        return self._target.ResolveLoadAddress(addr + self._addr_slide)
 
     def source_lines_for_addrs(
         self, addrs: list[int],
@@ -885,28 +813,15 @@ class LldbBackend:
     def _iter_function_instructions(
         self, start: int, end: int,
     ) -> list[Any]:
-        """Return every SBInstruction whose address falls in
-        `[start, end)` in order.
+        """Return every SBInstruction in `[start, end)` in order.
 
-        Address space is consistently the file-address space for
-        both modes — for pe_pdb that's the absolute PE file address
-        (what PDB records carry), for corefile that's the ELF
-        offset (what `GetFileAddress` on an in-module SBAddress
-        returns). The function handles the mode-specific SBAddress
-        construction and instruction-addr extraction internally so
-        callers can pass `GetFileAddress()`-derived bounds
-        uniformly.
+        Bounds are in the decoder's address space (ELF offset for
+        corefile mode, absolute PE file address for PE+PDB mode);
+        `_addr_slide` reconciles them to the LLDB runtime load
+        address space.
         """
-        file_mode = self._mode == 'pe_pdb'
-        if file_mode:
-            sb = self._target.ResolveFileAddress(start)
-        else:
-            # Corefile: use load-address space for the SBAddress
-            # constructor because that's what the process-less
-            # ResolveLoadAddress expects, then translate back to
-            # file-addr for comparisons. image_base is the runtime
-            # slide the target was loaded at.
-            sb = self._target.ResolveLoadAddress(start + self._image_base)
+        runtime_start = start + self._addr_slide
+        sb = self._target.ResolveLoadAddress(runtime_start)
         if not sb.IsValid():
             return []
         byte_count = max(1, end - start)
@@ -914,14 +829,10 @@ class LldbBackend:
         kept: list[Any] = []
         for i in range(instrs.GetSize()):
             insn = instrs.GetInstructionAtIndex(i)
-            lldb_addr = insn.GetAddress()
-            if file_mode:
-                a = lldb_addr.GetFileAddress()
-            else:
-                load = lldb_addr.GetLoadAddress(self._target)
-                if load == self._lldb.LLDB_INVALID_ADDRESS:
-                    continue
-                a = load - self._image_base
+            load = insn.GetAddress().GetLoadAddress(self._target)
+            if load == self._lldb.LLDB_INVALID_ADDRESS:
+                continue
+            a = load - self._addr_slide
             if a < start:
                 continue
             if a >= end:
@@ -965,19 +876,14 @@ class LldbBackend:
                 return None
             range_ = (start, end)
 
-        file_mode = self._mode == 'pe_pdb'
         for insn in self._iter_function_instructions(*range_):
             mn = (insn.GetMnemonic(self._target) or '').lower()
             if not mn.startswith(('call', 'bl', 'jmp')):
                 continue
-            insn_addr = insn.GetAddress()
-            if file_mode:
-                a = insn_addr.GetFileAddress()
-            else:
-                load = insn_addr.GetLoadAddress(self._target)
-                if load == self._lldb.LLDB_INVALID_ADDRESS:
-                    continue
-                a = load - self._image_base
+            load = insn.GetAddress().GetLoadAddress(self._target)
+            if load == self._lldb.LLDB_INVALID_ADDRESS:
+                continue
+            a = load - self._addr_slide
             if a + insn.GetByteSize() == ret_addr:
                 return (insn, a)
         return None
@@ -1051,17 +957,10 @@ class LldbBackend:
         if parsed is None:
             return None
         target_symbol, _target_src = parsed
-        lldb_addr = last.GetAddress()
-        file_mode = self._mode == 'pe_pdb'
-        if file_mode:
-            jmp_addr = lldb_addr.GetFileAddress()
-        else:
-            load = lldb_addr.GetLoadAddress(self._target)
-            if load == self._lldb.LLDB_INVALID_ADDRESS:
-                return None
-            jmp_addr = load - self._image_base
-        if jmp_addr == self._lldb.LLDB_INVALID_ADDRESS:
+        load = last.GetAddress().GetLoadAddress(self._target)
+        if load == self._lldb.LLDB_INVALID_ADDRESS:
             return None
+        jmp_addr = load - self._addr_slide
         # Look up the source line for the jmp itself (caller's last
         # executed line, not the callee's entry).
         jmp_sb = self._resolve_sb_address(jmp_addr)
@@ -1150,18 +1049,22 @@ class LldbBackend:
         lldb = import_lldb()
         if lldb is None:
             raise RuntimeError('lldb Python module not available')
+        del frames  # LLDB's PDB .pdata unwinder drives the backtrace.
         instance = cls.__new__(cls)
         instance._lldb = lldb
         instance._elf_path = pe_path
         instance._image_base = image_base
+        # PE files link with ImageBase baked into section addresses,
+        # so decoder-facing addresses are already absolute.
+        instance._addr_slide = 0
+        # Dell x86_64 RSODs carry GPRs only — no XMM/YMM — so the
+        # CONTEXT blob's FP save area is zeroed and register-held
+        # variables in MSVC DWARF (`DW_OP_reg26 XMM9` style) must
+        # be suppressed. See `_sbvalue_to_varinfo`.
+        instance._registers_fully_populated = False
         instance._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_pe_'))
         instance._var_objects = {}
         instance._globals_cache = None
-        instance._mode = 'pe_pdb'
-        instance._crash_registers = registers
-        instance._stack_base = stack_base
-        instance._stack_mem = stack_mem
-        instance._valid_ranges = []
 
         dump_path = instance._tmpdir / 'crash.dmp'
         write_minidump(
@@ -1208,434 +1111,17 @@ class LldbBackend:
             if pc:
                 instance._frame_map[pc] = i
 
-        # Cache module sections with their file addresses (no slide
-        # — PE files link with ImageBase baked into section addresses).
-        instance._pe_sections: list[tuple[int, int, Any]] = []
-        if instance._target.GetNumModules() > 0:
-            module = instance._target.GetModuleAtIndex(0)
-            for i in range(module.GetNumSections()):
-                sec = module.GetSectionAtIndex(i)
-                file_addr = sec.GetFileAddress()
-                size = sec.GetByteSize()
-                if size > 0 and file_addr != \
-                        lldb.LLDB_INVALID_ADDRESS:
-                    instance._pe_sections.append((file_addr, size, sec))
-
-        # Per-frame post-prologue RSP map for DWARF [RSP+offset]
-        # resolution. Still needed by the current `_pe_get_variables`
-        # text-parse path — the variable-walker unification in the
-        # next commit routes through SBFrame instead.
-        instance._pe_frame_rsps = instance._compute_pe_frame_rsps(
-            frames, stack_base, stack_mem,
-            registers.get('RSP', 0))
+        # Valid memory ranges: stack dump + every PE section the target
+        # module exposes. LLDB auto-maps .text/.rdata/.data/.pdata/...
+        # from the on-disk file so the Memory64List only needs the
+        # stack bytes.
+        instance._valid_ranges = [
+            (stack_base, stack_base + len(stack_mem))]
+        module = instance._target.GetModuleAtIndex(0)
+        for s_idx in range(module.GetNumSections()):
+            sec = module.GetSectionAtIndex(s_idx)
+            load = sec.GetLoadAddress(instance._target)
+            size = sec.GetByteSize()
+            if size and load != lldb.LLDB_INVALID_ADDRESS:
+                instance._valid_ranges.append((load, load + size))
         return instance
-
-    def _compute_pe_frame_rsps(
-        self,
-        frames: list[tuple[int, int]] | None,
-        stack_base: int,
-        stack_mem: bytes,
-        crash_rsp: int,
-    ) -> dict[int, int]:
-        """Derive `{frame_return_addr: effective_rsp}` for PE mode.
-
-        MSVC x64 has no CFI we can use without a process, so we walk
-        the stack ourselves: each frame's return-address slot was
-        pushed by the caller's `call` instruction, so `slot_addr + 8`
-        is the caller's post-prologue RSP (MSVC doesn't mutate RSP
-        mid-body absent alloca).
-        """
-        result: dict[int, int] = {}
-        if not frames:
-            return result
-        # Frame 0 is the crash frame — its RSP is the registered value.
-        result[frames[0][1]] = crash_rsp
-
-        min_offset = 0
-        for i in range(1, len(frames)):
-            # Each frame's own return address was pushed by its caller's
-            # `call` instruction, so searching for it locates the slot
-            # at (frame_i_post_prologue_rsp - 8).
-            target = frames[i][1]
-            target_bytes = target.to_bytes(8, 'little', signed=False)
-            slot_offset: int | None = None
-            off = min_offset - (min_offset % 8)
-            while off <= len(stack_mem) - 8:
-                if stack_mem[off:off + 8] == target_bytes:
-                    slot_offset = off
-                    break
-                off += 8
-            if slot_offset is None:
-                continue
-            result[frames[i][1]] = stack_base + slot_offset + 8
-            min_offset = slot_offset + 8
-        return result
-
-    def _read_memory_static(self, addr: int, size: int) -> bytes | None:
-        """PE+PDB mode memory read: stack dump first, then PE sections."""
-        if self._stack_mem:
-            off = addr - self._stack_base
-            if 0 <= off <= len(self._stack_mem) - size:
-                return self._stack_mem[off:off + size]
-        for file_addr, sec_size, sec in self._pe_sections:
-            off = addr - file_addr
-            if 0 <= off <= sec_size - size:
-                err = self._lldb.SBError()
-                data = sec.GetSectionData().ReadRawData(err, off, size)
-                if err.Success() and data is not None:
-                    return bytes(data)
-                return None
-        return None
-
-    def _read_cstring_static(
-        self, addr: int, max_len: int = 256,
-    ) -> str | None:
-        """Read a NUL-terminated UTF-8 string from PE sections or stack."""
-        for length in (max_len, 64, 16, 1):
-            data = self._read_memory_static(addr, length)
-            if data is not None:
-                nul = data.find(b'\x00')
-                if nul >= 0:
-                    data = data[:nul]
-                return data.decode('utf-8', errors='replace')
-        return None
-
-    def _find_pe_type(self, type_name: str) -> Any | None:
-        """Look up a type by name via SBModule.FindTypes."""
-        if self._target.GetNumModules() == 0:
-            return None
-        module = self._target.GetModuleAtIndex(0)
-        matches = module.FindTypes(type_name)
-        if matches.GetSize() == 0:
-            # FindFirstType handles typedefs better than FindTypes in
-            # some lldb builds; try it as a fallback.
-            t = module.FindFirstType(type_name)
-            return t if t and t.IsValid() else None
-        return matches.GetTypeAtIndex(0)
-
-    def _expand_pe_type(
-        self, type_name: str, addr: int,
-        offset: int, count: int,
-    ) -> tuple[list[dict], int]:
-        sb_type = self._find_pe_type(type_name)
-        if sb_type is None:
-            return [], 0
-        total = sb_type.GetNumberOfFields()
-        fields: list[dict] = []
-        for i in range(offset, min(offset + count, total)):
-            field = sb_type.GetFieldAtIndex(i)
-            fields.append(self._pe_field_to_dict(field, addr))
-        return fields, total
-
-    def _resolve_pe_frame_rsp(self, lookup_pc: int) -> int | None:
-        """Find the PE-mode RSP for a frame at or near `lookup_pc`.
-
-        Serializer passes either `frame.address` (crash frame) or
-        `frame.call_addr - 1` (non-crash) as `lookup_pc`, so we accept
-        anything within ~16 bytes of a known frame return address.
-        """
-        if lookup_pc in self._pe_frame_rsps:
-            return self._pe_frame_rsps[lookup_pc]
-        for key, rsp in self._pe_frame_rsps.items():
-            if abs(key - lookup_pc) <= 16:
-                return rsp
-        return None
-
-    def _pe_get_variables(
-        self, lookup_pc: int, args: bool,
-    ) -> list[VarInfo]:
-        """Pre-resolve params/locals for a PE+PDB frame at `lookup_pc`.
-
-        Parses `image lookup -va <lookup_pc>` output into a list of
-        variables with DWARF-style locations, deduplicates by name
-        (picking the scope that covers `lookup_pc`), splits into
-        args vs. locals using the function type signature, and
-        resolves values using the frame's computed RSP.
-        """
-        rsp = self._resolve_pe_frame_rsp(lookup_pc)
-        ci = self._debugger.GetCommandInterpreter()
-        ro = self._lldb.SBCommandReturnObject()
-        ci.HandleCommand(f'image lookup -va 0x{lookup_pc:x}', ro)
-        if not ro.Succeeded():
-            return []
-        output = ro.GetOutput()
-
-        parsed = _dedupe_lookup_vars(_parse_lookup_vars(output, lookup_pc))
-        if not parsed:
-            return []
-
-        ft_m = _RE_LOOKUP_FUNCTYPE.search(output)
-        param_count = _count_func_params(ft_m.group(1)) if ft_m else 0
-        chosen = parsed[:param_count] if args else parsed[param_count:]
-        return [self._pe_var_to_varinfo(v, lookup_pc, rsp) for v in chosen]
-
-    def _pe_var_to_varinfo(
-        self,
-        entry: dict[str, Any],
-        lookup_pc: int,
-        frame_rsp: int | None,
-    ) -> VarInfo:
-        """Turn one parsed image-lookup entry into a pre-resolved VarInfo.
-
-        Stack-based locations (`DW_OP_breg7 RSP+N`) are resolved via
-        the frame's effective RSP + stack_mem; register locations are
-        resolved from the crash registers only when the target frame
-        is the crash frame itself (callee-saved values aren't preserved
-        across non-tail calls and we have no CFI to unwind them).
-        """
-        name = entry['name']
-        type_name = entry['type_name']
-        kind = entry['kind']
-        info = entry['info']
-
-        var = VarInfo(name=name, type_name=type_name)
-        # Crash frame is the first entry in the RSP map (PE mode stores
-        # it keyed by `frames[0].address`, which equals the crash PC).
-        crash_pc = next(iter(self._pe_frame_rsps), None)
-        is_crash_frame = (crash_pc is not None
-                          and abs(lookup_pc - crash_pc) <= 16)
-
-        addr: int | None = None
-        if kind == 'reg':
-            reg_name = info
-            var.location = reg_name
-            if is_crash_frame and reg_name in self._crash_registers:
-                var.reg_name = reg_name
-                var.value = self._crash_registers[reg_name]
-            else:
-                # Non-crash frame: register values aren't preserved
-                # across intervening calls and we have no CFI to
-                # unwind them. Mark the var pre-resolved as None so
-                # the serializer doesn't read a wrong crash-RSP reg.
-                var.is_expandable = False
-            return var
-        # Stack-based location
-        reg_name, offset = info
-        if reg_name == 'RSP' and frame_rsp is not None:
-            addr = frame_rsp + offset
-        elif reg_name in self._crash_registers:
-            addr = self._crash_registers[reg_name] + offset
-        var.location = f'[{reg_name}{offset:+d}]'
-
-        # Type classification via SBType when the PDB defines the type.
-        sb_type = self._find_pe_type(self._canonical_type_name(type_name))
-        is_pointer = type_name.rstrip().endswith('*')
-        is_array = '[' in type_name and type_name.rstrip().endswith(']')
-        is_struct = False
-        byte_size = 0
-        if sb_type is not None:
-            byte_size = sb_type.GetByteSize() or 0
-            tc = sb_type.GetTypeClass()
-            is_struct = tc in (
-                self._lldb.eTypeClassStruct,
-                self._lldb.eTypeClassClass,
-                self._lldb.eTypeClassUnion,
-            )
-
-        if addr is None:
-            if var.value is not None:
-                var.is_expandable = False
-            return var
-
-        if is_pointer:
-            raw = self._read_memory_static(addr, 8)
-            if raw is not None:
-                var.value = int.from_bytes(raw, 'little')
-            pointee_name = type_name.rstrip()[:-1].strip()
-            pointee_base = self._canonical_type_name(pointee_name)
-            pointee_type = self._find_pe_type(pointee_base)
-            is_pointee_struct = False
-            if pointee_type is not None:
-                tc = pointee_type.GetTypeClass()
-                is_pointee_struct = tc in (
-                    self._lldb.eTypeClassStruct,
-                    self._lldb.eTypeClassClass,
-                    self._lldb.eTypeClassUnion,
-                )
-            # Only offer expansion if the pointer target is mappable.
-            # Dangling/stale pointers (e.g. MSVC spill slot reuse —
-            # initialize_test's `config` param at [RSP+96] reads
-            # garbage after the first line of the body) get the
-            # expandable flag dropped so the UI doesn't invite the
-            # user to dive into a struct of dashes.
-            if var.value and is_pointee_struct and \
-                    self._addr_mappable(var.value, 1):
-                var.is_expandable = True
-                var.expand_addr = var.value
-                var.var_key = f'pe_type:{pointee_base}'
-            else:
-                var.is_expandable = False
-            # char* → try to read the pointed-to C string
-            if var.value and 'char' in type_name:
-                var.string_preview = self._read_cstring_static(var.value, 256)
-            return var
-
-        if is_struct:
-            var.is_expandable = True
-            var.expand_addr = addr
-            var.value = addr
-            var.var_key = f'pe_type:{self._canonical_type_name(type_name)}'
-            return var
-
-        if is_array:
-            var.is_expandable = True
-            var.expand_addr = addr
-            # Match the existing expand_type array preview shape.
-            if sb_type is not None and byte_size > 0:
-                raw = self._read_memory_static(addr, byte_size)
-                elem = sb_type.GetArrayElementType()
-                esize = elem.GetByteSize() if elem.IsValid() else 0
-                if raw is not None and esize in (1, 2, 4, 8):
-                    n = byte_size // esize
-                    parts = [
-                        int.from_bytes(
-                            raw[j * esize:(j + 1) * esize], 'little')
-                        for j in range(n)
-                    ]
-                    var.string_preview = (
-                        '[' + ', '.join(str(p) for p in parts) + ']')
-            return var
-
-        # Scalar: read the bytes and store as int.
-        size = byte_size if byte_size in (1, 2, 4, 8) else 0
-        if size == 0:
-            size = self._scalar_size(type_name)
-        if size in (1, 2, 4, 8):
-            raw = self._read_memory_static(addr, size)
-            if raw is not None:
-                var.value = int.from_bytes(raw, 'little')
-                var.is_expandable = False
-        return var
-
-    @staticmethod
-    def _canonical_type_name(type_name: str) -> str:
-        """Strip qualifiers/keywords to get a bare lookup name.
-
-        Handles 'const', 'volatile', and 'struct '/'class '/'union '
-        prefixes. Returns the innermost identifier for namespaced
-        types (C++ ::-separated paths).
-        """
-        t = type_name.strip().rstrip('*').strip()
-        for prefix in ('const ', 'volatile ', 'struct ', 'class ', 'union '):
-            while t.startswith(prefix):
-                t = t[len(prefix):].strip()
-        return t.split('::')[-1]
-
-    @staticmethod
-    def _scalar_size(type_name: str) -> int:
-        """Heuristic size for scalar type names when SBType isn't available."""
-        t = type_name.strip().replace('const ', '').replace('volatile ', '')
-        if t in ('char', 'signed char', 'unsigned char', 'int8_t', 'uint8_t', 'bool'):
-            return 1
-        if t in ('short', 'signed short', 'unsigned short', 'int16_t', 'uint16_t'):
-            return 2
-        if t in ('int', 'signed int', 'unsigned int', 'int32_t', 'uint32_t'):
-            return 4
-        if t in ('long long', 'signed long long', 'unsigned long long',
-                 'int64_t', 'uint64_t'):
-            return 8
-        if t.startswith('long'):
-            return 8  # MSVC long is 4, but long long is 8; be conservative.
-        return 0
-
-    def _pe_field_to_dict(self, field: Any, struct_addr: int) -> dict:
-        """Turn one SBTypeMember into the /api/expand field dict format."""
-        name = field.GetName() or '?'
-        field_type = field.GetType()
-        type_name = field_type.GetName() or '?'
-        field_off = field.GetOffsetInBytes()
-        field_addr = struct_addr + field_off
-        field_size = field_type.GetByteSize()
-
-        # Resolve typedefs before checking type class — LLDB reports
-        # `typedef struct { ... } Foo` as eTypeClassTypedef.
-        canonical_field_type = field_type.GetCanonicalType()
-        is_pointer = canonical_field_type.IsPointerType()
-        is_array = canonical_field_type.IsArrayType()
-        type_class = canonical_field_type.GetTypeClass()
-        is_struct = type_class in (
-            self._lldb.eTypeClassStruct,
-            self._lldb.eTypeClassClass,
-            self._lldb.eTypeClassUnion,
-        )
-        is_expandable = is_pointer or is_array or is_struct
-
-        value: int | None = None
-        string_preview: str | None = None
-        expand_addr: int | None = None
-        var_key_out = ''
-
-        if is_pointer:
-            raw = self._read_memory_static(field_addr, 8)
-            if raw is not None:
-                value = int.from_bytes(raw, 'little')
-            if value:
-                pointee = canonical_field_type.GetPointeeType()
-                pointee_name = pointee.GetName() or ''
-                if 'char' in pointee_name:
-                    string_preview = self._read_cstring_static(value, 256)
-                # Pointer to struct → expand the pointee at the
-                # pointer value, but only if the target is mappable.
-                # Stale/dangling pointers stay non-expandable.
-                pointee_class = pointee.GetTypeClass()
-                if pointee_class in (
-                    self._lldb.eTypeClassStruct,
-                    self._lldb.eTypeClassClass,
-                    self._lldb.eTypeClassUnion,
-                ) and self._addr_mappable(value, 1):
-                    expand_addr = value
-                    pointee_base = pointee_name.split('::')[-1]
-                    var_key_out = f'pe_type:{pointee_base}'
-                else:
-                    is_expandable = False
-            else:
-                is_expandable = False
-        elif is_array:
-            # Array element expansion: child fields are synthesized per
-            # element. We don't wire up indexed expansion here; just
-            # report the array as expandable pointing at its own address.
-            expand_addr = field_addr
-            elem_type = field_type.GetArrayElementType()
-            elem_name = elem_type.GetName() or ''
-            var_key_out = f'pe_array:{elem_name}:{field_type.GetByteSize()}'
-            # For small integer arrays, show a preview by reading each
-            # element. Not expandable further in this minimal path.
-            raw = self._read_memory_static(field_addr, field_size)
-            if raw is not None and elem_type.IsValid() and \
-                    elem_type.GetByteSize() in (1, 2, 4, 8):
-                try:
-                    n_elems = field_size // elem_type.GetByteSize()
-                    elem_size = elem_type.GetByteSize()
-                    parts = [
-                        int.from_bytes(
-                            raw[j * elem_size:(j + 1) * elem_size],
-                            'little')
-                        for j in range(n_elems)
-                    ]
-                    string_preview = '[' + ', '.join(str(p) for p in parts) + ']'
-                except Exception:
-                    pass
-        elif is_struct:
-            expand_addr = field_addr
-            value = field_addr
-            nested = type_name.split('::')[-1]
-            var_key_out = f'pe_type:{nested}'
-        else:
-            # Scalar — read field_size bytes, interpret as little-endian.
-            if field_size in (1, 2, 4, 8):
-                raw = self._read_memory_static(field_addr, field_size)
-                if raw is not None:
-                    value = int.from_bytes(raw, 'little')
-
-        return {
-            'name': name,
-            'type': type_name,
-            'value': value,
-            'byte_size': field_size,
-            'is_expandable': is_expandable,
-            'expand_addr': expand_addr,
-            'string_preview': string_preview,
-            'type_offset': 0,
-            'cu_offset': 0,
-            'var_key': var_key_out,
-        }
