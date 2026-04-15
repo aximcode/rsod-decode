@@ -292,6 +292,10 @@ def create_app(repo_root: Path | None = None,
 
         session_id = uuid.uuid4().hex[:12]
         files_dir = _data_dir.session_files_dir_for(session_id)
+
+        def _rollback() -> None:
+            shutil.rmtree(files_dir, ignore_errors=True)
+
         try:
             primary_path, extra_paths, rsod_text = _copy_uploads_to_disk(
                 files_dir,
@@ -300,7 +304,7 @@ def create_app(repo_root: Path | None = None,
                 request.files.getlist('extra_symbols[]'),
             )
         except OSError as e:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            _rollback()
             return jsonify(error=f'upload failed: {e}'), 500
 
         try:
@@ -313,10 +317,10 @@ def create_app(repo_root: Path | None = None,
                 dwarf_prefix=app.config.get('DWARF_PREFIX'),
             )
         except SymbolLoadError as e:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            _rollback()
             return jsonify(error=str(e)), 400
-        except Exception as e:
-            shutil.rmtree(files_dir, ignore_errors=True)
+        except Exception:
+            _rollback()
             raise
 
         created_at = datetime.now(timezone.utc).isoformat()
@@ -330,7 +334,7 @@ def create_app(repo_root: Path | None = None,
                 dwarf_prefix=app.config.get('DWARF_PREFIX'),
             )
         except Exception:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            _rollback()
             raise
 
         session = Session.from_analysis_context(

@@ -1,8 +1,8 @@
 """Unit tests for the SQLite storage layer."""
 from __future__ import annotations
 
-import os
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -12,13 +12,12 @@ from rsod_decode import storage
 
 
 @pytest.fixture()
-def isolated_data_dir(tmp_path, monkeypatch) -> Path:
+def isolated_data_dir(tmp_path, monkeypatch) -> Iterator[Path]:
     """Point `RSOD_DATA_DIR` at a throwaway per-test directory."""
     target = tmp_path / 'rsod-data'
     monkeypatch.setenv('RSOD_DATA_DIR', str(target))
     storage.init_db()
     yield target
-    # Tempdir cleanup handled by pytest; nothing to do here.
 
 
 def _fake_file(path: Path, content: bytes = b'stub') -> None:

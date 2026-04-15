@@ -9,17 +9,19 @@ File layout under `~/.rsod-debug/`:
 
     sessions.db
     files/<session_id>/
-        rsod.txt              (original upload, optional; rsod_text
-                               also lives in the DB)
+        rsod.txt              (copy of the upload — rsod_text also
+                               lives in the DB for fast history reads)
         <primary symbol file>
         <companion>           (map or pe, if any)
         <pdb>                 (if any)
-        extras/...            (additional symbols)
+        <extra symbol files>  (flat; session_files row per file)
 """
 from __future__ import annotations
 
+import contextlib
 import shutil
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,12 +74,22 @@ class HydratedInputs:
 # Connection / schema
 # =============================================================================
 
-def _connect() -> sqlite3.Connection:
-    """Open a connection with FK enforcement turned on."""
+@contextlib.contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """Open a short-lived connection with FK + auto-commit/rollback.
+
+    `with conn:` handles commit on clean exit or rollback on exception;
+    the outer `try/finally` ensures the handle is closed so repeated
+    calls don't leak file descriptors.
+    """
     conn = sqlite3.connect(str(_data_dir.sessions_db()))
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys = ON')
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

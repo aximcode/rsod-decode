@@ -184,8 +184,9 @@ class AnalysisContext:
     def close(self) -> None:
         """Close backends and remove the tempdir.
 
-        The Flask `Session` has its own `cleanup_session` path, so web
-        sessions call that instead. The CLI calls this directly.
+        The Flask `Session` has its own `evict_from_memory` /
+        `delete_session` path, so web sessions call those instead.
+        The CLI calls this directly.
         """
         for b in (self.lldb_backend, self.gdb_backend):
             if b is None:

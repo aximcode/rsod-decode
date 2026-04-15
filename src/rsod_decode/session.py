@@ -191,9 +191,3 @@ def delete_session(session: Session) -> None:
     from . import storage
     evict_from_memory(session)
     storage.delete_session(session.id)
-
-
-# Back-compat alias — anything still importing the old name gets the
-# memory-eviction behavior. Persistent delete callers must use
-# `delete_session(session)` explicitly.
-cleanup_session = evict_from_memory
