@@ -296,6 +296,28 @@ class LldbBackend:
                 return True
         return False
 
+    def _addr_mappable(self, addr: int, size: int = 1) -> bool:
+        """True if `addr..addr+size` lives in any known memory region.
+
+        Used as a pointer-validity gate before advertising a variable
+        as expandable. A pointer whose target isn't mappable (e.g.
+        MSVC reuses a home-space spill slot after the initial arg
+        read, leaving stale garbage in the DWARF-advertised location)
+        should NOT get the ▶ expansion affordance in the UI — or the
+        user clicks in and sees a struct full of dashes.
+        """
+        if self._mode == 'pe_pdb':
+            if self._stack_mem:
+                off = addr - self._stack_base
+                if 0 <= off and off + size <= len(self._stack_mem):
+                    return True
+            for file_addr, sec_size, _ in self._pe_sections:
+                off = addr - file_addr
+                if 0 <= off and off + size <= sec_size:
+                    return True
+            return False
+        return self._has_memory(addr, size)
+
     # -----------------------------------------------------------------
     # Variable extraction
     # -----------------------------------------------------------------
@@ -330,18 +352,30 @@ class LldbBackend:
                 var.value = unsigned
 
         if (is_aggregate or is_pointer) and num_children > 0:
-            var.is_expandable = True
             load_addr = sv.GetLoadAddress()
             valid = load_addr != self._lldb.LLDB_INVALID_ADDRESS
             if is_pointer and var.value:
-                var.expand_addr = var.value
+                # Stale pointer gate: drop expandability when the
+                # pointer target isn't in any known memory region so
+                # the frontend doesn't invite a click-through into
+                # garbage. Matches the PE-mode gate in
+                # _pe_var_to_varinfo.
+                if self._addr_mappable(var.value, 1):
+                    var.is_expandable = True
+                    var.expand_addr = var.value
+                else:
+                    var.is_expandable = False
             elif valid:
+                var.is_expandable = True
                 var.expand_addr = load_addr
                 if var.value is None:
                     var.value = load_addr
-            var_key = f'v_{pc:x}_{name}'
-            self._var_objects[var_key] = sv
-            var.var_key = var_key
+            else:
+                var.is_expandable = False
+            if var.is_expandable:
+                var_key = f'v_{pc:x}_{name}'
+                self._var_objects[var_key] = sv
+                var.var_key = var_key
 
         preview = sv.GetSummary()
         if preview and preview.startswith('"') and preview.endswith('"'):
@@ -499,11 +533,16 @@ class LldbBackend:
         if is_expandable:
             load_addr = child.GetLoadAddress()
             if is_pointer and value:
-                expand_addr = value
+                if self._addr_mappable(value, 1):
+                    expand_addr = value
+                else:
+                    # Stale child pointer — drop expandability.
+                    is_expandable = False
             elif load_addr != self._lldb.LLDB_INVALID_ADDRESS:
                 expand_addr = load_addr
-            var_key_out = f'{parent_key}.{idx}.{name}'
-            self._var_objects[var_key_out] = child
+            if is_expandable:
+                var_key_out = f'{parent_key}.{idx}.{name}'
+                self._var_objects[var_key_out] = child
 
         string_preview: str | None = None
         preview = child.GetSummary()
@@ -1018,18 +1057,25 @@ class LldbBackend:
             pointee_name = type_name.rstrip()[:-1].strip()
             pointee_base = self._canonical_type_name(pointee_name)
             pointee_type = self._find_pe_type(pointee_base)
-            if var.value and pointee_type is not None:
+            is_pointee_struct = False
+            if pointee_type is not None:
                 tc = pointee_type.GetTypeClass()
-                if tc in (
+                is_pointee_struct = tc in (
                     self._lldb.eTypeClassStruct,
                     self._lldb.eTypeClassClass,
                     self._lldb.eTypeClassUnion,
-                ):
-                    var.is_expandable = True
-                    var.expand_addr = var.value
-                    var.var_key = f'pe_type:{pointee_base}'
-                else:
-                    var.is_expandable = False
+                )
+            # Only offer expansion if the pointer target is mappable.
+            # Dangling/stale pointers (e.g. MSVC spill slot reuse —
+            # initialize_test's `config` param at [RSP+96] reads
+            # garbage after the first line of the body) get the
+            # expandable flag dropped so the UI doesn't invite the
+            # user to dive into a struct of dashes.
+            if var.value and is_pointee_struct and \
+                    self._addr_mappable(var.value, 1):
+                var.is_expandable = True
+                var.expand_addr = var.value
+                var.var_key = f'pe_type:{pointee_base}'
             else:
                 var.is_expandable = False
             # char* → try to read the pointed-to C string
@@ -1114,10 +1160,12 @@ class LldbBackend:
         field_addr = struct_addr + field_off
         field_size = field_type.GetByteSize()
 
-        is_pointer = field_type.IsPointerType()
-        is_array = field_type.IsArrayType()
-        # Struct/class detection via type class
-        type_class = field_type.GetTypeClass()
+        # Resolve typedefs before checking type class — LLDB reports
+        # `typedef struct { ... } Foo` as eTypeClassTypedef.
+        canonical_field_type = field_type.GetCanonicalType()
+        is_pointer = canonical_field_type.IsPointerType()
+        is_array = canonical_field_type.IsArrayType()
+        type_class = canonical_field_type.GetTypeClass()
         is_struct = type_class in (
             self._lldb.eTypeClassStruct,
             self._lldb.eTypeClassClass,
@@ -1135,20 +1183,26 @@ class LldbBackend:
             if raw is not None:
                 value = int.from_bytes(raw, 'little')
             if value:
-                pointee = field_type.GetPointeeType()
+                pointee = canonical_field_type.GetPointeeType()
                 pointee_name = pointee.GetName() or ''
                 if 'char' in pointee_name:
                     string_preview = self._read_cstring_static(value, 256)
-                # Pointer to struct → expand the pointee at the pointer value
+                # Pointer to struct → expand the pointee at the
+                # pointer value, but only if the target is mappable.
+                # Stale/dangling pointers stay non-expandable.
                 pointee_class = pointee.GetTypeClass()
                 if pointee_class in (
                     self._lldb.eTypeClassStruct,
                     self._lldb.eTypeClassClass,
                     self._lldb.eTypeClassUnion,
-                ):
+                ) and self._addr_mappable(value, 1):
                     expand_addr = value
                     pointee_base = pointee_name.split('::')[-1]
                     var_key_out = f'pe_type:{pointee_base}'
+                else:
+                    is_expandable = False
+            else:
+                is_expandable = False
         elif is_array:
             # Array element expansion: child fields are synthesized per
             # element. We don't wire up indexed expansion here; just
