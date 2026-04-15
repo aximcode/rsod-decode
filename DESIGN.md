@@ -16,9 +16,8 @@ in a navigable interface instead of a flat text file.
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  Native Window (pywebview)                           │
-│  or Chrome --app mode                                │
-│  or browser tab at localhost:PORT                     │
+│  Browser tab at http://localhost:PORT                 │
+│  (stdlib webbrowser.open — no native window)          │
 │                                                      │
 │  ┌────────────────────────────────────────────────┐  │
 │  │  React + TypeScript + Tailwind SPA             │  │
@@ -45,17 +44,23 @@ in a navigable interface instead of a flat text file.
 │  /api/session          POST upload RSOD + symbols    │
 │  /api/session/<id>     GET  crash summary + frames   │
 │  /api/frame/<id>/<n>   GET  params, locals, disasm   │
-│  /api/resolve          POST resolve arbitrary addr   │
-│  /api/source           GET  source file context      │
-│  /api/registers/<id>   GET  full register dump       │
-│  /api/history          GET  past sessions            │
+│  /api/expand/<id>/<n>  GET  struct/array field walk  │
+│  /api/eval/<id>/<n>    POST LLDB/GDB expression eval │
+│  /api/disasm/<id>/<n>  GET  disassembly window       │
+│  /api/source/<id>/<n>  GET  source file context      │
+│  /api/resolve/<id>     POST resolve arbitrary addr   │
+│  /api/backend/<id>     POST switch DWARF backend     │
+│  /ws/lldb/<id>         WS   LLDB terminal bridge     │
+│  /ws/gdb/<id>          WS   GDB/MI terminal bridge   │
 │                                                      │
 │  ┌─────────────────────────────────────────────────┐ │
-│  │  Core Analysis Engine                           │ │
-│  │  (decoder, dwarf_info, symbols, esr)            │ │
+│  │  service.run_analysis pipeline                  │ │
+│  │  decoder + dwarf_backend + lldb_backend +       │ │
+│  │  gdb_backend + symbols + corefile + esr         │ │
 │  └─────────────────────────────────────────────────┘ │
 │                                                      │
-│  SQLite session store (~/.rsod-debug/sessions.db)     │
+│  In-memory session store (session._sessions dict,    │
+│  LRU-evicted at 50 entries, process-local)           │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -63,16 +68,17 @@ in a navigable interface instead of a flat text file.
 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
-| Backend | Flask 3.x | Lightweight, proven pattern for local tool UIs |
-| Frontend | React 19 + TypeScript | SPA for responsive frame-switching |
-| Styling | Tailwind CSS | Rapid UI development, dark mode |
+| Backend | Flask 3.x + flask-sock | Lightweight, WebSocket support for LLDB/GDB terminals |
+| Frontend | React 19 + TypeScript + Tailwind v4 | SPA for responsive frame-switching |
 | Build | Vite | Fast dev server with HMR, proxy to Flask |
-| Disassembly | capstone (Python) | Native ARM64/x86 disassembly |
-| ELF/DWARF | pyelftools | Symbol resolution, source lines, params |
+| Disassembly | capstone (ctypes wrapper) | Native ARM64/x86 disassembly |
+| ELF/DWARF (baseline) | pyelftools | Standalone symbol + line + DIE walk |
+| ELF+DWARF / PE+PDB (richer) | system LLDB via lldb_loader | Runtime var resolution, corefile unwind, minidump unwind |
+| ELF+DWARF (cross-check) | GDB/MI via pygdbmi | Second opinion for CFI unwinding + expr eval |
 | Demangling | cxxfilt | C++ name demangling |
-| Native window | pywebview (optional) | Desktop app feel, no browser chrome |
-| Database | SQLite | Session history, zero setup |
-| Distribution | .pyzw zipapp | Single file, no installer |
+| Session store | In-memory dict, LRU | Process-local; sessions die with the server |
+| Browser launch | stdlib `webbrowser` | Default tab open — no native-window bindings |
+| Distribution | stdlib zipapp (`rsod.pyzw`) | Single file; first-run extracts capstone + frontend/dist |
 
 ## Why a Web UI Instead of CLI Output
 
@@ -86,7 +92,6 @@ analysis that a text file can't:
 - **Upload multiple symbol files** and see multi-module resolution
   update live
 - **Save/share** analysis as a permalink or JSON export
-- **History** of analyzed RSODs stored in SQLite for recall
 - **Paste, upload, or drag-and-drop** — paste RSOD text directly, use a
   file picker, or drag files onto the upload zone
 - **Git-pinned source** — specify a tag or commit hash to view source
@@ -282,32 +287,43 @@ GET /api/source/<session_id>/<frame_index>?context=5
 POST /api/resolve/<session_id>
   Body: { address: "0x180031BA1" }
   Response: { symbol, offset, source_loc, object_file }
-
-POST /api/search/<session_id>
-  Body: { query: "fPromptTestError" }
-  Response: { matches[]: { address, name, source_loc } }
 ```
 
-### Session History and Export
+### Backend Switching
 
 ```
-GET /api/history
-  Response: { sessions[]: { id, date, image, exception, frame_count } }
-
-GET /api/export/<session_id>?format=json
-  Response: Full session data as JSON (shareable, importable)
-
-GET /api/export/<session_id>?format=text
-  Response: CLI-style text output (same as rsod-decode.py)
-
-POST /api/import
-  Body: JSON export from another instance
-  Response: { session_id }
+POST /api/backend/<session_id>
+  Body: { backend: "lldb" | "gdb" | "pyelftools" }
+  Response: { backend: "<active>" }
 ```
 
-Permalink support: `http://localhost:PORT/#session/<id>` opens a
-specific saved analysis.  JSON export/import allows sharing crash
-analyses between team members without sharing symbol files.
+Switches the session's DWARF backend on demand. The LLDB and GDB
+backends are instantiated lazily on first switch via
+`service.reinit_backend`, so the initial upload doesn't pay for
+backends the user may never ask for.
+
+### WebSocket Terminals
+
+```
+/ws/lldb/<session_id>   — in-process SBCommandInterpreter bridge
+/ws/gdb/<session_id>    — pygdbmi / PTY-backed GDB terminal
+```
+
+Both multiplex an xterm.js-driven terminal tab in the UI with the
+session's shared LLDB/GDB state, so the user can run ad-hoc
+commands (`register read`, `expression`, etc.) without leaving the
+browser.
+
+### What's not in the API
+
+No history, no permalinks, no cross-instance export/import. Sessions
+live and die with the server process — the analyzer is a local dev
+tool, and the source-of-truth artifacts (RSOD capture + symbol
+files) already live on the user's filesystem.
+
+The in-browser URL hash `#session/<id>` is purely a client-side
+route the React SPA uses to remember which session is being
+viewed across refreshes — it is not a persistent permalink.
 
 ## Project Structure
 
@@ -316,15 +332,23 @@ rsod-decode/
 ├── pyproject.toml          — Packaging, deps, pytest config
 ├── src/rsod_decode/
 │   ├── __init__.py
-│   ├── server.py           — rsod-debug entry point (Flask launcher + CLI pre-load)
-│   ├── cli.py              — rsod-decode entry point (text-only)
-│   ├── app.py              — Flask app, routes, session management
-│   ├── decoder.py          — RSOD text parsing, format detection
+│   ├── __main__.py         — `rsod decode|serve` subcommand dispatcher
+│   ├── server.py           — `rsod serve` entry point (Flask launcher + pre-load)
+│   ├── cli.py              — `rsod decode` entry point (text-only)
+│   ├── app.py              — Flask routes — thin JSON serializer over service.py
+│   ├── service.py          — Shared analysis pipeline: analyze + backend init
+│   │                         + source_loc backfill + tail-call reconstruction
+│   │                         + frame-level resolve_frame_vars
+│   ├── session.py          — Session dataclass + from/as_analysis_context
+│   ├── pdb_routing.py      — MSVC PE / .map / .pdb companion detection
+│   ├── resource_paths.py   — frontend_dist() helper (pyzw-aware)
+│   ├── serializers.py      — VarInfo → dict + crash_info_to_dict
+│   ├── decoder.py          — analyze_rsod pipeline + text formatters
 │   ├── dwarf_backend.py    — DwarfInfo class (pyelftools + capstone)
 │   ├── pe_backend.py       — PEBinary class (pefile + capstone)
-│   ├── gdb_backend.py      — GDB/MI DWARF backend (Phase-5 deletion pending)
-│   ├── gdb_bridge.py       — PTY-based GDB terminal bridge (Phase-5 pending)
-│   ├── lldb_backend.py     — LLDB backend (ELF corefile + PE+PDB static)
+│   ├── gdb_backend.py      — GDB/MI DWARF backend (ELF-only cross-check)
+│   ├── gdb_bridge.py       — PTY-based GDB terminal bridge (/ws/gdb)
+│   ├── lldb_backend.py     — LLDB backend (ELF corefile + PE+PDB minidump)
 │   ├── lldb_bridge.py      — In-process SBCommandInterpreter for /ws/lldb
 │   ├── lldb_loader.py      — sys.path shim to import system lldb from a venv
 │   ├── corefile.py         — Synthetic ELF core generator (ELFOSABI_LINUX)
@@ -377,7 +401,7 @@ rsod-decode/
    c. extract_crash_info() → CrashInfo
    d. resolve addresses → line_info per module
    e. decode_x86() or decode_arm64() → annotated lines + frames
-   f. Store session in SQLite + temp files
+   f. Store Session in the in-memory dict (LRU-evicted at 50)
    g. Return session_id + crash summary + frame list
    ↓
 4. Frontend loads session, shows crash banner + backtrace
@@ -400,23 +424,15 @@ rsod-decode/
 10. Frontend renders disassembly with highlighted target instruction
 ```
 
-## Native Window Strategy
+## Browser Launch
 
-Three-tier approach for maximum compatibility:
-
-1. **pywebview** — `pip install pywebview` (optional dependency)
-   - Creates native OS window: macOS WebKit, Windows Edge WebView2, Linux WebKitGTK
-   - Flask runs in background thread
-   - Best UX: looks like a real desktop app
-
-2. **Chrome/Edge --app mode** — fallback
-   - Detects Chrome or Edge installation
-   - Opens in app mode (no address bar, minimal chrome)
-   - Nearly as good as native window
-
-3. **Browser tab** — last resort
-   - Opens `http://localhost:PORT` in default browser
-   - Full functionality, just has browser chrome
+`rsod serve` starts Flask on the configured host/port, waits for
+the TCP port to accept connections via a short poll loop, then
+opens the default browser via stdlib `webbrowser.open` on a
+background thread. `--no-browser` skips the browser open for
+headless invocations (CI, Playwright, curl probes). There is no
+native-window binding — a regular browser tab at
+`http://localhost:PORT` is the UX.
 
 Launch:
 ```
@@ -502,30 +518,32 @@ Distribution constraints:
 
 ## Session Storage
 
-SQLite database at `~/.rsod-debug/sessions.db`:
+In-memory only. [src/rsod_decode/session.py](src/rsod_decode/session.py)
+owns a module-level `_sessions: dict[str, Session]` capped at
+`MAX_SESSIONS = 50`. When the cap is hit, the oldest entry is
+evicted via `cleanup_session` — which closes the LLDB/GDB
+backends, closes the pyelftools binary, and `shutil.rmtree`s the
+per-session temp dir.
 
-```sql
-CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,
-    created_at TEXT,
-    rsod_format TEXT,
-    image_name TEXT,
-    exception_desc TEXT,
-    crash_pc INTEGER,
-    crash_symbol TEXT,
-    frame_count INTEGER,
-    rsod_text TEXT,        -- original RSOD capture
-    crash_info TEXT        -- JSON: full CrashInfo
-);
+Every `Session` holds:
 
-CREATE TABLE session_files (
-    session_id TEXT,
-    filename TEXT,
-    file_type TEXT,        -- 'rsod_log', 'symbol', 'extra_symbol'
-    file_path TEXT,        -- path in ~/.rsod-debug/files/
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-);
-```
+- `result: AnalysisResult` — the shared core's parse output (frames,
+  registers, stack mem, call_verified map)
+- `source` / `extra_sources` — `SymbolSource` for the primary module
+  + each extra the user uploaded
+- `rsod_text` — the raw upload, cached for the `/api/session` GET
+- `temp_dir` — per-session scratch (corefile, extracted uploads,
+  etc.); removed in cleanup
+- `lldb_dwarf` / `gdb_dwarf` — richer backend instances, populated
+  lazily by service.run_analysis / service.reinit_backend
+- `frame_cache: dict[int, dict]` — per-frame JSON response cache so
+  repeated `/api/frame/<id>/<n>` hits don't re-run DWARF walks
+
+Sessions are process-local: restarting `rsod serve` wipes them.
+There's no history, no permalinks, no persistence to disk. This is
+a deliberate simplification — the analyzer is a local dev tool, not
+a shared service, and the source-of-truth artifacts (RSOD capture,
+symbol files) already live on the user's filesystem.
 
 ## What We Reuse vs Build New
 
@@ -541,11 +559,10 @@ CREATE TABLE session_files (
 
 ### Build new:
 
-- `backend/app.py` — Flask routes, session management, file handling
+- `app.py` — Flask routes, session management, file handling
 - All frontend components
-- `rsod-debug.py` — entry point with pywebview/browser launch
+- `server.py` — entry point with browser launch (stdlib `webbrowser`)
 - `build_pyz.py` — packaging script
-- SQLite session store
 
 ## Implementation Phases
 
@@ -571,17 +588,27 @@ Keyboard navigation (up/down to switch frames). Search.
 
 ### Phase 5: Desktop Packaging
 
-pywebview integration. Chrome --app fallback. build_pyz.py for .pyzw
-distribution.
+Unified `rsod.pyzw` zipapp via `build_pyz.py`. Single-file
+distribution bundling the CLI, the Flask web UI, the React
+frontend, and all Python deps. Browser is launched via stdlib
+`webbrowser` (no pywebview).
 
 ## CLI Compatibility
 
-The CLI tool continues to work standalone:
+Both interfaces ship in a single `rsod` console script via argparse
+subcommands, and the same code path is distributable as
+`rsod.pyzw`:
 
 ```
-rsod-decode putty.txt app.efi.map        # text output
-rsod-debug  putty.txt app.efi.map        # opens web UI
-rsod-debug                               # opens UI, upload via browser
+rsod decode putty.txt app.efi.map           # text output
+rsod serve  putty.txt app.efi.map           # opens web UI
+rsod serve                                  # opens UI, upload via browser
+
+python rsod.pyzw decode putty.txt app.efi.map   # standalone
+python rsod.pyzw serve  putty.txt app.efi.map   # standalone
 ```
 
-Both share the same `rsod_decode` package modules.
+Both subcommands share the same `rsod_decode.service` analysis
+pipeline, so they see identical backtraces, resolved values, and
+tail-call-reconstructed frames regardless of which interface the
+user picks.
