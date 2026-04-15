@@ -167,11 +167,16 @@ def format_disassembly(
 # =============================================================================
 
 def format_source_context(
-    source_loc: str, source_root: Path, context: int = 3,
+    source_loc: str,
+    source_root: Path | list[Path] | tuple[Path, ...],
+    context: int = 3,
     git_ref: GitRef | None = None, repo_root: Path | None = None,
 ) -> list[str]:
     """Show source lines around the target, marking it with >.
-    If git_ref is provided, reads source at that commit via git show."""
+    If git_ref is provided, reads source at that commit via git show.
+    `source_root` may be a single Path or a list/tuple of roots; the
+    multi-root form lets callers add out-of-tree source checkouts
+    (axl-sdk etc.) to the search path."""
     if ':' not in source_loc:
         return []
     file_part, line_part = source_loc.rsplit(':', 1)
@@ -189,8 +194,14 @@ def format_source_context(
             display_path = f"{file_part} @ {git_ref.short}"
     else:
         src_path = find_source_file(source_root, file_part, target_line)
-        if not src_path:
-            src_path = source_root / file_part
+        if src_path is None:
+            # Fallback: treat the first root as the canonical one and
+            # try a direct relative join (lets the CLI still surface a
+            # helpful error via read_text below).
+            first_root = (
+                source_root if isinstance(source_root, Path)
+                else (list(source_root)[0] if source_root else Path('.')))
+            src_path = first_root / file_part
         if not src_path.is_file():
             return []
         try:
@@ -591,7 +602,8 @@ def analyze_rsod(
 def decode_rsod(
     log_path: Path, sym_path: Path, out_path: Path,
     base_override: int | None, verbose: bool,
-    extra_sym_paths: list[Path], source_root: Path | None,
+    extra_sym_paths: list[Path],
+    source_root: Path | list[Path] | None,
     git_ref: GitRef | None = None, repo_root: Path | None = None,
     dwarf_prefix: str | None = None,
 ) -> None:

@@ -17,6 +17,17 @@ SYMBOL_ROOT = Path(
     )
 )
 
+# Sibling source-tree for axl-sdk, used by the CrashTest ELF fixtures
+# whose DWARF points at `src/crt0/axl-crt0-native.c` etc. — paths that
+# live outside the rsod-decode checkout. Tests that assert source
+# files for those frames pass this via `--source-path` / `source_paths=`.
+AXL_SDK_ROOT = Path(
+    os.environ.get(
+        "RSOD_TEST_AXL_SDK_ROOT",
+        Path.home() / "projects/aximcode/axl-sdk",
+    )
+)
+
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -34,6 +45,12 @@ class DatasetSpec:
     companion_path: Path | None = None
     pdb_path: Path | None = None
     base_override: int | None = None
+    # Out-of-tree source roots that should be appended to the
+    # `--source-path` search list so DWARF paths like
+    # `src/crt0/axl-crt0-native.c` (referenced from CrashTest.so but
+    # living in the sibling axl-sdk checkout) actually resolve. Tuple
+    # instead of list so the dataclass stays hashable.
+    source_roots: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -56,6 +73,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         expected_vregs=32,
         expected_stack_size=512,
         expected_lbr=0,
+        source_roots=(AXL_SDK_ROOT,),
     ),
     "dell_aa64": DatasetSpec(
         key="dell_aa64",
@@ -69,6 +87,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         expected_stack_size=4096,
         expected_lbr=0,
         expected_image_base=0x782B122000,
+        source_roots=(AXL_SDK_ROOT,),
     ),
     "dell_x64": DatasetSpec(
         key="dell_x64",
@@ -81,6 +100,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         expected_vregs=0,
         expected_stack_size=4096,
         expected_lbr=2,
+        source_roots=(AXL_SDK_ROOT,),
     ),
     # Real Dell EPSA x86-64 crash: PE (.efi) + MSVC .map. Exercises the
     # full MAP+PE path: symbols from .map, disassembly from .efi via

@@ -46,6 +46,12 @@ def main() -> None:
                         help='Override image base address (hex)')
     parser.add_argument('--source-root', type=Path, default=None,
                         help='Local source tree root for source context')
+    parser.add_argument('--source-path', type=Path, action='append',
+                        default=[], dest='source_paths',
+                        help='Additional source tree to search when the '
+                             'DWARF file path is not under the primary '
+                             'source root (repeatable; e.g. '
+                             '~/projects/aximcode/axl-sdk)')
     parser.add_argument('--tag', type=str, default=None,
                         help='Git tag for source context (e.g. v1.0.3)')
     parser.add_argument('--commit', type=str, default=None,
@@ -81,9 +87,15 @@ def main() -> None:
             break
 
     # Default source root: repo root or inferred from script location
-    source_root = args.source_root
-    if source_root is None:
-        source_root = repo_root or Path(__file__).resolve().parents[3]
+    primary_source_root = args.source_root
+    if primary_source_root is None:
+        primary_source_root = repo_root or Path(__file__).resolve().parents[3]
+    for sp in args.source_paths:
+        if not sp.is_dir():
+            sys.exit(f"Error: --source-path directory not found: {sp}")
+    source_root: Path | list[Path] = (
+        [primary_source_root, *args.source_paths]
+        if args.source_paths else primary_source_root)
 
     # Resolve git ref (tag or commit) for source context
     git_ref: GitRef | None = None

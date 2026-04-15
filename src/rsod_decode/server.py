@@ -98,6 +98,12 @@ def main() -> None:
                         help='Directory to search for module symbol files '
                              '(repeatable; auto-loads .so/.debug matching '
                              'image table modules)')
+    parser.add_argument('--source-path', type=Path, action='append',
+                        default=[], dest='source_paths',
+                        help='Additional source tree to search when a '
+                             'DWARF/PDB file path is not under the '
+                             'rsod-decode repo (repeatable; e.g. '
+                             '~/projects/aximcode/axl-sdk)')
     args = parser.parse_args()
 
     # Validate file args
@@ -118,9 +124,16 @@ def main() -> None:
             repo_root = parent
             break
 
+    # Validate any --source-path arguments eagerly so typos don't
+    # silently produce empty-Source tabs.
+    for sp in args.source_paths:
+        if not sp.is_dir():
+            sys.exit(f"Error: --source-path directory not found: {sp}")
+
     # Create Flask app with static file serving
     app = create_app(repo_root=repo_root, dwarf_prefix=args.dwarf_prefix,
-                     symbol_search_paths=args.symbol_paths or None)
+                     symbol_search_paths=args.symbol_paths or None,
+                     source_paths=args.source_paths or None)
     dist_dir = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
 
     if dist_dir.is_dir():

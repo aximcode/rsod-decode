@@ -206,71 +206,60 @@ def clean_path(raw: str) -> str:
 # Source file resolution
 # =============================================================================
 
-# Cache: (repo_root, lowercase_filename) → list[Path]
+# Cache: (root, lowercase_filename) → list[Path]
 _file_index: dict[tuple[str, str], list[Path]] = {}
-_file_index_root: str = ''
+_indexed_roots: set[str] = set()
 
 
-def _build_file_index(repo_root: Path) -> None:
-    """Build an index of all source files under repo_root (once)."""
-    global _file_index, _file_index_root
-    root_str = str(repo_root)
-    if _file_index_root == root_str:
+def _build_file_index(root: Path) -> None:
+    """Build an index of source files under `root` once; idempotent.
+
+    Successive calls with different roots accumulate into the shared
+    `_file_index` map (keyed by root), so multi-root searches don't
+    thrash the cache.
+    """
+    root_str = str(root)
+    if root_str in _indexed_roots:
         return
-    _file_index = {}
-    _file_index_root = root_str
+    _indexed_roots.add(root_str)
     skip = {'.git', '__pycache__', 'node_modules', 'archive'}
     src_exts = {'.c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.s', '.asm',
                 '.inc', '.inf', '.dsc', '.dec', '.py', '.rs'}
-    for p in repo_root.rglob('*'):
+    for p in root.rglob('*'):
         if (p.is_file() and p.suffix.lower() in src_exts
                 and not any(part.lower() in skip for part in p.parts)):
             key = (root_str, p.name.lower())
             _file_index.setdefault(key, []).append(p)
 
 
-def find_source_file(
-    repo_root: Path, dwarf_path: str, target_line: int,
+def _find_in_root(
+    root: Path, dwarf_path: str, target_line: int,
 ) -> Path | None:
-    """Resolve a DWARF source path to a file in the repo.
-
-    Strategies (in order):
-    1. Direct path match (exact)
-    2. Case-insensitive direct match (Windows→Linux cross-compile)
-    3. Filename search with line-count validation (build-reorganized files)
-       - If ambiguous, pick the match with the most path components in common
-
-    Args:
-        repo_root: Root of the repository / source tree.
-        dwarf_path: Relative path from DWARF (already prefix-stripped).
-        target_line: The line number we need — used to reject files too short.
-
-    Returns:
-        Resolved Path or None.
-    """
-    dwarf_path = dwarf_path.replace('\\', '/')
-
+    """Search a single root for a file matching the DWARF path."""
     # 1. Direct match
-    candidate = repo_root / dwarf_path
+    candidate = root / dwarf_path
     if candidate.is_file():
         return candidate
 
     # 2. Case-insensitive direct match — walk the path components
-    resolved = _case_insensitive_lookup(repo_root, dwarf_path)
+    resolved = _case_insensitive_lookup(root, dwarf_path)
     if resolved:
         return resolved
 
     # 3. Filename search with validation
-    _build_file_index(repo_root)
+    _build_file_index(root)
     filename_lower = Path(dwarf_path).name.lower()
-    matches = _file_index.get((str(repo_root), filename_lower), [])
+    matches = _file_index.get((str(root), filename_lower), [])
     if not matches:
         return None
 
     # Filter: line count must be sufficient, skip archive/backup dirs
     valid: list[Path] = []
     for m in matches:
-        rel = m.relative_to(repo_root).as_posix().lower()
+        try:
+            rel = m.relative_to(root).as_posix().lower()
+        except ValueError:
+            continue
         if '/archive/' in rel or rel.startswith('archive/'):
             continue
         try:
@@ -291,13 +280,55 @@ def find_source_file(
     best: Path | None = None
     best_score = -1
     for m in valid:
-        rel = m.relative_to(repo_root).as_posix()
+        rel = m.relative_to(root).as_posix()
         rel_parts = [p.lower() for p in rel.split('/')]
         score = sum(1 for p in dwarf_parts if p in rel_parts)
         if score > best_score:
             best_score = score
             best = m
     return best
+
+
+def find_source_file(
+    roots: Path | list[Path] | tuple[Path, ...],
+    dwarf_path: str, target_line: int,
+) -> Path | None:
+    """Resolve a DWARF source path to an on-disk file.
+
+    Searches each root in order and returns the first hit. Strategies
+    per root (in order):
+
+    1. Direct path match (exact)
+    2. Case-insensitive direct match (Windows → Linux cross-compile)
+    3. Filename search with line-count validation (build-reorganized
+       files). If ambiguous, pick the match with the most path
+       components in common with `dwarf_path`.
+
+    Args:
+        roots: One or more source trees to search. First match wins.
+            Pass a single `Path` for the common case or a list/tuple
+            when out-of-tree checkouts like `axl-sdk` need to be
+            covered.
+        dwarf_path: Relative path from DWARF (already prefix-stripped).
+        target_line: Line number we need — used to reject files too
+            short to plausibly contain it.
+
+    Returns:
+        Resolved Path or None.
+    """
+    dwarf_path = dwarf_path.replace('\\', '/')
+    if isinstance(roots, Path):
+        root_list: list[Path] = [roots]
+    else:
+        root_list = list(roots)
+
+    for root in root_list:
+        if not root or not root.is_dir():
+            continue
+        hit = _find_in_root(root, dwarf_path, target_line)
+        if hit is not None:
+            return hit
+    return None
 
 
 def _case_insensitive_lookup(root: Path, rel_path: str) -> Path | None:

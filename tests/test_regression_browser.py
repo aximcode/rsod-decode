@@ -79,7 +79,22 @@ def live_server():
     if not dist_dir.is_dir() or not (dist_dir / 'index.html').is_file():
         pytest.skip('frontend/dist not built; run `cd frontend && npm run build`')
 
-    app = create_app(repo_root=REPO_ROOT, dwarf_prefix=None)
+    # Same out-of-tree source-root collection as `conftest.app`, so
+    # any DWARF path that points at axl-sdk etc. resolves when the
+    # browser clicks the Source tab.
+    source_paths: list[Path] = []
+    seen: set[Path] = set()
+    for spec in DATASET_SPECS.values():
+        for root in spec.source_roots:
+            if root in seen:
+                continue
+            seen.add(root)
+            if root.is_dir():
+                source_paths.append(root)
+
+    app = create_app(
+        repo_root=REPO_ROOT, dwarf_prefix=None,
+        source_paths=source_paths or None)
 
     @app.get('/')
     def _index():  # pyright: ignore[reportUnusedFunction]

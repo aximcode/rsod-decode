@@ -82,19 +82,56 @@ def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
     return session, None
 
 
+def _backfill_source_loc_from_richer_backend(session: Session) -> None:
+    """Fill missing per-frame `source_loc` via the session's richer backend.
+
+    The decoder's source_loc resolution pass only sees the static
+    pyelftools / PEBinary surface — for PE+PDB sessions it returns
+    nothing because PEBinary stubs `resolve_addresses`. Once the
+    richer LLDB (or GDB) backend is attached to the session we can
+    re-run the lookup for any frames that are still missing a
+    source_loc and populate them from line-table-aware data.
+
+    Crash frames key off `frame.address`; non-crash frames key off
+    `frame.call_addr - 1` to land inside the caller's location-list
+    range instead of the return address (which falls in an entry_value
+    range that resolves to the callee). This mirrors the lookup_pc
+    convention used by `get_frame`.
+    """
+    backend = session.lldb_dwarf or session.gdb_dwarf
+    if backend is None:
+        return
+    for f in session.result.frames:
+        if f.source_loc:
+            continue
+        if f.is_crash_frame:
+            target = f.address
+        else:
+            target = (f.call_addr - 1) if f.call_addr else None
+        if not target:
+            continue
+        info = backend.resolve_address(target)
+        if info is None:
+            continue
+        if info.source_loc and not f.source_loc:
+            f.source_loc = info.source_loc
+
+
 # =============================================================================
 # Flask app factory
 # =============================================================================
 
 def create_app(repo_root: Path | None = None,
                dwarf_prefix: str | None = None,
-               symbol_search_paths: list[Path] | None = None) -> Flask:
+               symbol_search_paths: list[Path] | None = None,
+               source_paths: list[Path] | None = None) -> Flask:
     """Create and configure the Flask application."""
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
     app.config['REPO_ROOT'] = repo_root
     app.config['DWARF_PREFIX'] = dwarf_prefix
     app.config['SYMBOL_SEARCH_PATHS'] = symbol_search_paths
+    app.config['SOURCE_PATHS'] = source_paths or []
 
     # -----------------------------------------------------------------
     # POST /api/session — upload RSOD + symbols, create session
@@ -231,6 +268,13 @@ def create_app(repo_root: Path | None = None,
                 session.backend = 'gdb'
             except Exception:
                 pass
+
+        # PE+PDB source_loc backfill. The decoder's re-resolve pass in
+        # `analyze_rsod` uses `binary_for_frame` which returns the
+        # static PEBinary for psa_x64.efi — PEBinary has no line info.
+        # Once the richer LLDB backend is attached, walk the frames
+        # and populate missing `source_loc` entries from the PDB.
+        _backfill_source_loc_from_richer_backend(session)
 
         store_session(session)
 
@@ -544,8 +588,15 @@ def create_app(repo_root: Path | None = None,
 
         frame = session.result.frames[frame_index]
         binary = binary_for_session(session, frame)
-        # Use call_addr for disassembly center and target highlight
-        target_addr = frame.call_addr or frame.address
+        # Target highlight and forward-decode anchor is the frame's
+        # own address (return address for non-crash frames, crash PC
+        # for frame 0) because that's the instruction the UI wants
+        # marked "we're about to execute this". `frame.call_addr` is
+        # `address - insn_size` for DWARF location-list lookups and
+        # is *not* a valid instruction boundary on variable-length
+        # x86, so the target highlight would never match any decoded
+        # instruction if we used it as the anchor.
+        target_addr = frame.address or frame.call_addr
         if not binary or not target_addr:
             return jsonify(instructions=[])
 
@@ -587,13 +638,23 @@ def create_app(repo_root: Path | None = None,
 
         context = min(request.args.get('context', 5, type=int), 50)
 
-        # Direct path lookup: try absolute path first, then repo-relative
+        # Direct path lookup: try absolute path first (common for Linux
+        # builds where DWARF holds real on-disk paths), then fall back
+        # to multi-root filename search. The search order is the
+        # server's REPO_ROOT followed by every `--source-path` the
+        # operator configured — this is how out-of-tree checkouts
+        # like axl-sdk or the Dell EPSA source mirror get picked up.
         abs_path = Path(file_part)
         if abs_path.is_absolute() and abs_path.is_file():
             src_path = abs_path
         else:
-            root = app.config['REPO_ROOT'] or Path(__file__).resolve().parents[2]
-            src_path = find_source_file(root, file_part, target_line)
+            roots: list[Path] = []
+            repo_root = (app.config['REPO_ROOT']
+                         or Path(__file__).resolve().parents[2])
+            if repo_root is not None:
+                roots.append(repo_root)
+            roots.extend(app.config.get('SOURCE_PATHS') or [])
+            src_path = find_source_file(roots, file_part, target_line)
         if not src_path:
             return jsonify(file=file_part, target_line=target_line, lines=[])
 
@@ -736,6 +797,7 @@ def create_app(repo_root: Path | None = None,
 
         session.backend = target
         session.frame_cache.clear()
+        _backfill_source_loc_from_richer_backend(session)
         return jsonify(backend=session.backend)
 
     # -----------------------------------------------------------------

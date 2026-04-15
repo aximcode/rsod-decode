@@ -644,44 +644,95 @@ class LldbBackend:
     ) -> list[tuple[int, str, str]]:
         """Disassemble a window centred on `addr`.
 
-        Corefile mode: `addr` is an ELF offset, converted to runtime via
-        the module slide and reported back in ELF-offset space so the
-        serializer can compare against frame.address.
+        Corefile mode: `addr` is an ELF offset; runtime = addr+slide and
+        we report back in ELF-offset space so the serializer can compare
+        against `frame.address`.
 
-        PE+PDB mode: `addr` is already a runtime/file address (PE sections
-        link with ImageBase baked in, no slide), so we pass it through.
+        PE+PDB mode: `addr` is already the absolute file address (PE
+        links with ImageBase baked in, no slide), so we pass it
+        through. SBAddress construction differs per mode — corefile
+        targets have a valid load-address list, PE+PDB targets don't,
+        so we go through `_resolve_sb_address` which knows the
+        difference.
+
+        Forward-decoding always starts at `addr`, guaranteeing the
+        target shows up as an `insn.address == addr` entry. Backward
+        decoding is anchored on the enclosing function's start address
+        (from `SBFunction` / `SBSymbol`) whenever we can find one; the
+        alignment would otherwise be lost on variable-length x86 and
+        the caller's `is_target` highlight would never match.
         """
-        if self._mode == 'pe_pdb':
-            runtime = addr
-            file_mode = True
+        file_mode = self._mode == 'pe_pdb'
+        runtime = addr if file_mode else addr + self._image_base
+
+        # Find the enclosing function start to anchor the backward half.
+        # Falls back to the sweep-from-addr behavior if unavailable.
+        sb_addr = self._resolve_sb_address(addr)
+        func_start_rt: int | None = None
+        if sb_addr.IsValid():
+            fn = sb_addr.GetFunction()
+            start_sb = (
+                fn.GetStartAddress() if fn.IsValid()
+                else sb_addr.GetSymbol().GetStartAddress())
+            if start_sb.IsValid():
+                fs = (
+                    start_sb.GetFileAddress() if file_mode
+                    else start_sb.GetLoadAddress(self._target))
+                if fs != self._lldb.LLDB_INVALID_ADDRESS and fs > 0:
+                    func_start_rt = fs
+
+        # Backward: anchor on the function start when it's within
+        # reach. Otherwise read a generous backward window and filter.
+        if (
+            func_start_rt is not None
+            and 0 < runtime - func_start_rt <= context * 6
+        ):
+            back_start = func_start_rt
+            back_count = max(1, (runtime - back_start) // 2 + 8)
         else:
-            runtime = addr + self._image_base
-            file_mode = False
-        # Read a generous window of instructions centered on addr; the
-        # exact byte size depends on the ISA so we read count*3 and
-        # filter by the expected address range below.
-        start = runtime - context * 4
-        end = runtime + context * 4
-        sb_addr = self._lldb.SBAddress(start, self._target)
-        instructions = self._target.ReadInstructions(sb_addr, context * 3)
-        insns: list[tuple[int, str, str]] = []
-        for i in range(instructions.GetSize()):
-            insn = instructions.GetInstructionAtIndex(i)
-            lldb_addr = insn.GetAddress()
+            back_start = runtime - context * 4
+            back_count = context * 2
+
+        def _read_from(start_rt: int, count: int) -> Any:
             if file_mode:
-                use = lldb_addr.GetFileAddress()
+                sb = self._target.ResolveFileAddress(start_rt)
             else:
-                use = lldb_addr.GetLoadAddress(self._target)
+                sb = self._lldb.SBAddress(start_rt, self._target)
+            if not sb.IsValid():
+                return None
+            return self._target.ReadInstructions(sb, count)
+
+        window_lo = runtime - context
+        window_hi = runtime + context
+        insns: list[tuple[int, str, str]] = []
+        seen: set[int] = set()
+
+        def _consume(instructions: Any, lo: int, hi: int) -> None:
+            if instructions is None:
+                return
+            for i in range(instructions.GetSize()):
+                insn = instructions.GetInstructionAtIndex(i)
+                lldb_addr = insn.GetAddress()
+                use = (
+                    lldb_addr.GetFileAddress() if file_mode
+                    else lldb_addr.GetLoadAddress(self._target))
                 if use == self._lldb.LLDB_INVALID_ADDRESS:
                     continue
-            if use < start or use >= end:
-                continue
-            mnemonic = insn.GetMnemonic(self._target) or ''
-            operands = insn.GetOperands(self._target) or ''
-            if file_mode:
-                insns.append((use, mnemonic, operands))
-            else:
-                insns.append((use - self._image_base, mnemonic, operands))
+                if use < lo or use >= hi or use in seen:
+                    continue
+                seen.add(use)
+                mnemonic = insn.GetMnemonic(self._target) or ''
+                operands = insn.GetOperands(self._target) or ''
+                offset_addr = use if file_mode else use - self._image_base
+                insns.append((offset_addr, mnemonic, operands))
+
+        # Backward half: only keep instructions strictly below runtime.
+        _consume(_read_from(back_start, back_count), window_lo, runtime)
+        # Forward half: decode from runtime itself so `addr` lands
+        # exactly on an instruction boundary.
+        _consume(_read_from(runtime, context * 2), runtime, window_hi)
+
+        insns.sort(key=lambda it: it[0])
         return insns
 
     def is_call_before(self, addr: int) -> bool:
@@ -696,13 +747,29 @@ class LldbBackend:
         mnemonic = (last.GetMnemonic(self._target) or '').lower()
         return mnemonic in _CALL_MNEMONICS
 
+    def _resolve_sb_address(self, addr: int) -> Any:
+        """Resolve a frame address to an SBAddress in a mode-aware way.
+
+        Corefile mode: `addr` is an ELF offset; add the module slide and
+        use `ResolveLoadAddress` which walks the process-slid section
+        list. PE+PDB mode: `addr` is already an absolute file address
+        (PE links with ImageBase baked in and we never called
+        SetModuleLoadAddress), so `ResolveFileAddress` is the right
+        lookup — `ResolveLoadAddress` silently returns an SBAddress
+        with a null symbol and invalid line entry for a process-less
+        target.
+        """
+        if self._mode == 'pe_pdb':
+            return self._target.ResolveFileAddress(addr)
+        runtime = addr + self._image_base
+        return self._target.ResolveLoadAddress(runtime)
+
     def source_lines_for_addrs(
         self, addrs: list[int],
     ) -> dict[int, str]:
         result: dict[int, str] = {}
         for addr in addrs:
-            runtime = addr + self._image_base
-            sb_addr = self._target.ResolveLoadAddress(runtime)
+            sb_addr = self._resolve_sb_address(addr)
             if not sb_addr.IsValid():
                 continue
             line_entry = sb_addr.GetLineEntry()
@@ -717,14 +784,11 @@ class LldbBackend:
         return result
 
     def resolve_address(self, addr: int) -> AddressInfo | None:
-        runtime = addr + self._image_base
-        sb_addr = self._target.ResolveLoadAddress(runtime)
+        sb_addr = self._resolve_sb_address(addr)
         if not sb_addr.IsValid():
             return None
         symbol = sb_addr.GetSymbol()
         fn = symbol.GetName() if symbol.IsValid() else ''
-        if not fn:
-            return None
         line_entry = sb_addr.GetLineEntry()
         source_loc = ''
         if line_entry.IsValid():
@@ -734,6 +798,8 @@ class LldbBackend:
             if fname:
                 path = f'{directory}/{fname}' if directory else fname
                 source_loc = f'{path}:{line_entry.GetLine()}'
+        if not fn and not source_loc:
+            return None
         return AddressInfo(function=fn, source_loc=source_loc, inlines=[])
 
     def resolve_addresses(

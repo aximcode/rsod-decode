@@ -974,8 +974,15 @@ class DwarfInfo:
                            ) -> list[tuple[int, str, str]]:
         """Disassemble instructions around addr using capstone.
         Returns [(addr, mnemonic, op_str), ...]."""
+        func_start: int | None = None
+        func_die = self._find_function_die(addr)
+        if func_die is not None:
+            low = func_die.attributes.get('DW_AT_low_pc')
+            if low is not None and isinstance(low.value, int):
+                func_start = low.value
         return disasm.disassemble_around(
-            self._cs, self._text_data, self._text_addr, addr, context)
+            self._cs, self._text_data, self._text_addr, addr, context,
+            func_start=func_start)
 
     def is_call_before(self, addr: int) -> bool:
         """Check if there's a call/bl/blr instruction in the 8 bytes

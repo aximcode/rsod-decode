@@ -70,12 +70,28 @@ def _build_frame_ctx(
 
 
 def binary_for_session(session: Session, frame: FrameInfo) -> object | None:
-    """Get the binary backend for a frame, respecting session backend choice."""
-    if session.backend == 'lldb' and session.lldb_dwarf:
-        return session.lldb_dwarf
-    if session.backend == 'gdb' and session.gdb_dwarf:
-        return session.gdb_dwarf
-    return binary_for_frame(frame, session.source, session.extra_sources)
+    """Get the binary backend for a frame, respecting session backend choice.
+
+    Module-aware dispatch: we only hand the session's richer backend
+    (LLDB / GDB) to callers when the frame actually belongs to the
+    primary image that backend was built from. For frames from
+    secondary modules (Shell.efi, DxeCore.efi, DellBdsDxe.efi, …) we
+    fall through to `binary_for_frame`, which returns a per-module
+    pyelftools binary when `extra_sources` has one loaded or `None`
+    otherwise. Without this gate, passing a Shell.efi frame address
+    to `session.lldb_dwarf` silently disassembles CrashTest.so bytes
+    at the same offset and mislabels them as Shell.efi code.
+    """
+    per_frame = binary_for_frame(
+        frame, session.source, session.extra_sources)
+    if per_frame is None:
+        return None
+    if per_frame is session.source.binary:
+        if session.backend == 'lldb' and session.lldb_dwarf:
+            return session.lldb_dwarf
+        if session.backend == 'gdb' and session.gdb_dwarf:
+            return session.gdb_dwarf
+    return per_frame
 
 
 def _var_to_dict(v: VarInfo, ctx: _FrameCtx) -> dict:

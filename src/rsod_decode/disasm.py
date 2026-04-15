@@ -20,35 +20,123 @@ def make_capstone(arch: str) -> Cs:
     raise ValueError(f"unsupported capstone arch: {arch!r}")
 
 
+def _decode_sized(
+    cs: Cs, text_bytes: bytes, text_vaddr: int,
+    start: int, byte_count: int,
+) -> list[tuple[int, int, str, str]]:
+    """Capstone decode a byte window into (address, size, mnemonic, op_str)."""
+    offset = start - text_vaddr
+    if offset < 0 or offset >= len(text_bytes) or byte_count <= 0:
+        return []
+    end = min(offset + byte_count, len(text_bytes))
+    return [
+        (insn.address, insn.size, insn.mnemonic, insn.op_str)
+        for insn in cs.disasm(text_bytes[offset:end], start)
+    ]
+
+
+def _backward_start_aligned(
+    cs: Cs, text_bytes: bytes, text_vaddr: int,
+    addr: int, context: int,
+) -> int:
+    """Find the largest `start` in `[addr - context, addr)` such that
+    decoding from `start` produces a stream whose last instruction ends
+    exactly at `addr`.
+
+    For ARM64 this is just `(addr - context) & ~3` since fixed-length
+    4-byte instructions are always aligned. For x86, instruction length
+    is variable (1-15 bytes), so we iterate candidate starts outward
+    from `addr` and keep the largest one that round-trips through
+    capstone with the last instruction's `addr + size == addr`. This is
+    the standard "backward alignment scan" trick that debuggers use
+    when there's no function-start anchor available.
+    """
+    if cs.arch == CS_ARCH_ARM64:
+        return max(text_vaddr, (addr - context) & ~3)
+
+    best = addr  # sentinel: no valid backward window
+    for off in range(1, context + 1):
+        start = addr - off
+        if start < text_vaddr:
+            break
+        stream = _decode_sized(cs, text_bytes, text_vaddr, start, off)
+        if stream and stream[-1][0] + stream[-1][1] == addr:
+            best = start
+    return best
+
+
 def disassemble_around(
     cs: Cs, text_bytes: bytes, text_vaddr: int,
     addr: int, context: int = 24,
+    func_start: int | None = None,
 ) -> list[tuple[int, str, str]]:
     """Disassemble instructions in the window [addr-context, addr+context).
 
     Returns [(address, mnemonic, op_str), ...]. `text_vaddr` is the virtual
     address at which `text_bytes` begins (so byte offset = addr - text_vaddr).
     Empty list if the window falls outside the section.
+
+    The forward half is decoded starting at `addr`, so whenever `addr`
+    really is an instruction boundary the target shows up as an
+    `insn.address == addr` entry (which the caller uses for highlight).
+    The backward half has to land on an instruction boundary —
+    trivial on ARM64 (4-byte alignment) but variable-length on x86.
+    If `func_start` is provided (caller has a symbol table and knows
+    the enclosing function entry), we decode from there; otherwise we
+    run the backward alignment scan in `_backward_start_aligned`.
+
+    Fallback for crash frames: on x86 a crash PC can legitimately
+    fall mid-instruction (the CPU reports the faulting byte, which
+    may be inside an instruction capstone can't decode starting from
+    that exact offset). In that case the forward-from-`addr` decode
+    yields nothing and we fall back to sweeping backward from
+    `addr - context` and keeping whatever capstone produces — there's
+    no valid `is_target` hit but the surrounding instructions still
+    give the user context.
     """
     if not text_bytes:
         return []
 
-    start = max(text_vaddr, addr - context)
-    # Align to 4-byte boundary for ARM64 (fixed-length instructions)
-    if cs.arch == CS_ARCH_ARM64:
-        start = start & ~3
-    end = addr + context
+    # -- forward half: addr is always a valid instruction boundary.
+    forward = _decode_sized(cs, text_bytes, text_vaddr, addr, context)
 
-    offset = start - text_vaddr
-    end_offset = end - text_vaddr
-    if offset < 0 or offset >= len(text_bytes):
-        return []
-    end_offset = min(end_offset, len(text_bytes))
-    code = text_bytes[offset:end_offset]
+    # -- backward half: pick a start that lands on a boundary.
+    if (
+        func_start is not None
+        and 0 < addr - func_start <= context * 6
+        and func_start >= text_vaddr
+    ):
+        back_start = func_start
+    else:
+        back_start = _backward_start_aligned(
+            cs, text_bytes, text_vaddr, addr, context)
 
-    result: list[tuple[int, str, str]] = []
-    for insn in cs.disasm(code, start):
-        result.append((insn.address, insn.mnemonic, insn.op_str))
+    backward: list[tuple[int, int, str, str]] = []
+    if back_start < addr:
+        backward = _decode_sized(
+            cs, text_bytes, text_vaddr, back_start, addr - back_start)
+        window_lo = addr - context
+        backward = [ins for ins in backward if ins[0] >= window_lo]
+
+    result: list[tuple[int, str, str]] = [
+        (a, m, o) for (a, _sz, m, o) in backward
+    ]
+    result.extend((a, m, o) for (a, _sz, m, o) in forward)
+
+    # Fallback for crash PCs that land mid-instruction: the forward
+    # decode returned 0 instructions and the backward scan didn't
+    # find any aligned window either. Do the pre-fix thing and hand
+    # capstone whatever byte range we have — the `is_target` match
+    # will fail for `addr` itself but at least the UI shows something.
+    if not result:
+        start = max(text_vaddr, addr - context)
+        if cs.arch == CS_ARCH_ARM64:
+            start = start & ~3
+        end = addr + context
+        sweep = _decode_sized(
+            cs, text_bytes, text_vaddr, start, end - start)
+        result = [(a, m, o) for (a, _sz, m, o) in sweep]
+
     return result
 
 

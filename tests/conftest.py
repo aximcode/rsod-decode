@@ -70,7 +70,24 @@ def load_dataset_run(dataset_runs: dict[str, DatasetRun]):
 
 @pytest.fixture(scope="session")
 def app():
-    flask_app = create_app(repo_root=REPO_ROOT, dwarf_prefix=None)
+    # Collect every out-of-tree source root referenced by the
+    # dataset specs (e.g. axl-sdk for CrashTest.so frames) and pass
+    # them into the Flask app so the /api/source handler can find
+    # files that live outside the rsod-decode checkout. Existing
+    # roots are silently skipped when the directory isn't present
+    # on the dev machine, so CI without axl-sdk still runs.
+    source_paths: list[Path] = []
+    seen: set[Path] = set()
+    for spec in DATASET_SPECS.values():
+        for root in spec.source_roots:
+            if root in seen:
+                continue
+            seen.add(root)
+            if root.is_dir():
+                source_paths.append(root)
+    flask_app = create_app(
+        repo_root=REPO_ROOT, dwarf_prefix=None,
+        source_paths=source_paths or None)
     flask_app.config["TESTING"] = True
     return flask_app
 
