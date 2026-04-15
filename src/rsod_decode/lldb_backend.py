@@ -18,29 +18,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from elftools.elf.elffile import ELFFile
-
 from .corefile import write_corefile
 from .lldb_loader import import_lldb
 from .minidump import write_minidump
 from .models import AddressInfo, VarInfo
-
-
-def lldb_available() -> bool:
-    """True iff the system lldb Python module can be imported."""
-    return import_lldb() is not None
-
-
-def _is_expandable_type_name(type_name: str) -> bool:
-    t = type_name.strip()
-    if not t:
-        return False
-    if t.endswith(']') or t.endswith('*'):
-        return True
-    if t.startswith(('struct ', 'class ', 'union ')):
-        return True
-    return False
-
 
 _CALL_MNEMONICS = ('bl', 'blr', 'blx', 'call', 'callq')
 
@@ -66,41 +47,25 @@ class LldbBackend:
         lldb = import_lldb()
         if lldb is None:
             raise RuntimeError('lldb Python module not available')
-        self._lldb = lldb
-        self._elf_path = elf_path
-        self._image_base = image_base
-        # Decoder-facing addresses are ELF offsets for corefile mode
-        # (bare section offsets) and absolute file addresses for PE+PDB
-        # mode (ImageBase already baked in). `_addr_slide` is the
-        # value to add on entry to reach the LLDB-side runtime address
-        # (corefile: image_base, PE+PDB: 0).
-        self._addr_slide: int = image_base
-        # ELF corefile carries the full NT_PRSTATUS gregset, so
-        # register-held scalars resolve through LLDB cleanly. PE+PDB
-        # minidumps omit FP/XMM state (absent from Dell RSODs), so
-        # register-held scalars in that mode read back as phantom
-        # zeros and must be suppressed — see `_sbvalue_to_varinfo`.
-        self._registers_fully_populated: bool = True
-        self._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_'))
-        self._var_objects: dict[str, Any] = {}
-        self._globals_cache: list[VarInfo] | None = None
+        self._init_common(lldb, elf_path, image_base,
+                          addr_slide=image_base,
+                          registers_fully_populated=True)
 
         core_path = self._tmpdir / 'crash.core'
         write_corefile(
             registers, crash_pc, stack_base, stack_mem,
             elf_path, core_path, image_base, frames=frames)
 
-        self._debugger = lldb.SBDebugger.Create()
-        self._debugger.SetAsync(False)
         self._target = self._debugger.CreateTarget(str(elf_path))
         if not self._target.IsValid():
             raise RuntimeError(
                 f'LLDB failed to create target for {elf_path}')
 
         # Slide the module BEFORE LoadCore so LLDB's unwinder sees the
-        # ELF's sections at their runtime addresses. The corefile itself
-        # carries PT_LOADs at runtime addresses (image_base already baked
-        # in by _load_elf_sections), so this keeps both views consistent.
+        # ELF's sections at their runtime addresses. The corefile
+        # itself carries PT_LOADs at runtime addresses (image_base
+        # already baked in by _load_elf_sections), so this keeps both
+        # views consistent.
         if image_base and self._target.GetNumModules() > 0:
             module = self._target.GetModuleAtIndex(0)
             slide_err = self._target.SetModuleLoadAddress(module, image_base)
@@ -108,6 +73,54 @@ class LldbBackend:
                 raise RuntimeError(
                     f'SetModuleLoadAddress failed: {slide_err.GetCString()}')
 
+        self._load_core_and_index(core_path, stack_base, stack_mem)
+
+    def _init_common(
+        self,
+        lldb: Any,
+        binary_path: Path,
+        image_base: int,
+        addr_slide: int,
+        registers_fully_populated: bool,
+    ) -> None:
+        """Populate the state common to both constructors.
+
+        Decoder-facing addresses are ELF offsets for corefile mode
+        (bare section offsets) and absolute file addresses for PE+PDB
+        mode (ImageBase already baked in). ``addr_slide`` is the value
+        to add on entry to reach the LLDB-side runtime address — set
+        to ``image_base`` for ELF cores and ``0`` for PE minidumps.
+
+        ``registers_fully_populated`` is True for ELF cores (the
+        NT_PRSTATUS gregset covers every register LLDB can read) and
+        False for PE minidumps (Dell RSODs carry GPRs only, no XMM
+        state, so register-held scalars must be suppressed — see
+        ``_sbvalue_to_varinfo``).
+        """
+        self._lldb = lldb
+        self._elf_path = binary_path
+        self._image_base = image_base
+        self._addr_slide = addr_slide
+        self._registers_fully_populated = registers_fully_populated
+        self._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_'))
+        self._var_objects: dict[str, Any] = {}
+        self._globals_cache: list[VarInfo] | None = None
+        self._debugger = lldb.SBDebugger.Create()
+        self._debugger.SetAsync(False)
+
+    def _load_core_and_index(
+        self, core_path: Path, stack_base: int, stack_mem: bytes,
+    ) -> None:
+        """LoadCore the synthetic crash dump and snapshot thread state.
+
+        Shared by both constructors after the target + symbol
+        provisioning is in place: feed ``core_path`` to
+        ``SBTarget.LoadCore``, cache the first thread, build the
+        ``pc → frame_index`` map used by ``_frame_for``, and seed
+        ``_valid_ranges`` from the stack dump plus every module
+        section LLDB exposes at runtime addresses.
+        """
+        lldb = self._lldb
         err = lldb.SBError()
         self._process = self._target.LoadCore(str(core_path), err)
         if not err.Success():
@@ -116,7 +129,6 @@ class LldbBackend:
             raise RuntimeError('LoadCore returned an invalid process')
 
         self._thread = self._process.GetThreadAtIndex(0)
-
         self._frame_map: dict[int, int] = {}
         for i in range(self._thread.GetNumFrames()):
             frame = self._thread.GetFrameAtIndex(i)
@@ -124,18 +136,17 @@ class LldbBackend:
             if pc:
                 self._frame_map[pc] = i
 
-        # Valid-range tracking mirrors GdbBackend so we don't return
-        # zeroed corefile padding as real memory.
         self._valid_ranges: list[tuple[int, int]] = []
         if stack_mem:
             self._valid_ranges.append(
                 (stack_base, stack_base + len(stack_mem)))
-        with open(str(elf_path), 'rb') as f:
-            elf = ELFFile(f)
-            for sec in elf.iter_sections():
-                if sec['sh_size'] > 0 and sec['sh_addr'] > 0:
-                    rt = sec['sh_addr'] + image_base
-                    self._valid_ranges.append((rt, rt + sec['sh_size']))
+        module = self._target.GetModuleAtIndex(0)
+        for s_idx in range(module.GetNumSections()):
+            sec = module.GetSectionAtIndex(s_idx)
+            load = sec.GetLoadAddress(self._target)
+            size = sec.GetByteSize()
+            if size and load != lldb.LLDB_INVALID_ADDRESS:
+                self._valid_ranges.append((load, load + size))
 
     # -----------------------------------------------------------------
     # Frame mapping
@@ -158,23 +169,20 @@ class LldbBackend:
         return self._thread.GetFrameAtIndex(idx)
 
     def _has_memory(self, addr: int, size: int = 1) -> bool:
+        """True if ``addr..addr+size`` lives in any known memory region.
+
+        Also serves as the pointer-validity gate before advertising a
+        variable as expandable. A pointer whose target isn't mappable
+        (e.g. MSVC reuses a home-space spill slot after the initial
+        arg read, leaving stale garbage in the DWARF-advertised
+        location) should NOT get the ▶ expansion affordance in the
+        UI — or the user clicks in and sees a struct full of dashes.
+        """
         end = addr + size
         for start, rend in self._valid_ranges:
             if addr >= start and end <= rend:
                 return True
         return False
-
-    def _addr_mappable(self, addr: int, size: int = 1) -> bool:
-        """True if `addr..addr+size` lives in any known memory region.
-
-        Used as a pointer-validity gate before advertising a variable
-        as expandable. A pointer whose target isn't mappable (e.g.
-        MSVC reuses a home-space spill slot after the initial arg
-        read, leaving stale garbage in the DWARF-advertised location)
-        should NOT get the ▶ expansion affordance in the UI — or the
-        user clicks in and sees a struct full of dashes.
-        """
-        return self._has_memory(addr, size)
 
     @staticmethod
     def _in_scope_variables(frame_values: Any) -> list[Any]:
@@ -265,9 +273,8 @@ class LldbBackend:
                 # Stale pointer gate: drop expandability when the
                 # pointer target isn't in any known memory region so
                 # the frontend doesn't invite a click-through into
-                # garbage. Matches the PE-mode gate in
-                # _pe_var_to_varinfo.
-                if self._addr_mappable(var.value, 1):
+                # garbage.
+                if self._has_memory(var.value, 1):
                     var.is_expandable = True
                     var.expand_addr = var.value
                 else:
@@ -462,7 +469,7 @@ class LldbBackend:
         if is_expandable:
             load_addr = child.GetLoadAddress()
             if is_pointer and value:
-                if self._addr_mappable(value, 1):
+                if self._has_memory(value, 1):
                     expand_addr = value
                 else:
                     # Stale child pointer — drop expandability.
@@ -1060,32 +1067,24 @@ class LldbBackend:
             raise RuntimeError('lldb Python module not available')
         del frames  # LLDB's PDB .pdata unwinder drives the backtrace.
         instance = cls.__new__(cls)
-        instance._lldb = lldb
-        instance._elf_path = pe_path
-        instance._image_base = image_base
         # PE files link with ImageBase baked into section addresses,
-        # so decoder-facing addresses are already absolute.
-        instance._addr_slide = 0
-        # Dell x86_64 RSODs carry GPRs only — no XMM/YMM — so the
+        # so decoder-facing addresses are already absolute — no slide.
+        # Dell x86_64 RSODs carry GPRs only (no XMM/YMM), so the
         # CONTEXT blob's FP save area is zeroed and register-held
-        # variables in MSVC DWARF (`DW_OP_reg26 XMM9` style) must
-        # be suppressed. See `_sbvalue_to_varinfo`.
-        instance._registers_fully_populated = False
-        instance._tmpdir = Path(tempfile.mkdtemp(prefix='rsod_lldb_pe_'))
-        instance._var_objects = {}
-        instance._globals_cache = None
+        # MSVC DWARF vars (`DW_OP_reg26 XMM9` style) must be
+        # suppressed downstream — see `_sbvalue_to_varinfo`.
+        instance._init_common(
+            lldb, pe_path, image_base,
+            addr_slide=0, registers_fully_populated=False)
 
         dump_path = instance._tmpdir / 'crash.dmp'
         write_minidump(
             registers, stack_base, stack_mem,
             pe_path, image_base, dump_path)
 
-        instance._debugger = lldb.SBDebugger.Create()
-        instance._debugger.SetAsync(False)
         ci = instance._debugger.GetCommandInterpreter()
         ro = lldb.SBCommandReturnObject()
-        ci.HandleCommand(
-            f'target create --arch x86_64 {pe_path}', ro)
+        ci.HandleCommand(f'target create --arch x86_64 {pe_path}', ro)
         if not ro.Succeeded():
             lldb.SBDebugger.Destroy(instance._debugger)
             raise RuntimeError(
@@ -1101,36 +1100,5 @@ class LldbBackend:
             lldb.SBDebugger.Destroy(instance._debugger)
             raise RuntimeError('PE+PDB target invalid after creation')
 
-        err = lldb.SBError()
-        instance._process = instance._target.LoadCore(str(dump_path), err)
-        if not err.Success():
-            lldb.SBDebugger.Destroy(instance._debugger)
-            raise RuntimeError(
-                f'LoadCore failed: {err.GetCString()}')
-        if not instance._process.IsValid() \
-                or instance._process.GetNumThreads() < 1:
-            lldb.SBDebugger.Destroy(instance._debugger)
-            raise RuntimeError('LoadCore returned an invalid process')
-        instance._thread = instance._process.GetThreadAtIndex(0)
-
-        instance._frame_map = {}
-        for i in range(instance._thread.GetNumFrames()):
-            frame = instance._thread.GetFrameAtIndex(i)
-            pc = frame.GetPC()
-            if pc:
-                instance._frame_map[pc] = i
-
-        # Valid memory ranges: stack dump + every PE section the target
-        # module exposes. LLDB auto-maps .text/.rdata/.data/.pdata/...
-        # from the on-disk file so the Memory64List only needs the
-        # stack bytes.
-        instance._valid_ranges = [
-            (stack_base, stack_base + len(stack_mem))]
-        module = instance._target.GetModuleAtIndex(0)
-        for s_idx in range(module.GetNumSections()):
-            sec = module.GetSectionAtIndex(s_idx)
-            load = sec.GetLoadAddress(instance._target)
-            size = sec.GetByteSize()
-            if size and load != lldb.LLDB_INVALID_ADDRESS:
-                instance._valid_ranges.append((load, load + size))
+        instance._load_core_and_index(dump_path, stack_base, stack_mem)
         return instance
