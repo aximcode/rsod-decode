@@ -304,6 +304,28 @@ def list_sessions(
         ]
 
 
+def resolve_partial_id(prefix: str) -> str:
+    """Resolve a prefix (8+ hex chars) to a full session id.
+
+    Raises `ValueError` on no match or ambiguous match (more than
+    one row shares the prefix).
+    """
+    if len(prefix) < 4:
+        raise ValueError(f'id prefix too short: {prefix!r} (need >= 4 chars)')
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM sessions WHERE id LIKE ? || '%'",
+            (prefix,),
+        ).fetchall()
+    if len(rows) == 0:
+        raise ValueError(f'no session matching {prefix!r}')
+    if len(rows) > 1:
+        ids = ', '.join(r['id'][:12] for r in rows[:5])
+        raise ValueError(
+            f'ambiguous prefix {prefix!r} matches {len(rows)} sessions: {ids}')
+    return rows[0]['id']
+
+
 def session_exists(session_id: str) -> bool:
     with _connect() as conn:
         row = conn.execute(

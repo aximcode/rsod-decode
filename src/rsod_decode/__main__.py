@@ -19,15 +19,18 @@ from __future__ import annotations
 import sys
 
 
-_USAGE = """usage: rsod {decode,serve} [args...]
+_USAGE = """usage: rsod {decode,serve,history} [args...]
 
-RSOD crash analyzer — decode to text or serve a web UI.
+RSOD crash analyzer — decode to text, serve a web UI, or inspect
+saved sessions.
 
-  rsod decode  Write a text report to disk (CLI-only).
-  rsod serve   Launch the Flask web UI + open a browser tab.
+  rsod decode   Write a text report to disk (from files or --session).
+  rsod serve    Launch the Flask web UI + open a browser tab.
+  rsod history  List persisted sessions from ~/.rsod-debug/.
 
-Run `rsod decode --help` or `rsod serve --help` for per-subcommand
-options."""
+Run `rsod <command> --help` for per-subcommand options."""
+
+_COMMANDS = ('decode', 'serve', 'history')
 
 
 def main() -> int:
@@ -38,7 +41,7 @@ def main() -> int:
 
     command = argv[0]
     rest = argv[1:]
-    if command not in ('decode', 'serve'):
+    if command not in _COMMANDS:
         print(f"rsod: unknown command {command!r}", file=sys.stderr)
         print(_USAGE, file=sys.stderr)
         return 2
@@ -50,6 +53,9 @@ def main() -> int:
     if command == 'decode':
         from .cli import main as cli_main
         result = cli_main()
+    elif command == 'history':
+        from .cli_history import main as history_main
+        result = history_main()
     else:
         from .server import main as server_main
         result = server_main()
