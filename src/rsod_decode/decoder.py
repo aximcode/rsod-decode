@@ -620,6 +620,7 @@ def decode_rsod(
     git_ref: GitRef | None = None, repo_root: Path | None = None,
     dwarf_prefix: str | None = None,
     backend: BackendChoice = 'auto',
+    brief: bool = False,
 ) -> None:
     """Read RSOD log + symbol file, write annotated + enhanced output.
 
@@ -670,7 +671,8 @@ def decode_rsod(
     )
     try:
         _write_text_report(
-            ctx, out_path, verbose, source_root, git_ref, repo_root)
+            ctx, out_path, verbose, source_root, git_ref, repo_root,
+            brief=brief)
     finally:
         ctx.close()
 
@@ -682,15 +684,24 @@ def _write_text_report(
     source_root: Path | list[Path] | None,
     git_ref: GitRef | None,
     repo_root: Path | None,
+    brief: bool = False,
 ) -> None:
-    """Render the analysis context as a text report."""
+    """Render the analysis context as a text report.
+
+    When `brief` is True, the annotated RSOD section (the full hex
+    dump with symbol annotations) is omitted — the output is just
+    crash summary + backtrace + (if verbose) params/locals/disasm.
+    Used by `--session` replays where the user already has the raw
+    RSOD stored and only wants the analysis.
+    """
     from .service import resolve_frame_vars
 
     result = ctx.result
     out: list[str] = []
     out.extend(format_crash_summary(result.crash_info, git_ref))
-    out.append('')
-    out.extend(result.annotated_lines)
+    if not brief:
+        out.append('')
+        out.extend(result.annotated_lines)
     out.append('')
     out.extend(format_backtrace(result.frames, result.call_verified))
 
@@ -724,4 +735,5 @@ def _write_text_report(
 
     out_path.write_text('\n'.join(out) + '\n', encoding='utf-8')
     _log(f"Resolved {result.resolved_count} addresses")
-    _log(f"Output: {out_path}")
+    if out_path.name != 'stdout':
+        _log(f"Output: {out_path}")

@@ -131,6 +131,7 @@ def _decode_from_session(args: argparse.Namespace) -> None:
             git_ref, repo_root,
             dwarf_prefix=inputs.dwarf_prefix or args.dwarf_prefix,
             backend=args.backend,
+            brief=True,
         )
     except SymbolLoadError as e:
         sys.exit(f"Error: {e}")
