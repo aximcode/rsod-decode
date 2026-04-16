@@ -81,7 +81,7 @@ export async function getDisasm(
 export async function getSource(
   sessionId: string,
   frameIndex: number,
-  context = 5,
+  context = 0,
 ): Promise<{ file: string; target_line: number; lines: SourceLine[] }> {
   return request(`/api/source/${sessionId}/${frameIndex}?context=${context}`)
 }

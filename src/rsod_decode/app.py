@@ -700,7 +700,10 @@ def create_app(repo_root: Path | None = None,
         except ValueError:
             return jsonify(file='', target_line=0, lines=[])
 
-        context = min(request.args.get('context', 5, type=int), 50)
+        # context=0 means "return the entire file" (used by the web UI
+        # to render a scrollable source view). Any positive value caps
+        # the window to ±N lines around the target (CLI default is 5).
+        context = request.args.get('context', 5, type=int)
 
         # Direct path lookup: try absolute path first (common for Linux
         # builds where DWARF holds real on-disk paths), then fall back
@@ -728,8 +731,12 @@ def create_app(repo_root: Path | None = None,
         except OSError:
             return jsonify(file=file_part, target_line=target_line, lines=[])
 
-        start = max(0, target_line - context - 1)
-        end = min(len(all_lines), target_line + context)
+        if context <= 0:
+            start = 0
+            end = len(all_lines)
+        else:
+            start = max(0, target_line - context - 1)
+            end = min(len(all_lines), target_line + context)
 
         result_lines = []
         for i in range(start, end):
