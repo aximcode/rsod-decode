@@ -21,8 +21,12 @@ import argparse
 import sys
 from pathlib import Path
 
+import shutil
+
 from .decoder import decode_rsod, resolve_git_ref
+from .ingest import ingest_session, staging_dir as _staging_dir
 from .models import GitRef
+from .storage import canonical_filename
 from .symbols import SymbolLoadError
 
 
@@ -66,6 +70,9 @@ def main() -> None:
                         choices=['auto', 'lldb', 'gdb', 'pyelftools'],
                         help='DWARF backend for variable resolution. '
                              '"auto" picks lldb > gdb > pyelftools.')
+    parser.add_argument('--name', type=str, default=None,
+                        help='Friendly display name for this session '
+                             '(shown in history instead of the content-hash id)')
     args = parser.parse_args()
 
     if args.session_id is not None:
@@ -134,7 +141,7 @@ def _decode_from_session(args: argparse.Namespace) -> None:
 
 
 def _decode_from_files(args: argparse.Namespace) -> None:
-    """Original file-based decode path (positional rsod_log + symbol_file)."""
+    """Decode from raw files — stage + ingest (persist) + text report."""
     if not args.rsod_log.exists():
         sys.exit(f"Error: RSOD log not found: {args.rsod_log}")
     if not args.symbol_file.exists():
@@ -160,20 +167,54 @@ def _decode_from_files(args: argparse.Namespace) -> None:
             sys.exit(f"Error: --source-path directory not found: {sp}")
 
     fallback_root = repo_root or Path(__file__).resolve().parents[3]
-    source_root: Path | list[Path] = (
-        [*args.source_paths, fallback_root]
-        if args.source_paths else fallback_root)
+    src_roots: list[Path] = list(args.source_paths)
+    src_roots.append(fallback_root)
 
     git_ref = _resolve_git_ref(args, repo_root)
 
+    # Stage input files and run the shared ingest pipeline so this
+    # decode lands in ~/.rsod-debug/ alongside web UI uploads. The
+    # same content-hash dedup means re-running `rsod decode` on the
+    # same inputs is a no-op on the storage side.
+    from . import storage
+    storage.init_db()
+    stg = _staging_dir()
     try:
-        decode_rsod(args.rsod_log, args.symbol_file, out_path,
-                    base_override, args.verbose, args.sym,
-                    source_root, git_ref, repo_root,
-                    dwarf_prefix=args.dwarf_prefix,
-                    backend=args.backend)
+        (stg / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
+        shutil.copy2(args.symbol_file,
+                     stg / canonical_filename(args.symbol_file.name))
+        for s in args.sym:
+            shutil.copy2(s, stg / canonical_filename(s.name))
+    except OSError as e:
+        shutil.rmtree(stg, ignore_errors=True)
+        sys.exit(f"Error staging inputs: {e}")
+
+    try:
+        result = ingest_session(
+            stg,
+            base_override=base_override,
+            dwarf_prefix=args.dwarf_prefix,
+            repo_root=repo_root,
+            source_roots=src_roots,
+            backend=args.backend,
+            name=getattr(args, 'name', None),
+        )
     except SymbolLoadError as e:
         sys.exit(f"Error: {e}")
+
+    _log(f"Session {result.session_id[:8]}… "
+         f"({'reused' if not result.is_new else 'new'})")
+
+    # Write the text report using the analysis context from ingest.
+    from .decoder import _write_text_report
+    try:
+        _write_text_report(
+            result.ctx, out_path, args.verbose,
+            src_roots, git_ref, repo_root)
+    finally:
+        result.ctx.close()
+
+    _log(f"Output: {out_path}")
 
 
 def _find_repo_root() -> Path | None:

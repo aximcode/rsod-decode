@@ -9,48 +9,41 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import shutil
 import tempfile
-import threading
-import uuid
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
 
-
-# Export/import bundle format version — bumped when metadata.json
-# gains required fields that older importers don't know about.
-BUNDLE_SCHEMA_VERSION = 1
-
-# Hard cap on the total uncompressed size of a /api/import bundle.
-# Primary guard against zip bombs. Set well above realistic symbol
-# bundles (PE + PDB + rsod is ~10-40 MB) but far below a fork bomb.
-BUNDLE_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MiB
-
 from . import data_dir as _data_dir, storage
+from .ingest import analyze_from_disk, ingest_session, staging_dir
 from .storage import canonical_filename
-from .models import SymbolSource, clean_path, binary_for_frame, find_source_file
+from .models import clean_path, binary_for_frame, find_source_file
 from .corefile import write_corefile
 from .gdb_bridge import GdbSession
-from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
 from .serializers import (
     _RE_MEM_LOC, _build_frame_ctx, _var_to_dict,
     crash_info_to_dict, binary_for_session, frame_to_dict, registers_to_dict,
 )
 from .service import (
-    AnalysisContext, advance_past_brace_line,
+    advance_past_brace_line,
     reinit_backend as _service_reinit_backend,
-    resolve_frame_vars, run_analysis,
+    resolve_frame_vars,
 )
 from .session import (
     Session, delete_session as _delete_session,
     gdb_available, get_session, lldb_available,
     pop_session, store_session,
 )
-from .symbols import SymbolLoadError, is_pe, load_symbols
+from .symbols import SymbolLoadError
+
+# Export/import bundle format version — bumped when metadata.json
+# gains required fields that older importers don't know about.
+BUNDLE_SCHEMA_VERSION = 1
+
+# Hard cap on the total uncompressed size of a /api/import bundle.
+BUNDLE_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MiB
 
 
 def _get_session(session_id: str) -> tuple[Session, None] | tuple[None, tuple]:
@@ -106,122 +99,9 @@ def _copy_uploads_to_disk(
     return primary, extras, rsod_text
 
 
-def _analyze_from_disk(
-    app: Flask,
-    *,
-    rsod_text: str,
-    primary_path: Path,
-    extra_paths: list[Path],
-    base_override: int | None,
-    dwarf_prefix: str | None,
-) -> tuple[AnalysisContext, Path | None, Path | None, list[Path]]:
-    """Run symbol loading + analysis on already-persisted files.
-
-    Returns `(ctx, companion_path, pdb_path, remaining_extras)`. The
-    three path return values reflect how `_pair_map_with_pe` and
-    `_pop_pdb_for` classified the input set, so the caller can
-    persist a matching session_files row for each.
-    """
-    companion, remaining_extras = _pair_map_with_pe(primary_path, extra_paths)
-    pe_for_pdb = companion if companion and is_pe(companion) else (
-        primary_path if is_pe(primary_path) else None)
-    pdb_path: Path | None = None
-    if pe_for_pdb is not None:
-        pdb_path, remaining_extras = _pop_pdb_for(
-            pe_for_pdb.stem, remaining_extras)
-
-    source = load_symbols(
-        primary_path,
-        dwarf_prefix=dwarf_prefix,
-        repo_root=app.config.get('REPO_ROOT'),
-        companion_path=companion,
-        pdb_path=pdb_path if companion is None else None)
-
-    extra_sources: dict[str, SymbolSource] = {}
-    for p in remaining_extras:
-        s = load_symbols(
-            p, dwarf_prefix=dwarf_prefix,
-            repo_root=app.config.get('REPO_ROOT'))
-        extra_sources[p.stem.lower()] = s
-
-    # NOTE: temp_dir is deliberately None. `evict_from_memory` wipes
-    # `session.temp_dir` on eviction — setting it to the persistent
-    # files dir here would nuke `~/.rsod-debug/files/<id>/` on LRU
-    # rollover. Short-lived artifacts (GDB terminal corefile) get
-    # their own `tempfile.mkdtemp()` in the WS handler on demand.
-    ctx = run_analysis(
-        rsod_text, source, extra_sources,
-        base_override=base_override,
-        symbol_search_paths=app.config.get('SYMBOL_SEARCH_PATHS'),
-        temp_dir=None,
-        elf_path=primary_path,
-        pe_path=pe_for_pdb,
-        pdb_path=pdb_path,
-        backend='auto',
-        source_roots=_source_search_roots(app),
-    )
-    return ctx, companion, pdb_path, remaining_extras
-
-
-def persist_session(
-    *,
-    session_id: str,
-    created_at: str,
-    ctx: AnalysisContext,
-    rsod_text: str,
-    primary_path: Path,
-    companion_path: Path | None,
-    pdb_path: Path | None,
-    remaining_extras: list[Path],
-    base_override: int | None,
-    dwarf_prefix: str | None,
-    imported_from: str | None = None,
-) -> None:
-    """Insert one row + session_files entries for a freshly-uploaded session.
-
-    Callers must have already copied the files into
-    `data_dir.session_files_dir_for(session_id)` — only filenames
-    (basenames relative to that dir) are stored in `session_files`.
-    Used by both the HTTP upload handler and the CLI pre-load path.
-    `imported_from` is set by POST /api/import to preserve the
-    original session id from the bundle as provenance.
-    """
-    ci = ctx.result.crash_info
-    files: list[storage.FileEntry] = [
-        storage.FileEntry(
-            filename=primary_path.name, file_type='primary',
-            rel_path=primary_path.name),
-    ]
-    if companion_path is not None:
-        files.append(storage.FileEntry(
-            filename=companion_path.name, file_type='companion',
-            rel_path=companion_path.name))
-    if pdb_path is not None:
-        files.append(storage.FileEntry(
-            filename=pdb_path.name, file_type='pdb',
-            rel_path=pdb_path.name))
-    for p in remaining_extras:
-        files.append(storage.FileEntry(
-            filename=p.name, file_type='extra', rel_path=p.name))
-
-    image_name = ci.image_name or primary_path.stem
-    storage.save_session(
-        session_id=session_id,
-        created_at=created_at,
-        rsod_text=rsod_text,
-        rsod_format=ctx.result.rsod_format or '',
-        image_name=image_name,
-        image_base=ctx.image_base,
-        exception_desc=ci.exception_desc or '',
-        crash_pc=ci.crash_pc,
-        crash_symbol=ci.crash_symbol or '',
-        frame_count=len(ctx.result.frames),
-        backend=ctx.backend,
-        base_override=base_override,
-        dwarf_prefix=dwarf_prefix,
-        files=files,
-        imported_from=imported_from,
-    )
+# Session lifecycle helpers (_analyze_from_disk, persist_session,
+# staging_dir, _session_lock, try_resolve_existing, promote_staging)
+# moved to ingest.py — callers import from there.
 
 
 class _BundleError(ValueError):
@@ -340,91 +220,6 @@ def _extract_bundle(stream, files_dir: Path) -> dict:
     return metadata
 
 
-def _staging_dir() -> Path:
-    """Return a fresh scratch dir for in-flight uploads.
-
-    Uploads land here first so we can compute the content hash — and
-    thus the canonical session id — before choosing a final location.
-    Staging dirs live under `files/.staging/` so the top level of
-    `files/` contains only real session ids.
-    """
-    root = _data_dir.session_files_dir() / '.staging'
-    root.mkdir(parents=True, exist_ok=True)
-    d = root / uuid.uuid4().hex
-    return d
-
-
-# Per-session upload serialization. Two concurrent uploads with the
-# same content hash will contend on the same Lock entry and
-# serialize through the entire stage → resolve → promote → analyze →
-# persist sequence, so the second one hits the clean dedup fast path
-# instead of racing `_promote_staging` against `_try_resolve_existing`.
-# Uploads with different hashes never contend. The master lock only
-# guards dict access and is held for nanoseconds.
-_session_locks_master = threading.Lock()
-_session_locks: dict[str, threading.Lock] = {}
-
-
-def _session_lock(session_id: str) -> threading.Lock:
-    with _session_locks_master:
-        lock = _session_locks.get(session_id)
-        if lock is None:
-            lock = threading.Lock()
-            _session_locks[session_id] = lock
-        return lock
-
-
-def _try_resolve_existing(app: Flask, session_id: str) -> Session | None:
-    """Return the live Session for `session_id` if it's healthy on disk.
-
-    Used by the dedup fast path in /api/session and /api/import: if
-    the content hash already has a DB row AND a files dir AND
-    hydration still works, the caller discards its fresh copy and
-    returns the existing session. Any one of those checks failing
-    falls through to the fresh-upload path.
-    """
-    files_dir = _data_dir.session_files_dir_for(session_id)
-    if not storage.session_exists(session_id) or not files_dir.exists():
-        return None
-    existing = get_session(session_id)
-    if existing is not None:
-        return existing
-    try:
-        existing = _hydrate_session(app, session_id)
-    except FileNotFoundError:
-        return None
-    if existing is not None:
-        store_session(existing)
-    return existing
-
-
-def _promote_staging(
-    staging_dir: Path, session_id: str,
-) -> Path:
-    """Atomically rename `staging_dir` to its content-hash final dir.
-
-    Uses `os.rename`, which succeeds only when the target doesn't
-    exist (or is an empty directory). If another upload already
-    claimed this `session_id` we raise `FileExistsError` — the
-    caller retries dedup resolution from there.
-
-    The earlier version of this function pre-cleared the target via
-    `storage.delete_session` + `rmtree`, which was racy: two
-    concurrent uploads of identical content could both pass
-    `_try_resolve_existing`, and the second one's pre-clear would
-    wipe the first one's in-flight files_dir. Orphan directories
-    (files without a row, from a crashed upload that never
-    persisted) are now handled at startup by `collect_orphans`, not
-    inline during the promote.
-    """
-    final_dir = _data_dir.session_files_dir_for(session_id)
-    try:
-        os.rename(str(staging_dir), str(final_dir))
-    except OSError as e:
-        raise FileExistsError(str(final_dir)) from e
-    return final_dir
-
-
 def _hydrate_session(app: Flask, session_id: str) -> Session | None:
     """Reconstruct a Session from SQLite + on-disk files.
 
@@ -435,23 +230,20 @@ def _hydrate_session(app: Flask, session_id: str) -> Session | None:
     inputs = storage.hydrate_inputs(session_id)
     if inputs is None:
         return None
-
     extras = list(inputs.extra_paths)
-    # hydrate_inputs already split companion/pdb; rebuild the flat list
-    # that _analyze_from_disk re-classifies — it's idempotent because
-    # the classifier is a pure function of the file names.
     if inputs.companion_path is not None:
         extras.append(inputs.companion_path)
     if inputs.pdb_path is not None:
         extras.append(inputs.pdb_path)
-
-    ctx, _, _, _ = _analyze_from_disk(
-        app,
+    ctx, _, _, _ = analyze_from_disk(
         rsod_text=inputs.rsod_text,
         primary_path=inputs.primary_path,
         extra_paths=extras,
         base_override=inputs.base_override,
         dwarf_prefix=inputs.dwarf_prefix or app.config.get('DWARF_PREFIX'),
+        repo_root=app.config.get('REPO_ROOT'),
+        symbol_search_paths=app.config.get('SYMBOL_SEARCH_PATHS'),
+        source_roots=_source_search_roots(app),
     )
     return Session.from_analysis_context(
         ctx, session_id, created_at=inputs.created_at)
@@ -513,104 +305,41 @@ def create_app(repo_root: Path | None = None,
             except ValueError:
                 return jsonify(error=f'invalid base address: {base_str}'), 400
 
-        # Stage uploads first so we can compute the content hash and
-        # the final session id. Dedup happens BEFORE we waste work
-        # re-running run_analysis on inputs we've already persisted.
-        staging_dir = _staging_dir()
+        stg = staging_dir()
         try:
-            primary_path, extra_paths, rsod_text = _copy_uploads_to_disk(
-                staging_dir,
+            _copy_uploads_to_disk(
+                stg,
                 request.files['rsod_log'],
                 request.files['symbol_file'],
                 request.files.getlist('extra_symbols[]'),
             )
         except OSError as e:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(error=f'upload failed: {e}'), 500
 
-        session_id = storage.compute_session_id(staging_dir)
+        try:
+            result = ingest_session(
+                stg,
+                base_override=base_override,
+                dwarf_prefix=app.config.get('DWARF_PREFIX'),
+                repo_root=app.config.get('REPO_ROOT'),
+                symbol_search_paths=app.config.get('SYMBOL_SEARCH_PATHS'),
+                source_roots=_source_search_roots(app),
+                name=request.form.get('name'),
+            )
+        except SymbolLoadError as e:
+            return jsonify(error=str(e)), 400
 
-        # Serialize through the entire stage→analyze→persist sequence
-        # for this session_id so a concurrent upload of identical
-        # content hits the clean dedup fast path instead of racing
-        # _promote_staging. Uploads with different hashes take
-        # different locks and don't contend.
-        with _session_lock(session_id):
-            existing = _try_resolve_existing(app, session_id)
-            if existing is not None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                return jsonify(
-                    session_id=session_id,
-                    crash_summary=crash_info_to_dict(existing.result.crash_info),
-                    frame_count=len(existing.result.frames),
-                    deduplicated=True,
-                ), 200
-
-            # Fresh session — atomically promote staging to files/<id>/.
-            try:
-                files_dir = _promote_staging(staging_dir, session_id)
-            except FileExistsError:
-                # Under normal operation the lock should prevent
-                # this. Treat it defensively as a dedup hit if
-                # possible (could happen if an orphan sweep missed
-                # a pre-existing files/<id>/ from a crashed upload).
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                existing = _try_resolve_existing(app, session_id)
-                if existing is not None:
-                    return jsonify(
-                        session_id=session_id,
-                        crash_summary=crash_info_to_dict(existing.result.crash_info),
-                        frame_count=len(existing.result.frames),
-                        deduplicated=True,
-                    ), 200
-                return jsonify(error='promote failed (stale files dir)'), 500
-
-            # Paths in staging_dir became invalid on rename — rebuild.
-            primary_path = files_dir / primary_path.name
-            extra_paths = [files_dir / p.name for p in extra_paths]
-
-            def _rollback() -> None:
-                shutil.rmtree(files_dir, ignore_errors=True)
-
-            try:
-                ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
-                    app,
-                    rsod_text=rsod_text,
-                    primary_path=primary_path,
-                    extra_paths=extra_paths,
-                    base_override=base_override,
-                    dwarf_prefix=app.config.get('DWARF_PREFIX'),
-                )
-            except SymbolLoadError as e:
-                _rollback()
-                return jsonify(error=str(e)), 400
-            except Exception:
-                _rollback()
-                raise
-
-            created_at = datetime.now(timezone.utc).isoformat()
-            try:
-                persist_session(
-                    session_id=session_id, created_at=created_at, ctx=ctx,
-                    rsod_text=rsod_text,
-                    primary_path=primary_path, companion_path=companion,
-                    pdb_path=pdb_path, remaining_extras=remaining_extras,
-                    base_override=base_override,
-                    dwarf_prefix=app.config.get('DWARF_PREFIX'),
-                )
-            except Exception:
-                _rollback()
-                raise
-
-            session = Session.from_analysis_context(
-                ctx, session_id, created_at=created_at)
-            store_session(session)
+        session = Session.from_analysis_context(
+            result.ctx, result.session_id, created_at=result.created_at)
+        store_session(session)
 
         return jsonify(
-            session_id=session_id,
-            crash_summary=crash_info_to_dict(ctx.result.crash_info),
-            frame_count=len(ctx.result.frames),
-        ), 201
+            session_id=result.session_id,
+            crash_summary=crash_info_to_dict(result.ctx.result.crash_info),
+            frame_count=len(result.ctx.result.frames),
+            deduplicated=not result.is_new,
+        ), 201 if result.is_new else 200
 
     # -----------------------------------------------------------------
     # GET /api/session/<id> — get crash summary + frames + registers
@@ -1099,6 +828,7 @@ def create_app(repo_root: Path | None = None,
             'frame_count': r.frame_count,
             'backend': r.backend,
             'imported_from': r.imported_from,
+            'name': r.name,
         } for r in rows])
 
     # -----------------------------------------------------------------
@@ -1162,148 +892,63 @@ def create_app(repo_root: Path | None = None,
         if upload is None:
             return jsonify(error='file upload (zip bundle) required'), 400
 
-        # Extract into staging, hash, then either dedup or promote.
-        # Same pattern as /api/session, different source of files.
-        staging_dir = _staging_dir()
+        stg = staging_dir()
         try:
-            metadata = _extract_bundle(upload.stream, staging_dir)
+            metadata = _extract_bundle(upload.stream, stg)
         except _BundleError as e:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(error=str(e)), 400
         except zipfile.BadZipFile:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(error='not a valid zip archive'), 400
         except OSError as e:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(error=f'bundle extraction failed: {e}'), 500
 
-        if not (staging_dir / 'rsod.txt').exists():
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        if not (stg / 'rsod.txt').exists():
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(error='bundle missing rsod.txt'), 400
-        # Canonicalize each metadata filename field to match what
-        # `_extract_bundle` actually wrote to disk. Without this the
-        # post-import file lookups miss whenever the bundle's
-        # metadata still has a raw (pre-canonicalization) name.
         raw_primary = metadata.get('primary_filename') or ''
         if not raw_primary:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(error='bundle metadata missing primary_filename'), 400
         primary_name = canonical_filename(raw_primary)
-        if not (staging_dir / primary_name).exists():
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        if not (stg / primary_name).exists():
+            shutil.rmtree(stg, ignore_errors=True)
             return jsonify(
                 error=f'bundle missing primary symbol file {primary_name!r}'), 400
 
-        # Drop metadata.json BEFORE hashing — it's not part of the
-        # canonical input set, and keeping it in the hash would make
-        # the id depend on who exported the bundle (created_at,
-        # metadata schema_version, etc.) instead of on the crash
-        # inputs themselves.
         try:
-            (staging_dir / 'metadata.json').unlink()
+            (stg / 'metadata.json').unlink()
         except FileNotFoundError:
             pass
 
-        session_id = storage.compute_session_id(staging_dir)
         bundle_original_id = metadata.get('session_id')
+        try:
+            result = ingest_session(
+                stg,
+                base_override=metadata.get('base_override'),
+                dwarf_prefix=metadata.get('dwarf_prefix')
+                    or app.config.get('DWARF_PREFIX'),
+                repo_root=app.config.get('REPO_ROOT'),
+                symbol_search_paths=app.config.get('SYMBOL_SEARCH_PATHS'),
+                source_roots=_source_search_roots(app),
+                imported_from=bundle_original_id,
+            )
+        except SymbolLoadError as e:
+            return jsonify(error=str(e)), 400
 
-        with _session_lock(session_id):
-            existing = _try_resolve_existing(app, session_id)
-            if existing is not None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                return jsonify(
-                    session_id=session_id,
-                    imported_from=bundle_original_id,
-                    crash_summary=crash_info_to_dict(existing.result.crash_info),
-                    frame_count=len(existing.result.frames),
-                    deduplicated=True,
-                ), 200
-
-            try:
-                files_dir = _promote_staging(staging_dir, session_id)
-            except FileExistsError:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                existing = _try_resolve_existing(app, session_id)
-                if existing is not None:
-                    return jsonify(
-                        session_id=session_id,
-                        imported_from=bundle_original_id,
-                        crash_summary=crash_info_to_dict(existing.result.crash_info),
-                        frame_count=len(existing.result.frames),
-                        deduplicated=True,
-                    ), 200
-                return jsonify(error='promote failed (stale files dir)'), 500
-
-            def _rollback() -> None:
-                shutil.rmtree(files_dir, ignore_errors=True)
-
-            # Reconstruct the "extras" list _analyze_from_disk expects.
-            # Canonicalize metadata field values so they line up with
-            # the canonical basenames _extract_bundle wrote to disk.
-            primary_path = files_dir / primary_name
-            extras: list[Path] = []
-            for name_field in ('companion_filename', 'pdb_filename'):
-                raw = metadata.get(name_field)
-                if raw:
-                    canonical = canonical_filename(raw)
-                    p = files_dir / canonical
-                    if not p.exists():
-                        _rollback()
-                        return jsonify(error=f'bundle missing {canonical}'), 400
-                    extras.append(p)
-            for raw in metadata.get('extra_filenames') or []:
-                canonical = canonical_filename(raw)
-                p = files_dir / canonical
-                if not p.exists():
-                    _rollback()
-                    return jsonify(error=f'bundle missing {canonical}'), 400
-                extras.append(p)
-
-            rsod_text = (files_dir / 'rsod.txt').read_text(
-                encoding='utf-8', errors='replace')
-
-            try:
-                ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
-                    app,
-                    rsod_text=rsod_text,
-                    primary_path=primary_path,
-                    extra_paths=extras,
-                    base_override=metadata.get('base_override'),
-                    dwarf_prefix=metadata.get('dwarf_prefix')
-                        or app.config.get('DWARF_PREFIX'),
-                )
-            except SymbolLoadError as e:
-                _rollback()
-                return jsonify(error=str(e)), 400
-            except Exception:
-                _rollback()
-                raise
-
-            created_at = datetime.now(timezone.utc).isoformat()
-            try:
-                persist_session(
-                    session_id=session_id, created_at=created_at, ctx=ctx,
-                    rsod_text=rsod_text,
-                    primary_path=primary_path, companion_path=companion,
-                    pdb_path=pdb_path, remaining_extras=remaining_extras,
-                    base_override=metadata.get('base_override'),
-                    dwarf_prefix=metadata.get('dwarf_prefix'),
-                    imported_from=bundle_original_id,
-                )
-            except Exception:
-                _rollback()
-                raise
-
-            session = Session.from_analysis_context(
-                ctx, session_id, created_at=created_at)
-            store_session(session)
+        session = Session.from_analysis_context(
+            result.ctx, result.session_id, created_at=result.created_at)
+        store_session(session)
 
         return jsonify(
-            session_id=session_id,
+            session_id=result.session_id,
             imported_from=bundle_original_id,
-            crash_summary=crash_info_to_dict(ctx.result.crash_info),
-            frame_count=len(ctx.result.frames),
-        ), 201
+            crash_summary=crash_info_to_dict(result.ctx.result.crash_info),
+            frame_count=len(result.ctx.result.frames),
+            deduplicated=not result.is_new,
+        ), 201 if result.is_new else 200
 
     # -----------------------------------------------------------------
     # DELETE /api/session/<id> — drop in-memory + SQLite + files dir
@@ -1318,6 +963,17 @@ def create_app(repo_root: Path | None = None,
         if storage.delete_session(session_id):
             return jsonify(deleted=True)
         return jsonify(error='session not found'), 404
+
+    # -----------------------------------------------------------------
+    # PATCH /api/session/<id> — rename session
+    # -----------------------------------------------------------------
+    @app.patch('/api/session/<session_id>')
+    def update_session_route(session_id: str):
+        data = request.get_json(silent=True) or {}
+        name = data.get('name')
+        if name is not None:
+            storage.update_session_name(session_id, name or None)
+        return jsonify(updated=True)
 
     # -----------------------------------------------------------------
     # WebSocket /ws/gdb/<session_id> — GDB terminal bridge

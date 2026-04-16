@@ -18,16 +18,13 @@ import argparse
 import shutil
 import socket
 import sys
-import uuid
 import webbrowser
-from datetime import datetime, timezone
 from pathlib import Path
 
-from . import data_dir as _data_dir, storage
-from .app import create_app, persist_session
+from .app import create_app
+from .ingest import ingest_session, staging_dir as _staging_dir
 from .session import Session, register_session
 from .storage import canonical_filename
-from .symbols import SymbolLoadError, load_symbols
 
 
 def _log(msg: str) -> None:
@@ -140,142 +137,50 @@ def main() -> None:
     if args.rsod_log and args.symbol_file:
         _log(f"Loading {args.rsod_log.name} + {args.symbol_file.name}...")
 
-        base_override = None
+        base_override: int | None = None
         if args.base:
             try:
                 base_override = int(args.base, 16)
             except ValueError:
                 sys.exit(f"Error: invalid base address: {args.base}")
 
-        # Stage the CLI inputs, compute the content-hash session id,
-        # then either promote staging to the final location or discard
-        # it and reuse the existing files if this content was already
-        # uploaded (possibly in a prior `rsod serve` run on the same
-        # data dir).
-        staging_root = _data_dir.session_files_dir() / '.staging'
-        staging_root.mkdir(parents=True, exist_ok=True)
-        staging_dir = staging_root / uuid.uuid4().hex
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        # canonical_filename keeps every ingestion path on the same
-        # on-disk basename convention so HTTP upload, CLI pre-load,
-        # and bundle import all hash to the same session_id for the
-        # same inputs — no more surprise drift via secure_filename.
+        stg = _staging_dir()
         try:
-            (staging_dir / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
-            primary_name = canonical_filename(args.symbol_file.name)
-            staging_primary = staging_dir / primary_name
-            shutil.copy2(args.symbol_file, staging_primary)
+            (stg / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
+            shutil.copy2(args.symbol_file,
+                         stg / canonical_filename(args.symbol_file.name))
             for src in args.sym:
-                shutil.copy2(src, staging_dir / canonical_filename(src.name))
+                shutil.copy2(src, stg / canonical_filename(src.name))
         except OSError as e:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            shutil.rmtree(stg, ignore_errors=True)
             sys.exit(f"Error copying inputs: {e}")
-
-        session_id = storage.compute_session_id(staging_dir)
-        files_dir = _data_dir.session_files_dir_for(session_id)
-        is_dedup = storage.session_exists(session_id) and files_dir.exists()
-        if is_dedup:
-            _log(f"Session {session_id} already in store — reusing persisted files")
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        else:
-            storage.delete_session(session_id)  # drop stale row, no-op if absent
-            if files_dir.exists():
-                shutil.rmtree(files_dir)
-            try:
-                staging_dir.rename(files_dir)
-            except OSError as e:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-                sys.exit(f"Error promoting staging dir: {e}")
-
-        primary_path = files_dir / canonical_filename(args.symbol_file.name)
-        extra_paths: list[Path] = [
-            files_dir / canonical_filename(s.name) for s in args.sym]
-
-        def _cli_rollback() -> None:
-            # Only rmtree on the fresh-promotion path. Dedup reuses
-            # the already-persisted files dir — erasing it would
-            # break every other session that content-hashes to it.
-            if not is_dedup:
-                shutil.rmtree(files_dir, ignore_errors=True)
-                storage.delete_session(session_id)
-
-        # MSVC/EPSA: detect a MAP+EFI companion pair in the extras, and
-        # pick up a matching .pdb for PDB-backed LLDB.
-        from .pdb_routing import _pair_map_with_pe, _pop_pdb_for
-        from .symbols import is_pe
-        companion, remaining_extras = _pair_map_with_pe(primary_path, extra_paths)
-        pe_for_pdb = companion if companion and is_pe(companion) else (
-            primary_path if is_pe(primary_path) else None)
-        pdb_path: Path | None = None
-        if pe_for_pdb is not None:
-            pdb_path, remaining_extras = _pop_pdb_for(
-                pe_for_pdb.stem, remaining_extras)
-
-        try:
-            source = load_symbols(
-                primary_path,
-                dwarf_prefix=args.dwarf_prefix,
-                repo_root=repo_root,
-                companion_path=companion,
-                pdb_path=pdb_path if companion is None else None)
-        except SymbolLoadError as e:
-            _cli_rollback()
-            sys.exit(f"Error: {e}")
-
-        extra_sources = {}
-        for p in remaining_extras:
-            try:
-                s = load_symbols(p, dwarf_prefix=args.dwarf_prefix,
-                                 repo_root=repo_root)
-            except SymbolLoadError as e:
-                _cli_rollback()
-                sys.exit(f"Error: {e}")
-            extra_sources[p.stem.lower()] = s
-
-        rsod_text = (files_dir / 'rsod.txt').read_text(
-            encoding='utf-8', errors='replace')
 
         cli_source_roots: list[Path] = []
         if repo_root is not None:
             cli_source_roots.append(repo_root)
         cli_source_roots.extend(args.source_paths or [])
 
-        from .service import run_analysis
-        ctx = run_analysis(
-            rsod_text, source, extra_sources,
-            base_override=base_override,
-            symbol_search_paths=args.symbol_paths or None,
-            elf_path=primary_path,
-            pe_path=pe_for_pdb,
-            pdb_path=pdb_path,
-            backend=args.backend,
-            source_roots=cli_source_roots,
-        )
-
-        created_at = datetime.now(timezone.utc).isoformat()
         try:
-            # INSERT OR IGNORE inside save_session makes this a no-op
-            # on dedup, so we can always call it. The row's
-            # created_at stays at whatever the first upload recorded.
-            persist_session(
-                session_id=session_id, created_at=created_at, ctx=ctx,
-                rsod_text=rsod_text,
-                primary_path=primary_path, companion_path=companion,
-                pdb_path=pdb_path, remaining_extras=remaining_extras,
+            result = ingest_session(
+                stg,
                 base_override=base_override,
                 dwarf_prefix=args.dwarf_prefix,
+                repo_root=repo_root,
+                symbol_search_paths=args.symbol_paths or None,
+                source_roots=cli_source_roots,
+                backend=args.backend,
             )
         except Exception as e:
-            _cli_rollback()
-            sys.exit(f"Error persisting session: {e}")
+            sys.exit(f"Error: {e}")
 
+        session_id = result.session_id
         sess = Session.from_analysis_context(
-            ctx, session_id, created_at=created_at)
+            result.ctx, session_id, created_at=result.created_at)
         register_session(sess)
 
         _log(f'Using {sess.backend} backend')
-        _log(f"Session {session_id}: {len(ctx.result.frames)} frames, "
-             f"{ctx.result.resolved_count} addresses resolved")
+        _log(f"Session {session_id}: {len(result.ctx.result.frames)} frames, "
+             f"{result.ctx.result.resolved_count} addresses resolved")
 
     # Build URLs for all accessible addresses
     session_hash = f"/#session/{session_id}" if session_id else ""

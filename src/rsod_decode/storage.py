@@ -31,7 +31,7 @@ from werkzeug.utils import secure_filename
 from . import data_dir as _data_dir
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # Length of the content-hash prefix used as the session id. 16 hex
 # chars = 64 bits; collision probability is ignorable at any realistic
@@ -55,6 +55,7 @@ class HistoryRow:
     frame_count: int
     backend: str
     imported_from: str | None = None
+    name: str | None = None
 
 
 @dataclass
@@ -189,10 +190,11 @@ def init_db() -> None:
             """)
             version = 1
         if version < 2:
-            # Schema v2: track cross-install import provenance so Bob
-            # can see whose crash he imported from Alice.
             conn.execute('ALTER TABLE sessions ADD COLUMN imported_from TEXT')
             version = 2
+        if version < 3:
+            conn.execute('ALTER TABLE sessions ADD COLUMN name TEXT')
+            version = 3
         conn.execute(f'PRAGMA user_version = {CURRENT_SCHEMA_VERSION}')
 
 
@@ -217,6 +219,7 @@ def save_session(
     dwarf_prefix: str | None,
     files: list[FileEntry],
     imported_from: str | None = None,
+    name: str | None = None,
 ) -> None:
     """Insert one session row + its file metadata.
 
@@ -237,12 +240,13 @@ def save_session(
                 id, created_at, rsod_format, image_name, image_base,
                 exception_desc, crash_pc, crash_symbol, frame_count,
                 backend, rsod_text, base_override, dwarf_prefix,
-                imported_from
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                imported_from, name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (session_id, created_at, rsod_format, image_name, image_base,
              exception_desc, crash_pc, crash_symbol, frame_count,
-             backend, rsod_text, base_override, dwarf_prefix, imported_from),
+             backend, rsod_text, base_override, dwarf_prefix,
+             imported_from, name),
         )
         conn.executemany(
             """
@@ -268,7 +272,7 @@ def list_sessions(
                 """
                 SELECT id, created_at, image_name, exception_desc,
                        crash_pc, crash_symbol, frame_count, backend,
-                       imported_from
+                       imported_from, name
                 FROM sessions
                 WHERE created_at < ?
                 ORDER BY created_at DESC
@@ -281,7 +285,7 @@ def list_sessions(
                 """
                 SELECT id, created_at, image_name, exception_desc,
                        crash_pc, crash_symbol, frame_count, backend,
-                       imported_from
+                       imported_from, name
                 FROM sessions
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -299,6 +303,7 @@ def list_sessions(
                 frame_count=row['frame_count'] or 0,
                 backend=row['backend'] or 'pyelftools',
                 imported_from=row['imported_from'],
+                name=row['name'],
             )
             for row in cur.fetchall()
         ]
@@ -396,6 +401,19 @@ def hydrate_inputs(session_id: str) -> HydratedInputs | None:
 # =============================================================================
 # Delete path
 # =============================================================================
+
+def update_session_name(session_id: str, name: str | None) -> bool:
+    """Set or clear the friendly display name for a session.
+
+    Returns True if the row was found and updated.
+    """
+    with _connect() as conn:
+        cur = conn.execute(
+            'UPDATE sessions SET name = ? WHERE id = ?',
+            (name, session_id),
+        )
+        return cur.rowcount > 0
+
 
 def delete_session(session_id: str) -> bool:
     """Drop DB row + `files/<session_id>/` directory.
