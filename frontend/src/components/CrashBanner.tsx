@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import * as api from '../api'
 import type { CrashSummary, LbrEntry } from '../types'
 
@@ -31,12 +31,23 @@ export function CrashBanner({
   const [editingName, setEditingName] = useState(false)
   const [nameDraft, setNameDraft] = useState(sessionName ?? '')
   const [displayName, setDisplayName] = useState(sessionName)
+  const cancelledRef = useRef(false)
 
   const saveName = async () => {
+    if (cancelledRef.current) {
+      cancelledRef.current = false
+      return
+    }
     const trimmed = nameDraft.trim() || null
     setEditingName(false)
     setDisplayName(trimmed)
     try { await api.renameSession(sessionId, trimmed) } catch { /* best-effort */ }
+  }
+
+  const cancelName = () => {
+    cancelledRef.current = true
+    setEditingName(false)
+    setNameDraft(displayName ?? '')
   }
 
   const handleExport = async () => {
@@ -83,7 +94,7 @@ export function CrashBanner({
                   value={nameDraft}
                   onChange={e => setNameDraft(e.target.value)}
                   onBlur={saveName}
-                  onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') setEditingName(false) }}
+                  onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') cancelName() }}
                   autoFocus
                   className="bg-transparent border-b border-zinc-500 text-zinc-100 text-xs font-sans px-0.5 py-0 outline-none w-48"
                   placeholder="Session name…"

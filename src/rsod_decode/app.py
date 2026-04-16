@@ -350,6 +350,7 @@ def create_app(repo_root: Path | None = None,
         if err:
             return err
         r = session.result
+        inputs = storage.hydrate_inputs(session.id)
         return jsonify(
             crash_summary=crash_info_to_dict(r.crash_info),
             frames=[frame_to_dict(f) for f in r.frames],
@@ -359,13 +360,11 @@ def create_app(repo_root: Path | None = None,
             call_verified={str(k): v for k, v in r.call_verified.items()},
             rsod_text=session.rsod_text,
             backend=session.backend,
-            # gdb_available reflects per-session usability: GDB is
-            # ELF-only so a PE-based session (pe_path set) reports
-            # False even when gdb is installed globally.
             gdb_available=gdb_available() and session.pe_path is None,
             lldb_available=lldb_available(),
             modules=r.modules,
             lbr=r.crash_info.lbr,
+            name=inputs.name if inputs else None,
         )
 
     # -----------------------------------------------------------------

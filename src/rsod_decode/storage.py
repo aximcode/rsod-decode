@@ -79,6 +79,7 @@ class HydratedInputs:
     base_override: int | None
     dwarf_prefix: str | None
     imported_from: str | None = None
+    name: str | None = None
 
 
 # =============================================================================
@@ -349,7 +350,7 @@ def hydrate_inputs(session_id: str) -> HydratedInputs | None:
         row = conn.execute(
             """
             SELECT id, created_at, rsod_text, base_override, dwarf_prefix,
-                   imported_from
+                   imported_from, name
             FROM sessions WHERE id = ?
             """,
             (session_id,),
@@ -395,6 +396,7 @@ def hydrate_inputs(session_id: str) -> HydratedInputs | None:
         base_override=row['base_override'],
         dwarf_prefix=row['dwarf_prefix'],
         imported_from=row['imported_from'],
+        name=row['name'],
     )
 
 

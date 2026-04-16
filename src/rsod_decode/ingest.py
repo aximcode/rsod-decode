@@ -332,10 +332,10 @@ def ingest_session(
             raise RuntimeError(
                 f'files/{session_id} exists but cannot hydrate')
 
-        # Discover the primary symbol file — the one non-rsod.txt
-        # entry that _analyze_from_disk will receive as primary_path.
-        # We pick by the same heuristic the upload classifier uses:
-        # first .efi/.so/.debug/.elf, else first remaining file.
+        # Discover the primary symbol file — the first non-rsod.txt
+        # entry alphabetically. Which file is "primary" doesn't
+        # actually matter: analyze_from_disk passes all paths to
+        # _pair_map_with_pe which reclassifies by extension anyway.
         primary_path: Path | None = None
         extra_paths: list[Path] = []
         for item in sorted(files_dir.iterdir(), key=lambda p: p.name):
