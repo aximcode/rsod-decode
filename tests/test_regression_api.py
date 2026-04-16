@@ -609,6 +609,79 @@ def test_is_safe_member_name_unit() -> None:
     assert not _is_safe_member_name(("a" * 260) + ".efi")
 
 
+def test_decode_persists_and_deduplicates(
+    client, app, tmp_path, monkeypatch,
+) -> None:
+    """ingest_session persists the session on first call and deduplicates
+    on the second call with the same content."""
+    spec = DATASET_SPECS["edk2_aa64"]
+    if not spec.symbol_path.exists():
+        pytest.skip(f"missing fixture: {spec.symbol_path}")
+
+    data_dir = tmp_path / "decode_persist"
+    monkeypatch.setenv("RSOD_DATA_DIR", str(data_dir))
+
+    from rsod_decode import storage
+    storage.init_db()
+
+    from rsod_decode.ingest import ingest_session, staging_dir
+    from rsod_decode.storage import canonical_filename
+    import shutil
+
+    from tests._datasets import FIXTURES_DIR
+    rsod_path = FIXTURES_DIR / spec.rsod_file
+
+    def _stage() -> Path:
+        stg = staging_dir()
+        (stg / 'rsod.txt').write_bytes(rsod_path.read_bytes())
+        shutil.copy2(spec.symbol_path,
+                     stg / canonical_filename(spec.symbol_path.name))
+        return stg
+
+    result = ingest_session(_stage(), backend='pyelftools')
+    assert result.is_new is True
+    assert len(result.session_id) == 16
+    rows = storage.list_sessions()
+    assert any(r.id == result.session_id for r in rows)
+
+    second = ingest_session(_stage(), backend='pyelftools')
+    assert second.is_new is False
+    assert second.session_id == result.session_id
+    rows = storage.list_sessions()
+    assert sum(1 for r in rows if r.id == result.session_id) == 1
+
+    storage.delete_session(result.session_id)
+
+
+def test_session_name_crud(client, app) -> None:
+    """Create with name, PATCH rename, verify in history + GET."""
+    spec = DATASET_SPECS["edk2_aa64"]
+    ctx = create_api_session(client, spec)
+    sid = ctx.session_id
+
+    # Set a name via PATCH
+    resp = client.patch(
+        f"/api/session/{sid}",
+        json={"name": "R470 fGndBounce"},
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["updated"] is True
+
+    # History shows the name
+    hist = client.get("/api/history").get_json()
+    row = next(s for s in hist["sessions"] if s["id"] == sid)
+    assert row["name"] == "R470 fGndBounce"
+
+    # Clear the name
+    client.patch(f"/api/session/{sid}", json={"name": ""})
+    hist = client.get("/api/history").get_json()
+    row = next(s for s in hist["sessions"] if s["id"] == sid)
+    assert row["name"] is None
+
+    client.delete(f"/api/session/{sid}")
+
+
 def test_upload_canonicalizes_filename_with_spaces(client) -> None:
     """Uploading a file with spaces + special chars still produces a
     stable content-hash session_id matching what the CLI pre-load

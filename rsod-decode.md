@@ -251,6 +251,8 @@ git revision of the auto-detected rsod-decode repo.
 | `--source-path PATH` | Source tree to search (repeatable; auto-detected rsod-decode repo is always a fallback) |
 | `--tag TAG` | Git tag for source context (reads source at that revision) |
 | `--commit HASH` | Git commit hash for source context |
+| `--session ID` | Replay a persisted session by id (full or prefix) instead of reading files |
+| `--name TEXT` | Friendly display name for this session (visible in `rsod history` and the web UI) |
 
 ### Multi-module traces (`-s`)
 

@@ -421,12 +421,13 @@ rsod-decode/
 │   ├── __main__.py         — `rsod decode|serve` subcommand dispatcher
 │   ├── server.py           — `rsod serve` entry point (Flask launcher + pre-load)
 │   ├── cli.py              — `rsod decode` entry point (text-only)
-│   ├── app.py              — Flask routes — thin JSON serializer over service.py
+│   ├── app.py              — Flask routes — thin JSON wrappers over ingest.py + service.py
 │   ├── service.py          — Shared analysis pipeline: analyze + backend init
 │   │                         + source_loc backfill + tail-call reconstruction
 │   │                         + frame-level resolve_frame_vars
 │   ├── session.py          — Session dataclass + from/as_analysis_context
-│   ├── storage.py          — SQLite session store (schema v2, migrations)
+│   ├── ingest.py           — Session lifecycle: stage→hash→dedup→promote→analyze→persist
+│   ├── storage.py          — SQLite session store (schema v3, migrations)
 │   ├── data_dir.py         — ~/.rsod-debug/ path + RSOD_DATA_DIR override
 │   ├── pdb_routing.py      — MSVC PE / .map / .pdb companion detection
 │   ├── resource_paths.py   — frontend_dist() helper (pyzw-aware)
@@ -647,14 +648,15 @@ the hash, then either `rename` the staging dir to `files/<id>/`
 (fresh) or `rmtree` it (dedup). Staging lives under `.staging/` so
 the top level of `files/` only contains real session ids.
 
-Schema v2:
+Schema v3:
 
 ```
 sessions(
     id, created_at, rsod_format, image_name, image_base,
     exception_desc, crash_pc, crash_symbol, frame_count,
     backend, rsod_text, base_override, dwarf_prefix,
-    imported_from   -- v2: original id when the row came from /api/import
+    imported_from,  -- v2: original id when the row came from /api/import
+    name            -- v3: optional user-facing display name
 ) WITHOUT ROWID;
 
 session_files(
