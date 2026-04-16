@@ -117,7 +117,7 @@ def _decode_from_session(args: argparse.Namespace) -> None:
 
     git_ref = _resolve_git_ref(args, repo_root)
 
-    out_path = args.output or Path(f'{session_id[:8]}_decode.txt')
+    out_path = args.output or Path('/dev/stdout')
 
     try:
         decode_rsod(
@@ -137,7 +137,8 @@ def _decode_from_session(args: argparse.Namespace) -> None:
     except FileNotFoundError as e:
         sys.exit(f"Error: session files missing on disk: {e}")
 
-    _log(f"Output: {out_path}")
+    if args.output:
+        _log(f"Output: {out_path}")
 
 
 def _decode_from_files(args: argparse.Namespace) -> None:
