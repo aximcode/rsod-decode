@@ -33,6 +33,82 @@ rsod-decode rsod.txt app.efi.so -v --commit 6f3b70ec
 
 Output is written to `<log>_decode.txt` by default (override with `-o`).
 
+## Web UI (`rsod serve`)
+
+The same analysis pipeline also ships as an interactive web UI. Run
+`rsod serve` and the tool starts a local Flask server, opens your
+default browser to an upload page, and lets you drop any combination
+of RSOD log + symbol files in one action.
+
+```
+rsod serve                                 # upload form at localhost:5000
+rsod serve rsod.txt app.efi.so             # pre-load a session on startup
+rsod serve rsod.txt app.efi -s app.pdb     # MSVC PE+PDB crash
+rsod serve --port 9090 --no-browser        # custom port, skip browser open
+```
+
+The UI gives you the same clickable backtrace, per-frame
+params/locals/disassembly/source, and LLDB/GDB terminal tabs that
+verbose CLI mode describes above — but navigable rather than flat
+text.
+
+### Persistent session history
+
+Uploaded sessions survive `rsod serve` restarts. Every upload writes
+to a SQLite store at `~/.rsod-debug/sessions.db` plus a per-session
+files directory under `~/.rsod-debug/files/<id>/`. The upload page
+shows a "Recent sessions" list below the upload zone; click any row
+to reopen the crash.
+
+Override the data directory with the `RSOD_DATA_DIR` env var — handy
+for CI, for keeping test runs isolated from your real history, or
+for splitting history by project.
+
+Sessions are **never** auto-deleted. Refreshing the tab preserves
+the session; "New Analysis" preserves the session; closing the
+browser preserves the session. The only way to permanently remove a
+session is to click the Delete button in the crash banner (or on a
+history row), which prompts for confirmation before dropping both
+the SQLite row and the on-disk files.
+
+Re-uploading the same input set doesn't create a duplicate. The
+`session_id` is a sha256 over the canonical filenames + bytes of
+the uploaded files, so identical inputs always land on the same row.
+
+### Sharing crashes across machines (export / import)
+
+Click **Export** in the crash banner (or on a history row) to
+download a `.rsod.zip` bundle containing the original RSOD text, the
+symbol files, and a small `metadata.json` manifest. Filename format:
+
+```
+crash-2026-04-15-ab12cd34.rsod.zip
+```
+
+Send that file to a teammate (email, Slack, shared drive). They
+click **Import bundle** on their own upload page and drop straight
+into the imported session — the symbol files travel with the
+bundle, so they don't need separate access to the build artifacts.
+
+Because `session_id` is a content hash, Alice's id and Bob's id
+match whenever they have the same inputs. A `#session/ab12cd34...`
+permalink Alice sends Bob resolves to the same crash on Bob's
+install once he's imported the bundle.
+
+### Permalinks
+
+Any session URL of the form `http://host:port/#session/<id>` is a
+stable bookmark. Opening it:
+
+- Hits the in-memory cache if the session is still hot.
+- Otherwise reads the SQLite row, copies the persisted files back
+  into a fresh analysis context, and re-runs the full pipeline
+  (`service.run_analysis`) to reconstruct the view.
+
+This works across `rsod serve` restarts (the SQLite store survives)
+and, thanks to content-hash ids, across different installs that
+have imported the same bundle.
+
 ## Symbol Files
 
 The tool accepts two types of symbol files:

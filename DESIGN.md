@@ -119,6 +119,37 @@ analysis that a text file can't:
 
 ## UI Panels
 
+### Upload screen (no session loaded)
+
+The landing screen when there's no active session. One region
+handles all file ingestion:
+
+- **Drop zone** — accepts any combination of RSOD capture and
+  symbol files in a single drag. A pure `classifyAndMerge`
+  helper in [UploadForm.tsx](frontend/src/components/UploadForm.tsx)
+  routes `.txt`/`.log` to the RSOD slot, picks the first
+  `.efi`/`.so`/`.debug`/`.elf` as the primary, and drops `.map`
+  and `.pdb` (plus any additional modules) into extras. Dropping
+  a "better" primary later promotes it and demotes the old one
+  into extras, so the order the user drops files in doesn't
+  matter.
+- **"or browse…" button** — a hidden `<input type="file" multiple>`
+  fallback for anyone who'd rather click than drag. Same
+  classifier, same semantics.
+- **Paste textarea** — for RSOD text pasted from a terminal.
+  Setting this clears any file-dropped RSOD and vice versa.
+- **Advanced options** — base address override + git tag/commit
+  for source context lookup. Collapsed by default.
+- **Analyze + Import bundle** — Analyze submits the form to
+  `POST /api/session`; Import bundle opens a second hidden file
+  picker accepting `.zip` and posts the selected bundle to
+  `POST /api/import`. On success, both flows drop the user
+  directly into the resulting session.
+- **Recent sessions (HistoryPanel)** — renders below the submit
+  row. Per-row export + delete buttons. Clicking a row hydrates
+  the session via the same `loadSession` path the permalink
+  bootstrap uses.
+
 ### Crash Banner (top, always visible)
 
 ```
@@ -127,8 +158,22 @@ analysis that a text file can't:
 ║  PC: 0x62FC  fHandleError  src/Platform/ErrorHandler.cpp:294  ║
 ║  ESR: 0x96000047  Translation fault L3  FAR: 0x0 (NULL)      ║
 ║  Image: firmware.efi.so  ARM64                                ║
+║  [ New Analysis ] [ Export ] [ Delete ]  backend: pyelf gdb lldb  ║
 ╚══════════════════════════════════════════════════════════╝
 ```
+
+The action cluster on the right:
+
+- **New Analysis** — closes the current view (goes back to the
+  upload screen) **without** touching SQLite. The session stays
+  in history and can be reopened from HistoryPanel or via its
+  permalink.
+- **Export** — downloads the current session as an
+  `.rsod.zip` bundle. Same format as `GET /api/export/<id>`.
+- **Delete** — permanently drops the row + files dir. Confirms
+  via `window.confirm` before firing. This is the **only** UI
+  path that calls `DELETE /api/session/<id>`.
+- **Backend toggle** — pyelf / gdb / lldb, unchanged.
 
 ### Backtrace Panel (left sidebar)
 
@@ -405,7 +450,7 @@ rsod-decode/
 │   │   ├── api.ts          — Backend API client
 │   │   ├── types.ts        — TypeScript interfaces matching backend models
 │   │   ├── components/
-│   │   │   ├── CrashBanner.tsx
+│   │   │   ├── CrashBanner.tsx        — top banner + Export/Delete buttons
 │   │   │   ├── BacktracePanel.tsx
 │   │   │   ├── DetailPanel.tsx
 │   │   │   ├── ParamsTab.tsx
@@ -415,10 +460,10 @@ rsod-decode/
 │   │   │   ├── RegisterPanel.tsx
 │   │   │   ├── RawRsodPanel.tsx
 │   │   │   ├── AddressResolver.tsx
-│   │   │   ├── UploadForm.tsx
-│   │   │   └── SessionHistory.tsx
+│   │   │   ├── UploadForm.tsx         — drop zone + classifyAndMerge + import
+│   │   │   └── HistoryPanel.tsx       — recent sessions, per-row export/delete
 │   │   └── hooks/
-│   │       └── useSession.ts  — Session state management
+│   │       └── useSession.ts  — Session state management (no implicit DELETE)
 │   ├── index.html
 │   ├── package.json
 │   ├── tsconfig.json
@@ -668,6 +713,36 @@ evicted or cross-restart session, `_get_session` calls
 `storage.hydrate_inputs`, re-runs `service.run_analysis` against the
 persisted files, and stuffs the result back into the in-memory
 dict. Permalinks (`#session/<id>`) work through the same path.
+
+### Frontend persistence contract
+
+The React SPA **must not** call `DELETE /api/session/<id>` as a
+side effect of casual navigation — refreshing the tab, pressing
+"New Analysis", or switching between history entries all leave
+persistent state untouched. The only allowed DELETE trigger is
+the explicit CrashBanner Delete button, which goes through
+`useSession.deleteCurrent` after a `window.confirm`.
+
+This contract exists because an earlier Phase 1 build broke
+persistence in practice by DELETE'ing on `beforeunload` and on
+`reset()`. Those calls fired on every refresh and every "New
+Analysis" click, silently wiping rows the user expected to find
+in history. The regression only surfaced once the Phase 3 UI
+wired up the history flow — `curl`-driven smoke tests never
+triggered `beforeunload`.
+
+Concretely:
+
+- `useSession` has no `beforeunload` handler.
+- `closeView` clears the hash + in-memory state and returns to
+  the upload screen. No network call.
+- `deleteCurrent` is the only callback that calls
+  `api.deleteSession`. Bound only to the CrashBanner Delete
+  button.
+- `HistoryPanel`'s per-row Delete button also calls
+  `api.deleteSession`, but only after an explicit confirm.
+- Clicking a history row or importing a bundle calls
+  `loadSession(id)` — a read path, no DELETE.
 
 ### Export / import bundle format
 
