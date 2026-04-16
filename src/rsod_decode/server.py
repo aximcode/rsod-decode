@@ -26,6 +26,7 @@ from pathlib import Path
 from . import data_dir as _data_dir, storage
 from .app import create_app, persist_session
 from .session import Session, register_session
+from .storage import canonical_filename
 from .symbols import SymbolLoadError, load_symbols
 
 
@@ -155,12 +156,17 @@ def main() -> None:
         staging_root.mkdir(parents=True, exist_ok=True)
         staging_dir = staging_root / uuid.uuid4().hex
         staging_dir.mkdir(parents=True, exist_ok=True)
+        # canonical_filename keeps every ingestion path on the same
+        # on-disk basename convention so HTTP upload, CLI pre-load,
+        # and bundle import all hash to the same session_id for the
+        # same inputs — no more surprise drift via secure_filename.
         try:
             (staging_dir / 'rsod.txt').write_bytes(args.rsod_log.read_bytes())
-            staging_primary = staging_dir / args.symbol_file.name
+            primary_name = canonical_filename(args.symbol_file.name)
+            staging_primary = staging_dir / primary_name
             shutil.copy2(args.symbol_file, staging_primary)
             for src in args.sym:
-                shutil.copy2(src, staging_dir / src.name)
+                shutil.copy2(src, staging_dir / canonical_filename(src.name))
         except OSError as e:
             shutil.rmtree(staging_dir, ignore_errors=True)
             sys.exit(f"Error copying inputs: {e}")
@@ -181,8 +187,9 @@ def main() -> None:
                 shutil.rmtree(staging_dir, ignore_errors=True)
                 sys.exit(f"Error promoting staging dir: {e}")
 
-        primary_path = files_dir / args.symbol_file.name
-        extra_paths: list[Path] = [files_dir / s.name for s in args.sym]
+        primary_path = files_dir / canonical_filename(args.symbol_file.name)
+        extra_paths: list[Path] = [
+            files_dir / canonical_filename(s.name) for s in args.sym]
 
         def _cli_rollback() -> None:
             # Only rmtree on the fresh-promotion path. Dedup reuses

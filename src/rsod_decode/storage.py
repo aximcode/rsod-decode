@@ -26,6 +26,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from werkzeug.utils import secure_filename
+
 from . import data_dir as _data_dir
 
 
@@ -76,6 +78,29 @@ class HydratedInputs:
     base_override: int | None
     dwarf_prefix: str | None
     imported_from: str | None = None
+
+
+# =============================================================================
+# Filename canonicalization (shared by all ingestion paths)
+# =============================================================================
+
+def canonical_filename(raw: str) -> str:
+    """Return the on-disk basename for an uploaded file.
+
+    All three ingestion paths — HTTP POST /api/session, CLI pre-load
+    in `rsod serve`, and POST /api/import bundle extraction — go
+    through this helper before writing to `files/<id>/`. That's what
+    makes `compute_session_id` produce the same hash regardless of
+    which ingestion path Alice used vs which one Bob used: all
+    produce the same basename set under the same canonicalization.
+
+    Wraps `werkzeug.utils.secure_filename` for its path-component
+    stripping, non-ASCII normalization, and unsafe-char filtering.
+    Falls back to 'unnamed' when secure_filename produces an empty
+    string (e.g. purely non-ASCII input like "über.efi" → "ber.efi"
+    stays non-empty, but all-punctuation names don't).
+    """
+    return secure_filename(raw) or 'unnamed'
 
 
 # =============================================================================
@@ -364,3 +389,37 @@ def delete_session(session_id: str) -> bool:
     if files_dir.exists():
         shutil.rmtree(files_dir, ignore_errors=True)
     return deleted
+
+
+def collect_orphans() -> None:
+    """Garbage-collect `files/<id>/` dirs with no matching DB row.
+
+    Called from `init_db` on every server start. Handles two cases:
+
+    - `.staging/` — contains in-flight upload scratch dirs. Any
+      leftover contents belong to a previous process that crashed
+      mid-upload; wipe the whole subtree.
+    - `files/<id>/` where `id` is NOT in the `sessions` table — an
+      orphan from an upload that crashed after creating the files
+      dir but before calling `save_session`. Left in place, the
+      next upload of the same content would hit the rename guard in
+      `_promote_staging` and fail. Sweep them.
+
+    Directories whose name matches an existing session_id are left
+    alone even if they look empty or malformed — they're the caller's
+    responsibility, not ours.
+    """
+    files_root = _data_dir.session_files_dir()
+    if not files_root.exists():
+        return
+    with _connect() as conn:
+        rows = conn.execute('SELECT id FROM sessions').fetchall()
+    valid_ids = {row['id'] for row in rows}
+    for child in files_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name == '.staging':
+            shutil.rmtree(child, ignore_errors=True)
+            continue
+        if child.name not in valid_ids:
+            shutil.rmtree(child, ignore_errors=True)

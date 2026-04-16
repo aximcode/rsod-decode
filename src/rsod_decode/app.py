@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
-from werkzeug.utils import secure_filename
 
 
 # Export/import bundle format version — bumped when metadata.json
@@ -30,6 +31,7 @@ BUNDLE_SCHEMA_VERSION = 1
 BUNDLE_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MiB
 
 from . import data_dir as _data_dir, storage
+from .storage import canonical_filename
 from .models import SymbolSource, clean_path, binary_for_frame, find_source_file
 from .corefile import write_corefile
 from .gdb_bridge import GdbSession
@@ -93,11 +95,11 @@ def _copy_uploads_to_disk(
     files_dir.mkdir(parents=True, exist_ok=True)
     rsod_path = files_dir / 'rsod.txt'
     rsod_file.save(str(rsod_path))
-    primary = files_dir / secure_filename(sym_file.filename or 'symbols')
+    primary = files_dir / canonical_filename(sym_file.filename or 'symbols')
     sym_file.save(str(primary))
     extras: list[Path] = []
     for f in extra_files:
-        p = files_dir / secure_filename(f.filename or 'extra')
+        p = files_dir / canonical_filename(f.filename or 'extra')
         f.save(str(p))
         extras.append(p)
     rsod_text = rsod_path.read_text(encoding='utf-8', errors='replace')
@@ -226,16 +228,57 @@ class _BundleError(ValueError):
     """Raised on a malformed or unsafe /api/import upload."""
 
 
+# Hard cap on the length of any single zip member name. 255 matches
+# ext4/btrfs NAME_MAX; anything past this gets rejected before we
+# even try to open a file descriptor.
+BUNDLE_MAX_NAME_LEN = 255
+
+
+def _is_safe_member_name(name: str) -> bool:
+    """Return True if `name` is a bare, control-char-free basename.
+
+    This is the gate that stops zip-bomb / path-traversal / symlink /
+    NUL-smuggling attacks from laying down files anywhere except
+    directly under the destination dir.
+    """
+    if not name or name != name.strip():
+        return False
+    if len(name.encode('utf-8')) > BUNDLE_MAX_NAME_LEN:
+        return False
+    if name in ('.', '..'):
+        return False
+    if '/' in name or '\\' in name:
+        return False
+    # Reject NUL and all other control bytes. `"good\x00.efi"` would
+    # otherwise pass the slash / basename checks above but get
+    # truncated to "good" at the syscall boundary, silently
+    # overwriting `rsod.txt` or the primary symbol file from the same
+    # bundle (depending on zip member order).
+    if any(ord(c) < 32 or ord(c) == 0x7f for c in name):
+        return False
+    if Path(name).is_absolute():
+        return False
+    return True
+
+
 def _extract_bundle(stream, files_dir: Path) -> dict:
     """Unpack an /api/import zip into `files_dir`, returning metadata.
 
     Safety guards (applied BEFORE any disk write):
     - Members must be regular files — reject dirs, symlinks, devices
       (zipfile's external_attr upper bits expose the POSIX mode).
-    - Member names must be flat basenames — no directory separators,
-      no absolute paths, no `..` traversal, no empty/control chars.
+    - Member names must be flat basenames with no directory
+      separators, no `..` traversal, no empty/control/NUL bytes, and
+      no more than BUNDLE_MAX_NAME_LEN bytes. See `_is_safe_member_name`.
+    - No duplicate member names — zip allows them but they'd let a
+      malicious bundle sneak contradictory metadata past validation.
     - Total uncompressed size is capped at BUNDLE_MAX_UNCOMPRESSED to
       shut down zip-bomb amplification before the extract loop runs.
+    - Member names are canonicalized through `canonical_filename`
+      before writing to disk, so the on-disk set matches whatever
+      the create_session / CLI pre-load paths would have produced
+      from the same inputs — which is what keeps the content-hash
+      session id stable across ingestion paths.
     - metadata.json must be present and parse as a dict with an
       integer `schema_version` this server understands.
     """
@@ -243,16 +286,16 @@ def _extract_bundle(stream, files_dir: Path) -> dict:
     with zipfile.ZipFile(stream) as zf:
         infos = zf.infolist()
         total = 0
+        seen: set[str] = set()
         for info in infos:
             name = info.filename
-            if not name or name != name.strip():
-                raise _BundleError(f'suspicious member name: {name!r}')
+            if not _is_safe_member_name(name):
+                raise _BundleError(f'unsafe member name: {name!r}')
             if name.endswith('/') or info.is_dir():
                 raise _BundleError(f'bundles must be flat (got dir: {name})')
-            # Reject anything that isn't a bare basename.
-            if '/' in name or '\\' in name or name in ('.', '..') \
-                    or Path(name).is_absolute():
-                raise _BundleError(f'unsafe path in bundle: {name!r}')
+            if name in seen:
+                raise _BundleError(f'duplicate member: {name!r}')
+            seen.add(name)
             # Symlink detection via POSIX mode bits in external_attr.
             mode = (info.external_attr >> 16) & 0xF000
             if mode == 0xA000:  # S_IFLNK
@@ -267,10 +310,16 @@ def _extract_bundle(stream, files_dir: Path) -> dict:
 
         metadata_raw: bytes | None = None
         for info in infos:
-            dst = files_dir / info.filename
+            # Write member bytes under their canonical basename so the
+            # post-extract files_dir matches what the upload path
+            # would have produced for the same inputs. `metadata.json`
+            # passes through unchanged (canonical_filename is a no-op
+            # for already-canonical names).
+            target_name = canonical_filename(info.filename)
+            dst = files_dir / target_name
             with zf.open(info) as src_fp, dst.open('wb') as dst_fp:
                 shutil.copyfileobj(src_fp, dst_fp)
-            if info.filename == 'metadata.json':
+            if target_name == 'metadata.json':
                 metadata_raw = dst.read_bytes()
 
     if metadata_raw is None:
@@ -305,6 +354,26 @@ def _staging_dir() -> Path:
     return d
 
 
+# Per-session upload serialization. Two concurrent uploads with the
+# same content hash will contend on the same Lock entry and
+# serialize through the entire stage → resolve → promote → analyze →
+# persist sequence, so the second one hits the clean dedup fast path
+# instead of racing `_promote_staging` against `_try_resolve_existing`.
+# Uploads with different hashes never contend. The master lock only
+# guards dict access and is held for nanoseconds.
+_session_locks_master = threading.Lock()
+_session_locks: dict[str, threading.Lock] = {}
+
+
+def _session_lock(session_id: str) -> threading.Lock:
+    with _session_locks_master:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_id] = lock
+        return lock
+
+
 def _try_resolve_existing(app: Flask, session_id: str) -> Session | None:
     """Return the live Session for `session_id` if it's healthy on disk.
 
@@ -332,19 +401,27 @@ def _try_resolve_existing(app: Flask, session_id: str) -> Session | None:
 def _promote_staging(
     staging_dir: Path, session_id: str,
 ) -> Path:
-    """Rename `staging_dir` to its content-hash final location.
+    """Atomically rename `staging_dir` to its content-hash final dir.
 
-    Cleans up stale fragments (orphan DB row, orphan files dir) before
-    the rename so the move is always into an empty slot. Returns the
-    final dir. Caller must handle rollback on any exception raised
-    AFTER this function returns — by the time we're done, the staging
-    dir is gone.
+    Uses `os.rename`, which succeeds only when the target doesn't
+    exist (or is an empty directory). If another upload already
+    claimed this `session_id` we raise `FileExistsError` — the
+    caller retries dedup resolution from there.
+
+    The earlier version of this function pre-cleared the target via
+    `storage.delete_session` + `rmtree`, which was racy: two
+    concurrent uploads of identical content could both pass
+    `_try_resolve_existing`, and the second one's pre-clear would
+    wipe the first one's in-flight files_dir. Orphan directories
+    (files without a row, from a crashed upload that never
+    persisted) are now handled at startup by `collect_orphans`, not
+    inline during the promote.
     """
-    storage.delete_session(session_id)  # no-op when absent
     final_dir = _data_dir.session_files_dir_for(session_id)
-    if final_dir.exists():
-        shutil.rmtree(final_dir)
-    staging_dir.rename(final_dir)
+    try:
+        os.rename(str(staging_dir), str(final_dir))
+    except OSError as e:
+        raise FileExistsError(str(final_dir)) from e
     return final_dir
 
 
@@ -412,8 +489,11 @@ def create_app(repo_root: Path | None = None,
 
     # Initialize persistent session store. Idempotent: creates
     # ~/.rsod-debug/sessions.db (or $RSOD_DATA_DIR) on first run,
-    # runs migrations on subsequent runs.
+    # runs migrations on subsequent runs. Sweeps orphan files dirs
+    # (crashed in-flight uploads, leftover .staging/ garbage) so
+    # fresh uploads don't collide with stale on-disk state.
     storage.init_db()
+    storage.collect_orphans()
 
     # -----------------------------------------------------------------
     # POST /api/session — upload RSOD + symbols, create session
@@ -450,75 +530,81 @@ def create_app(repo_root: Path | None = None,
 
         session_id = storage.compute_session_id(staging_dir)
 
-        # Dedup fast path: same content hash as an existing healthy
-        # session → discard staging, return the existing session.
-        existing = _try_resolve_existing(app, session_id)
-        if existing is not None:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            return jsonify(
-                session_id=session_id,
-                crash_summary=crash_info_to_dict(existing.result.crash_info),
-                frame_count=len(existing.result.frames),
-                deduplicated=True,
-            ), 200
-
-        # Fresh session — promote staging to the canonical files dir.
-        try:
-            files_dir = _promote_staging(staging_dir, session_id)
-        except OSError as e:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            # Rename race with a concurrent upload of identical
-            # content: the other request won, dedup-resolve instead.
+        # Serialize through the entire stage→analyze→persist sequence
+        # for this session_id so a concurrent upload of identical
+        # content hits the clean dedup fast path instead of racing
+        # _promote_staging. Uploads with different hashes take
+        # different locks and don't contend.
+        with _session_lock(session_id):
             existing = _try_resolve_existing(app, session_id)
             if existing is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
                 return jsonify(
                     session_id=session_id,
                     crash_summary=crash_info_to_dict(existing.result.crash_info),
                     frame_count=len(existing.result.frames),
                     deduplicated=True,
                 ), 200
-            return jsonify(error=f'promote failed: {e}'), 500
 
-        # Paths in staging_dir became invalid on rename — rebuild.
-        primary_path = files_dir / primary_path.name
-        extra_paths = [files_dir / p.name for p in extra_paths]
+            # Fresh session — atomically promote staging to files/<id>/.
+            try:
+                files_dir = _promote_staging(staging_dir, session_id)
+            except FileExistsError:
+                # Under normal operation the lock should prevent
+                # this. Treat it defensively as a dedup hit if
+                # possible (could happen if an orphan sweep missed
+                # a pre-existing files/<id>/ from a crashed upload).
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                existing = _try_resolve_existing(app, session_id)
+                if existing is not None:
+                    return jsonify(
+                        session_id=session_id,
+                        crash_summary=crash_info_to_dict(existing.result.crash_info),
+                        frame_count=len(existing.result.frames),
+                        deduplicated=True,
+                    ), 200
+                return jsonify(error='promote failed (stale files dir)'), 500
 
-        def _rollback() -> None:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            # Paths in staging_dir became invalid on rename — rebuild.
+            primary_path = files_dir / primary_path.name
+            extra_paths = [files_dir / p.name for p in extra_paths]
 
-        try:
-            ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
-                app,
-                rsod_text=rsod_text,
-                primary_path=primary_path,
-                extra_paths=extra_paths,
-                base_override=base_override,
-                dwarf_prefix=app.config.get('DWARF_PREFIX'),
-            )
-        except SymbolLoadError as e:
-            _rollback()
-            return jsonify(error=str(e)), 400
-        except Exception:
-            _rollback()
-            raise
+            def _rollback() -> None:
+                shutil.rmtree(files_dir, ignore_errors=True)
 
-        created_at = datetime.now(timezone.utc).isoformat()
-        try:
-            persist_session(
-                session_id=session_id, created_at=created_at, ctx=ctx,
-                rsod_text=rsod_text,
-                primary_path=primary_path, companion_path=companion,
-                pdb_path=pdb_path, remaining_extras=remaining_extras,
-                base_override=base_override,
-                dwarf_prefix=app.config.get('DWARF_PREFIX'),
-            )
-        except Exception:
-            _rollback()
-            raise
+            try:
+                ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
+                    app,
+                    rsod_text=rsod_text,
+                    primary_path=primary_path,
+                    extra_paths=extra_paths,
+                    base_override=base_override,
+                    dwarf_prefix=app.config.get('DWARF_PREFIX'),
+                )
+            except SymbolLoadError as e:
+                _rollback()
+                return jsonify(error=str(e)), 400
+            except Exception:
+                _rollback()
+                raise
 
-        session = Session.from_analysis_context(
-            ctx, session_id, created_at=created_at)
-        store_session(session)
+            created_at = datetime.now(timezone.utc).isoformat()
+            try:
+                persist_session(
+                    session_id=session_id, created_at=created_at, ctx=ctx,
+                    rsod_text=rsod_text,
+                    primary_path=primary_path, companion_path=companion,
+                    pdb_path=pdb_path, remaining_extras=remaining_extras,
+                    base_override=base_override,
+                    dwarf_prefix=app.config.get('DWARF_PREFIX'),
+                )
+            except Exception:
+                _rollback()
+                raise
+
+            session = Session.from_analysis_context(
+                ctx, session_id, created_at=created_at)
+            store_session(session)
 
         return jsonify(
             session_id=session_id,
@@ -1094,8 +1180,16 @@ def create_app(repo_root: Path | None = None,
         if not (staging_dir / 'rsod.txt').exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
             return jsonify(error='bundle missing rsod.txt'), 400
-        primary_name = metadata.get('primary_filename') or ''
-        if not primary_name or not (staging_dir / primary_name).exists():
+        # Canonicalize each metadata filename field to match what
+        # `_extract_bundle` actually wrote to disk. Without this the
+        # post-import file lookups miss whenever the bundle's
+        # metadata still has a raw (pre-canonicalization) name.
+        raw_primary = metadata.get('primary_filename') or ''
+        if not raw_primary:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return jsonify(error='bundle metadata missing primary_filename'), 400
+        primary_name = canonical_filename(raw_primary)
+        if not (staging_dir / primary_name).exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
             return jsonify(
                 error=f'bundle missing primary symbol file {primary_name!r}'), 400
@@ -1113,82 +1207,96 @@ def create_app(repo_root: Path | None = None,
         session_id = storage.compute_session_id(staging_dir)
         bundle_original_id = metadata.get('session_id')
 
-        existing = _try_resolve_existing(app, session_id)
-        if existing is not None:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            return jsonify(
-                session_id=session_id,
-                imported_from=bundle_original_id,
-                crash_summary=crash_info_to_dict(existing.result.crash_info),
-                frame_count=len(existing.result.frames),
-                deduplicated=True,
-            ), 200
+        with _session_lock(session_id):
+            existing = _try_resolve_existing(app, session_id)
+            if existing is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return jsonify(
+                    session_id=session_id,
+                    imported_from=bundle_original_id,
+                    crash_summary=crash_info_to_dict(existing.result.crash_info),
+                    frame_count=len(existing.result.frames),
+                    deduplicated=True,
+                ), 200
 
-        try:
-            files_dir = _promote_staging(staging_dir, session_id)
-        except OSError as e:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            return jsonify(error=f'promote failed: {e}'), 500
+            try:
+                files_dir = _promote_staging(staging_dir, session_id)
+            except FileExistsError:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                existing = _try_resolve_existing(app, session_id)
+                if existing is not None:
+                    return jsonify(
+                        session_id=session_id,
+                        imported_from=bundle_original_id,
+                        crash_summary=crash_info_to_dict(existing.result.crash_info),
+                        frame_count=len(existing.result.frames),
+                        deduplicated=True,
+                    ), 200
+                return jsonify(error='promote failed (stale files dir)'), 500
 
-        def _rollback() -> None:
-            shutil.rmtree(files_dir, ignore_errors=True)
+            def _rollback() -> None:
+                shutil.rmtree(files_dir, ignore_errors=True)
 
-        # Reconstruct the "extras" list _analyze_from_disk expects.
-        primary_path = files_dir / primary_name
-        extras: list[Path] = []
-        for name_field in ('companion_filename', 'pdb_filename'):
-            name = metadata.get(name_field)
-            if name:
-                p = files_dir / name
+            # Reconstruct the "extras" list _analyze_from_disk expects.
+            # Canonicalize metadata field values so they line up with
+            # the canonical basenames _extract_bundle wrote to disk.
+            primary_path = files_dir / primary_name
+            extras: list[Path] = []
+            for name_field in ('companion_filename', 'pdb_filename'):
+                raw = metadata.get(name_field)
+                if raw:
+                    canonical = canonical_filename(raw)
+                    p = files_dir / canonical
+                    if not p.exists():
+                        _rollback()
+                        return jsonify(error=f'bundle missing {canonical}'), 400
+                    extras.append(p)
+            for raw in metadata.get('extra_filenames') or []:
+                canonical = canonical_filename(raw)
+                p = files_dir / canonical
                 if not p.exists():
                     _rollback()
-                    return jsonify(error=f'bundle missing {name}'), 400
+                    return jsonify(error=f'bundle missing {canonical}'), 400
                 extras.append(p)
-        for name in metadata.get('extra_filenames') or []:
-            p = files_dir / name
-            if not p.exists():
+
+            rsod_text = (files_dir / 'rsod.txt').read_text(
+                encoding='utf-8', errors='replace')
+
+            try:
+                ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
+                    app,
+                    rsod_text=rsod_text,
+                    primary_path=primary_path,
+                    extra_paths=extras,
+                    base_override=metadata.get('base_override'),
+                    dwarf_prefix=metadata.get('dwarf_prefix')
+                        or app.config.get('DWARF_PREFIX'),
+                )
+            except SymbolLoadError as e:
                 _rollback()
-                return jsonify(error=f'bundle missing {name}'), 400
-            extras.append(p)
+                return jsonify(error=str(e)), 400
+            except Exception:
+                _rollback()
+                raise
 
-        rsod_text = (files_dir / 'rsod.txt').read_text(
-            encoding='utf-8', errors='replace')
+            created_at = datetime.now(timezone.utc).isoformat()
+            try:
+                persist_session(
+                    session_id=session_id, created_at=created_at, ctx=ctx,
+                    rsod_text=rsod_text,
+                    primary_path=primary_path, companion_path=companion,
+                    pdb_path=pdb_path, remaining_extras=remaining_extras,
+                    base_override=metadata.get('base_override'),
+                    dwarf_prefix=metadata.get('dwarf_prefix'),
+                    imported_from=bundle_original_id,
+                )
+            except Exception:
+                _rollback()
+                raise
 
-        try:
-            ctx, companion, pdb_path, remaining_extras = _analyze_from_disk(
-                app,
-                rsod_text=rsod_text,
-                primary_path=primary_path,
-                extra_paths=extras,
-                base_override=metadata.get('base_override'),
-                dwarf_prefix=metadata.get('dwarf_prefix')
-                    or app.config.get('DWARF_PREFIX'),
-            )
-        except SymbolLoadError as e:
-            _rollback()
-            return jsonify(error=str(e)), 400
-        except Exception:
-            _rollback()
-            raise
-
-        created_at = datetime.now(timezone.utc).isoformat()
-        try:
-            persist_session(
-                session_id=session_id, created_at=created_at, ctx=ctx,
-                rsod_text=rsod_text,
-                primary_path=primary_path, companion_path=companion,
-                pdb_path=pdb_path, remaining_extras=remaining_extras,
-                base_override=metadata.get('base_override'),
-                dwarf_prefix=metadata.get('dwarf_prefix'),
-                imported_from=bundle_original_id,
-            )
-        except Exception:
-            _rollback()
-            raise
-
-        session = Session.from_analysis_context(
-            ctx, session_id, created_at=created_at)
-        store_session(session)
+            session = Session.from_analysis_context(
+                ctx, session_id, created_at=created_at)
+            store_session(session)
 
         return jsonify(
             session_id=session_id,

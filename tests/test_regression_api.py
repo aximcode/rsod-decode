@@ -551,3 +551,112 @@ def test_import_rejects_unsafe_bundles(client) -> None:
         content_type="multipart/form-data",
     )
     assert resp.status_code == 400
+
+    # Duplicate member names — two metadata.json entries would let a
+    # malicious bundle sneak contradictory headers past validation.
+    # Suppress the UserWarning Python's zipfile emits while building
+    # the intentionally-broken bundle.
+    import warnings
+    buf = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("metadata.json", '{"schema_version": 1}')
+            zf.writestr("metadata.json", '{"schema_version": 999}')
+    code, body = _post(buf.getvalue())
+    assert code == 400 and "duplicate" in body["error"].lower()
+
+    # Member name over the 255-byte limit.
+    long_name = ("a" * 260) + ".efi"
+    code, body = _post(_make_bundle([(long_name, b"x", 0)]))
+    assert code == 400 and "unsafe" in body["error"].lower()
+
+
+def test_is_safe_member_name_unit() -> None:
+    """Pin the bundle member-name validator's rejection rules.
+
+    Python's `zipfile` silently strips NUL bytes on both write and
+    read, so an end-to-end test via /api/import can't actually ship
+    a NUL-bearing member through the standard library. The rejection
+    logic itself still needs coverage — a hand-crafted zip (or a
+    future library change) could expose the path. Keep the defensive
+    check and pin it with this unit test instead.
+    """
+    from rsod_decode.app import _is_safe_member_name
+
+    # Accepted
+    assert _is_safe_member_name("primary.efi")
+    assert _is_safe_member_name("psa_x64.pdb")
+    assert _is_safe_member_name("metadata.json")
+
+    # Rejected — path traversal and absolute paths
+    assert not _is_safe_member_name("../escape.efi")
+    assert not _is_safe_member_name("/etc/passwd")
+    assert not _is_safe_member_name("sub/dir/file.efi")
+    assert not _is_safe_member_name("..")
+    assert not _is_safe_member_name(".")
+
+    # Rejected — NUL, other control bytes, DEL
+    assert not _is_safe_member_name("good\x00.efi")
+    assert not _is_safe_member_name("good\x01evil")
+    assert not _is_safe_member_name("tab\t.efi")
+    assert not _is_safe_member_name("nl\n.efi")
+    assert not _is_safe_member_name("del\x7f.efi")
+
+    # Rejected — empty, whitespace-only, length cap
+    assert not _is_safe_member_name("")
+    assert not _is_safe_member_name("   ")
+    assert not _is_safe_member_name(("a" * 260) + ".efi")
+
+
+def test_upload_canonicalizes_filename_with_spaces(client) -> None:
+    """Uploading a file with spaces + special chars still produces a
+    stable content-hash session_id matching what the CLI pre-load
+    path or a bundle import would compute from the same bytes.
+    """
+    import io
+
+    from rsod_decode import storage
+
+    spec = DATASET_SPECS["edk2_aa64"]
+    if not spec.symbol_path.exists():
+        import pytest
+        pytest.skip(f"missing fixture: {spec.symbol_path}")
+
+    rsod_bytes = (DATASET_SPECS["edk2_aa64"].__class__.__module__,)  # unused
+    from tests._datasets import FIXTURES_DIR
+    rsod_path = FIXTURES_DIR / spec.rsod_file
+    rsod_bytes = rsod_path.read_bytes()
+    sym_bytes = spec.symbol_path.read_bytes()
+
+    # Weird filename the upload path must canonicalize.
+    weird_name = "My Build (v1.0).so"
+
+    # First upload: upload the fixture under the weird name via the
+    # HTTP path. canonical_filename is applied in _copy_uploads_to_disk.
+    response = client.post(
+        "/api/session",
+        data={
+            "rsod_log": (io.BytesIO(rsod_bytes), "rsod.txt"),
+            "symbol_file": (io.BytesIO(sym_bytes), weird_name),
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code in (200, 201), response.get_json()
+    web_id = response.get_json()["session_id"]
+
+    # Compute what the id "should" be by running compute_session_id
+    # against the same inputs through the canonical transform. If
+    # the HTTP path ever drifted from canonical_filename, these would
+    # disagree and the test would catch it.
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "rsod.txt").write_bytes(rsod_bytes)
+        (d / storage.canonical_filename(weird_name)).write_bytes(sym_bytes)
+        expected_id = storage.compute_session_id(d)
+
+    assert web_id == expected_id
+
+    client.delete(f"/api/session/{web_id}")
