@@ -107,6 +107,7 @@ export interface SessionData {
   lldb_available: boolean
   modules: ModuleInfo[]
   lbr: LbrEntry[]
+  name: string | null
 }
 
 export interface CreateSessionResponse {
@@ -131,4 +132,5 @@ export interface HistoryEntry {
   frame_count: number
   backend: string
   imported_from: string | null
+  name: string | null
 }

@@ -7,6 +7,7 @@ type BackendId = 'pyelftools' | 'gdb' | 'lldb'
 interface Props {
   sessionId: string
   crash: CrashSummary
+  sessionName: string | null
   onCloseView: () => void
   onDelete: () => void
   backend: string
@@ -22,11 +23,21 @@ function hex(n: number | null): string {
 }
 
 export function CrashBanner({
-  sessionId, crash, onCloseView, onDelete,
+  sessionId, crash, sessionName, onCloseView, onDelete,
   backend, gdbAvailable, lldbAvailable,
   onSwitchBackend, backendSwitching, lbr,
 }: Props) {
   const [exporting, setExporting] = useState(false)
+  const [editingName, setEditingName] = useState(false)
+  const [nameDraft, setNameDraft] = useState(sessionName ?? '')
+  const [displayName, setDisplayName] = useState(sessionName)
+
+  const saveName = async () => {
+    const trimmed = nameDraft.trim() || null
+    setEditingName(false)
+    setDisplayName(trimmed)
+    try { await api.renameSession(sessionId, trimmed) } catch { /* best-effort */ }
+  }
 
   const handleExport = async () => {
     setExporting(true)
@@ -64,6 +75,30 @@ export function CrashBanner({
     <div className="bg-red-950 border-b border-red-900 px-4 py-3 font-mono text-sm shrink-0">
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-0.5 min-w-0">
+          {(displayName || editingName) && (
+            <div className="flex items-center gap-1.5">
+              {editingName ? (
+                <input
+                  type="text"
+                  value={nameDraft}
+                  onChange={e => setNameDraft(e.target.value)}
+                  onBlur={saveName}
+                  onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') setEditingName(false) }}
+                  autoFocus
+                  className="bg-transparent border-b border-zinc-500 text-zinc-100 text-xs font-sans px-0.5 py-0 outline-none w-48"
+                  placeholder="Session name…"
+                />
+              ) : (
+                <button
+                  onClick={() => { setNameDraft(displayName ?? ''); setEditingName(true) }}
+                  className="text-xs text-zinc-300 font-sans hover:text-zinc-100 truncate max-w-xs"
+                  title="Click to rename"
+                >
+                  {displayName}
+                </button>
+              )}
+            </div>
+          )}
           <div className="flex items-center gap-2">
             <span className="text-red-400 font-bold">RSOD</span>
             {crash.exception_desc && (
@@ -123,6 +158,15 @@ export function CrashBanner({
             >
               New Analysis
             </button>
+            {!displayName && !editingName && (
+              <button
+                onClick={() => { setNameDraft(''); setEditingName(true) }}
+                className="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 rounded px-2 py-1 hover:border-zinc-500 transition-colors"
+                title="Give this session a friendly name"
+              >
+                Name
+              </button>
+            )}
             <button
               onClick={handleExport}
               disabled={exporting}

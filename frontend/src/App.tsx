@@ -60,6 +60,7 @@ export function App() {
       <CrashBanner
         sessionId={state.sessionId}
         crash={state.data.crash_summary}
+        sessionName={state.data.name}
         onCloseView={closeView}
         onDelete={deleteCurrent}
         backend={state.data.backend}

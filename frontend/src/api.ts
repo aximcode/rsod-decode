@@ -212,3 +212,14 @@ export async function importSession(file: File): Promise<{
   form.append('file', file)
   return request('/api/import', { method: 'POST', body: form })
 }
+
+export async function renameSession(
+  sessionId: string,
+  name: string | null,
+): Promise<{ updated: boolean }> {
+  return request(`/api/session/${sessionId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}

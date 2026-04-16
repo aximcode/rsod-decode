@@ -127,8 +127,13 @@ export function HistoryPanel({ onOpen, refreshKey }: Props) {
                 >
                   <div className="flex items-baseline gap-2 min-w-0">
                     <span className="font-mono text-zinc-300 truncate">
-                      {entry.image_name || '(unnamed)'}
+                      {entry.name || entry.image_name || '(unnamed)'}
                     </span>
+                    {entry.name && (
+                      <span className="text-xs text-zinc-500 truncate">
+                        {entry.image_name}
+                      </span>
+                    )}
                     <span
                       className="font-mono text-xs text-zinc-600"
                       title={entry.id}

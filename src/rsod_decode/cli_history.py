@@ -67,23 +67,37 @@ def main() -> None:
             'frame_count': r.frame_count,
             'backend': r.backend,
             'imported_from': r.imported_from,
+            'name': r.name,
         } for r in rows], indent=2))
         return
 
     # Table output — fixed-width columns tuned for 120-col terminals.
-    hdr = (f'{"ID":<18}  {"IMAGE":<14}  {"EXCEPTION":<28}  '
-           f'{"SYMBOL":<18}  {"FR":>3}  {"AGE":>4}')
+    has_names = any(r.name for r in rows)
+    if has_names:
+        hdr = (f'{"ID":<10}  {"NAME":<20}  {"IMAGE":<14}  {"EXCEPTION":<24}  '
+               f'{"SYMBOL":<16}  {"FR":>3}  {"AGE":>4}')
+    else:
+        hdr = (f'{"ID":<18}  {"IMAGE":<14}  {"EXCEPTION":<28}  '
+               f'{"SYMBOL":<18}  {"FR":>3}  {"AGE":>4}')
     print(hdr)
     print('-' * len(hdr))
     for r in rows:
         sid = r.id[:8]
-        img = _trunc(r.image_name, 14)
-        exc = _trunc(r.exception_desc, 28)
-        sym = _trunc(r.crash_symbol, 18)
         age = _ago(r.created_at)
         imp = ' *' if r.imported_from else ''
-        print(f'{sid:<18}  {img:<14}  {exc:<28}  {sym:<18}  '
-              f'{r.frame_count:>3}  {age:>4}{imp}')
+        if has_names:
+            name = _trunc(r.name or '', 20)
+            img = _trunc(r.image_name, 14)
+            exc = _trunc(r.exception_desc, 24)
+            sym = _trunc(r.crash_symbol, 16)
+            print(f'{sid:<10}  {name:<20}  {img:<14}  {exc:<24}  '
+                  f'{sym:<16}  {r.frame_count:>3}  {age:>4}{imp}')
+        else:
+            img = _trunc(r.image_name, 14)
+            exc = _trunc(r.exception_desc, 28)
+            sym = _trunc(r.crash_symbol, 18)
+            print(f'{sid:<18}  {img:<14}  {exc:<28}  {sym:<18}  '
+                  f'{r.frame_count:>3}  {age:>4}{imp}')
 
     if any(r.imported_from for r in rows):
         print('\n* = imported from a bundle', file=sys.stderr)
