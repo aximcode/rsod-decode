@@ -40,7 +40,9 @@ sudo apt install python3 python3-lldb lldb gdb            # Ubuntu / Debian / WS
 # sudo dnf install python3 python3-lldb lldb gdb          # Fedora / RHEL
 
 # 2. Download the zipapp
-wget https://github.com/aximcode/rsod-decode/releases/latest/download/rsod.pyzw
+#    The -o flag prevents wget/curl from auto-renaming to
+#    rsod.pyzw.1 / .2 / etc. when an older copy is in cwd.
+curl -L -o rsod.pyzw https://github.com/aximcode/rsod-decode/releases/latest/download/rsod.pyzw
 chmod +x rsod.pyzw
 
 # 3. Run it

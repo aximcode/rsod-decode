@@ -1,0 +1,49 @@
+name: pyzw smoke
+
+# Builds rsod.pyzw and exercises serve / decode / history end-to-end.
+# Catches artifact-level failures the pytest suite can't see — most
+# importantly the v0.1.0-style importlib.metadata.PackageNotFoundError
+# that only surfaced when werkzeug.serving.make_server actually ran.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Python deps
+        run: pip install -e ".[dev]"
+
+      - name: Run smoke
+        run: bash scripts/smoke-pyzw.sh
+
+      # Upload the built pyzw on tag pushes so a release can pick it
+      # up as a verified artifact instead of being built ad-hoc by
+      # whoever's tagging.
+      - name: Upload pyzw artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsod-pyzw-${{ github.ref_name }}
+          path: rsod.pyzw
+          if-no-files-found: error
