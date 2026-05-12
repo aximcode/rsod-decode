@@ -45,15 +45,45 @@ site-packages on Fedora/RHEL/Ubuntu; install it via your package manager
 
 ## Install
 
-You have two paths. **Pick one.**
+Three paths, in increasing order of fuss. **Pick one.**
 
-### A. From source (developers, or the only option on most platforms today)
+### A. Just want to try it (Linux x86-64 / WSL)
+
+Grab the pre-built zipapp from the latest release. No pip, no venv,
+no Node, no build step — only requires Python 3.11+ on the host.
 
 ```bash
-git clone git@github.com:aximcode/rsod-decode.git
-cd rsod-decode
+wget https://github.com/aximcode/rsod-decode/releases/latest/download/rsod.pyzw
+chmod +x rsod.pyzw
+./rsod.pyzw serve                       # opens browser to localhost:5000
+./rsod.pyzw decode rsod.txt symbols.so -v
+./rsod.pyzw history
+```
 
-# Recommended: a venv so you don't pollute system Python
+Released builds are **Linux x86-64 only** because `libcapstone.so` is
+baked in. Other platforms: see path C below.
+
+### B. From source (developers)
+
+```bash
+git clone https://github.com/aximcode/rsod-decode.git
+cd rsod-decode
+```
+
+**Prerequisites by platform:**
+
+| Platform | Run before `pip install` |
+|----------|--------------------------|
+| Ubuntu / Debian / WSL | `sudo apt install python3-pip python3-venv` |
+| Fedora / RHEL | `sudo dnf install python3-pip` |
+| macOS | `brew install python` (gets pip + venv together) |
+| Windows | install Python from [python.org](https://python.org) (includes pip + venv) |
+
+A **venv is required** on modern Ubuntu / Debian (PEP 668 blocks
+system-wide `pip install`). Even on other distros it's strongly
+recommended so you don't pollute system Python.
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate     # on Windows: .venv\Scripts\activate
 
@@ -76,33 +106,18 @@ Extras you can pick from `[]`:
 - `dev` — adds `pytest` for running the test suite.
 - `browser` — adds `playwright` for the browser regression tests.
 
-### B. Single-file zipapp (`rsod.pyzw`)
+### C. Build your own zipapp (other platforms)
 
-A self-contained Python zipapp that bundles Flask, capstone, the React
-frontend, and all dependencies into one ~2.6 MB file. Only requires
-Python 3.11+ on the target host.
-
-There are no published release artifacts yet, so you build it yourself:
+Released `rsod.pyzw` builds are Linux x86-64 only. To get a zipapp
+for Linux ARM64 / macOS / Windows, do the source install (path B
+above) on the target platform, then:
 
 ```bash
-git clone git@github.com:aximcode/rsod-decode.git
-cd rsod-decode
-pip install -e ".[dev]"
 cd frontend && npm install && npm run build && cd ..
-python build_pyz.py            # → rsod.pyzw
+python build_pyz.py            # → rsod.pyzw next to the source tree
 ```
 
-Then copy `rsod.pyzw` anywhere and run it directly:
-
-```bash
-python rsod.pyzw serve
-python rsod.pyzw decode rsod.txt app.efi.so -v
-python rsod.pyzw history
-```
-
-The zipapp is **architecture-specific** because `libcapstone.so` is
-baked into the bundle. A Linux x86-64 `rsod.pyzw` only runs on Linux
-x86-64; rebuild on each target platform.
+Copy `rsod.pyzw` anywhere and run it as in path A.
 
 ## First-run smoke test
 
