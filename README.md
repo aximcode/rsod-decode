@@ -25,138 +25,82 @@ hash, and export as `.rsod.zip` bundles for cross-team sharing.
 
 ---
 
-## Platform support
-
-| Platform | Source install | `rsod.pyzw` zipapp |
-|----------|---------------|---------------------|
-| **Linux x86-64** (Fedora/RHEL/Ubuntu) | ✓ supported, primary dev target | ✓ `libcapstone.so` is bundled for Linux x86-64 |
-| **Linux ARM64** | ✓ should work | ✗ rebuild `rsod.pyzw` on an ARM64 host |
-| **macOS** (Intel + Apple Silicon) | ✓ should work (untested) — capstone has macOS wheels | ✗ rebuild on macOS for native `libcapstone.dylib` |
-| **Windows native** | likely works for `decode` and `serve`, but the system-LLDB integration is Linux-tested | ✗ rebuild on Windows for `capstone.dll` |
-| **Windows + WSL** | ✓ same story as Linux | ✓ same as Linux x86-64 |
-
-The host architecture you're analyzing crashes on doesn't matter — the
-tool reads x86-64 and ARM64 RSODs from any host.
-
-System **LLDB** is optional but unlocks PE+PDB minidump analysis and
-callsite-arg reconstruction. It's auto-detected from the system Python
-site-packages on Fedora/RHEL/Ubuntu; install it via your package manager
-(see [Optional: system LLDB](#optional-system-lldb) below).
-
 ## Install
 
-Three paths, in increasing order of fuss. **Pick one.**
+> **Most users:** grab the pre-built zipapp on Linux x86-64 (including
+> WSL on Windows 11). It's the recommended path for everyone — full
+> features, including LLDB integration. No pip, no venv, no Node, no
+> build step.
 
-### A. Just want to try it (Linux x86-64 / WSL)
-
-Grab the pre-built zipapp from the latest release. No pip, no venv,
-no Node, no build step — only requires Python 3.11+ on the host.
+### Recommended: pre-built `rsod.pyzw` (Linux x86-64 / WSL)
 
 ```bash
+# 1. Install Python + LLDB (one-time, host system)
+sudo apt install python3 python3-lldb lldb gdb            # Ubuntu / Debian / WSL
+# sudo dnf install python3 python3-lldb lldb gdb          # Fedora / RHEL
+
+# 2. Download the zipapp
 wget https://github.com/aximcode/rsod-decode/releases/latest/download/rsod.pyzw
 chmod +x rsod.pyzw
-./rsod.pyzw serve                       # opens browser to localhost:5000
+
+# 3. Run it
+./rsod.pyzw serve                       # web UI at localhost:5000
 ./rsod.pyzw decode rsod.txt symbols.so -v
 ./rsod.pyzw history
 ```
 
-Released builds are **Linux x86-64 only** because `libcapstone.so` is
-baked in. Other platforms: see path C below.
+Requires Python 3.11+. The zipapp bundles Flask, capstone, the React
+frontend, and every Python dependency — only the LLDB and GDB
+binaries come from your system packages.
 
-### B. From source (developers)
+`python3-lldb` + `lldb` give you PE+PDB minidump analysis (the only
+way to get full parameter/local visibility for MSVC EPSA crashes)
+and callsite-arg reconstruction (recovers tail-call-elided frames).
+`gdb` enables the GDB cross-check backend. Both are optional — the
+tool degrades to the pyelftools backend if either is missing — but
+strongly recommended for the full experience.
+
+### Other platforms (macOS, Windows native, Linux ARM64)
+
+The released `rsod.pyzw` is Linux x86-64 only because `libcapstone.so`
+is baked into the bundle. To use rsod-decode on another platform, do
+the source install below on the target host (works fine — capstone
+has wheels for macOS, Windows, and Linux ARM64) and either run from
+source or rebuild the zipapp via `python build_pyz.py`.
+
+### Source install (developers + non-Linux-x86 hosts)
 
 ```bash
 git clone https://github.com/aximcode/rsod-decode.git
 cd rsod-decode
 ```
 
-**Prerequisites by platform:**
+Prerequisites by platform:
 
 | Platform | Run before `pip install` |
 |----------|--------------------------|
-| Ubuntu / Debian / WSL | `sudo apt install python3-pip python3-venv` |
-| Fedora / RHEL | `sudo dnf install python3-pip` |
-| macOS | `brew install python` (gets pip + venv together) |
-| Windows | install Python from [python.org](https://python.org) (includes pip + venv) |
+| Ubuntu / Debian / WSL | `sudo apt install python3-pip python3-venv python3-lldb lldb gdb` |
+| Fedora / RHEL | `sudo dnf install python3-pip python3-lldb lldb gdb` |
+| macOS | `brew install python lldb gdb` |
+| Windows | install Python from [python.org](https://python.org) + LLVM from [llvm.org](https://llvm.org/) |
 
 A **venv is required** on modern Ubuntu / Debian (PEP 668 blocks
-system-wide `pip install`). Even on other distros it's strongly
-recommended so you don't pollute system Python.
+system-wide `pip install`). Strongly recommended elsewhere too.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate     # on Windows: .venv\Scripts\activate
 
-# Editable install + the optional GDB backend + dev tools
 pip install -e ".[gdb,dev]"
-
-# (Optional) build the React frontend if you want the web UI
 cd frontend && npm install && npm run build && cd ..
 
 rsod --help
+# Or rebuild the zipapp for distribution:
+python build_pyz.py            # → rsod.pyzw
 ```
 
-`pip install -e` puts the `rsod` console script on your `PATH` and
-points it at the source tree, so edits take effect immediately.
-
-Extras you can pick from `[]`:
-
-- `gdb` — adds `pygdbmi` (the GDB cross-check backend). Also requires
-  `gdb` on your `PATH`.
-- `dev` — adds `pytest` for running the test suite.
-- `browser` — adds `playwright` for the browser regression tests.
-
-### C. Build your own zipapp (other platforms)
-
-Released `rsod.pyzw` builds are Linux x86-64 only. To get a zipapp
-for Linux ARM64 / macOS / Windows, do the source install (path B
-above) on the target platform, then:
-
-```bash
-cd frontend && npm install && npm run build && cd ..
-python build_pyz.py            # → rsod.pyzw next to the source tree
-```
-
-Copy `rsod.pyzw` anywhere and run it as in path A.
-
-## First-run smoke test
-
-```bash
-# Web UI — opens a browser tab on localhost:5000
-rsod serve
-
-# Pre-load a crash on startup (browser opens to the analysis view)
-rsod serve rsod.txt app.efi.so
-
-# Text report to stdout
-rsod decode rsod.txt app.efi.so -v
-
-# List sessions you've already analyzed
-rsod history
-
-# Replay a stored session
-rsod decode --session ab12cd34
-```
-
-The same commands work via `python rsod.pyzw <subcommand>` if you
-went the zipapp route.
-
-## Optional: system LLDB
-
-LLDB unlocks PE+PDB minidump analysis (the only way to get full
-parameter/local visibility for MSVC EPSA crashes) and callsite-arg
-reconstruction (recovers tail-call-elided frames). The tool falls
-back cleanly to pyelftools if LLDB isn't installed.
-
-| Distro | Install |
-|--------|---------|
-| Fedora / RHEL | `sudo dnf install lldb python3-lldb` |
-| Ubuntu / Debian | `sudo apt install lldb python3-lldb` |
-| macOS | ships with Xcode Command Line Tools (`xcode-select --install`) |
-| Windows | install LLVM from [llvm.org](https://llvm.org/) |
-
-`rsod_decode/lldb_loader.py` finds the system lldb Python module
-without needing a `--system-site-packages` venv.
+Optional extras: `[gdb]` adds `pygdbmi`, `[dev]` adds `pytest`,
+`[browser]` adds `playwright` for the browser regression tests.
 
 ---
 
