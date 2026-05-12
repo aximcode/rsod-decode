@@ -15,27 +15,13 @@ PDB) formats.
 
 ## At a glance
 
-**Web UI** — drop your RSOD log + symbol files, get a clickable
-backtrace, per-frame parameters/locals, disassembly, source
-context, and an in-browser LLDB/GDB terminal:
+Drop an RSOD log + symbol files, get a clickable backtrace,
+per-frame parameters/locals, full-file source view, disassembly
+with inline source annotations, and an in-browser LLDB/GDB
+terminal. Sessions persist across restarts, dedup by content
+hash, and export as `.rsod.zip` bundles for cross-team sharing.
 
-![Crash analysis](docs/screenshots/02-overview.png)
-
-**Source tab** — full file with the crash line highlighted and
-a "Go to line" reset button:
-
-![Source tab](docs/screenshots/03-source.png)
-
-**Disassembly tab** — instructions around the faulting PC with
-inline source-line annotations:
-
-![Disassembly tab](docs/screenshots/04-disasm.png)
-
-**Upload + history** — drop files into one zone, sessions persist
-across restarts, dedup by content hash, exportable as `.rsod.zip`
-bundles for cross-team sharing:
-
-![Upload screen with history](docs/screenshots/01-upload.png)
+![Demo: upload screen → crash analysis → source tab → disassembly tab](docs/screenshots/demo.gif)
 
 ---
 
