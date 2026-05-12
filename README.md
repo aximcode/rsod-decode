@@ -25,15 +25,92 @@ hash, and export as `.rsod.zip` bundles for cross-team sharing.
 
 ---
 
-## Quick start
+## Platform support
+
+| Platform | Source install | `rsod.pyzw` zipapp |
+|----------|---------------|---------------------|
+| **Linux x86-64** (Fedora/RHEL/Ubuntu) | ✓ supported, primary dev target | ✓ `libcapstone.so` is bundled for Linux x86-64 |
+| **Linux ARM64** | ✓ should work | ✗ rebuild `rsod.pyzw` on an ARM64 host |
+| **macOS** (Intel + Apple Silicon) | ✓ should work (untested) — capstone has macOS wheels | ✗ rebuild on macOS for native `libcapstone.dylib` |
+| **Windows native** | likely works for `decode` and `serve`, but the system-LLDB integration is Linux-tested | ✗ rebuild on Windows for `capstone.dll` |
+| **Windows + WSL** | ✓ same story as Linux | ✓ same as Linux x86-64 |
+
+The host architecture you're analyzing crashes on doesn't matter — the
+tool reads x86-64 and ARM64 RSODs from any host.
+
+System **LLDB** is optional but unlocks PE+PDB minidump analysis and
+callsite-arg reconstruction. It's auto-detected from the system Python
+site-packages on Fedora/RHEL/Ubuntu; install it via your package manager
+(see [Optional: system LLDB](#optional-system-lldb) below).
+
+## Install
+
+You have two paths. **Pick one.**
+
+### A. From source (developers, or the only option on most platforms today)
 
 ```bash
+git clone git@github.com:aximcode/rsod-decode.git
+cd rsod-decode
+
+# Recommended: a venv so you don't pollute system Python
+python3 -m venv .venv
+source .venv/bin/activate     # on Windows: .venv\Scripts\activate
+
+# Editable install + the optional GDB backend + dev tools
 pip install -e ".[gdb,dev]"
 
-# Web UI — opens a browser tab
+# (Optional) build the React frontend if you want the web UI
+cd frontend && npm install && npm run build && cd ..
+
+rsod --help
+```
+
+`pip install -e` puts the `rsod` console script on your `PATH` and
+points it at the source tree, so edits take effect immediately.
+
+Extras you can pick from `[]`:
+
+- `gdb` — adds `pygdbmi` (the GDB cross-check backend). Also requires
+  `gdb` on your `PATH`.
+- `dev` — adds `pytest` for running the test suite.
+- `browser` — adds `playwright` for the browser regression tests.
+
+### B. Single-file zipapp (`rsod.pyzw`)
+
+A self-contained Python zipapp that bundles Flask, capstone, the React
+frontend, and all dependencies into one ~2.6 MB file. Only requires
+Python 3.11+ on the target host.
+
+There are no published release artifacts yet, so you build it yourself:
+
+```bash
+git clone git@github.com:aximcode/rsod-decode.git
+cd rsod-decode
+pip install -e ".[dev]"
+cd frontend && npm install && npm run build && cd ..
+python build_pyz.py            # → rsod.pyzw
+```
+
+Then copy `rsod.pyzw` anywhere and run it directly:
+
+```bash
+python rsod.pyzw serve
+python rsod.pyzw decode rsod.txt app.efi.so -v
+python rsod.pyzw history
+```
+
+The zipapp is **architecture-specific** because `libcapstone.so` is
+baked into the bundle. A Linux x86-64 `rsod.pyzw` only runs on Linux
+x86-64; rebuild on each target platform.
+
+## First-run smoke test
+
+```bash
+# Web UI — opens a browser tab on localhost:5000
 rsod serve
 
-# Pre-load a crash on startup
+# Pre-load a crash on startup (browser opens to the analysis view)
 rsod serve rsod.txt app.efi.so
 
 # Text report to stdout
@@ -46,13 +123,25 @@ rsod history
 rsod decode --session ab12cd34
 ```
 
-The standalone zipapp ships the same subcommands:
+The same commands work via `python rsod.pyzw <subcommand>` if you
+went the zipapp route.
 
-```bash
-python rsod.pyzw serve  rsod.txt app.efi.so
-python rsod.pyzw decode rsod.txt app.efi.so -v
-python rsod.pyzw history
-```
+## Optional: system LLDB
+
+LLDB unlocks PE+PDB minidump analysis (the only way to get full
+parameter/local visibility for MSVC EPSA crashes) and callsite-arg
+reconstruction (recovers tail-call-elided frames). The tool falls
+back cleanly to pyelftools if LLDB isn't installed.
+
+| Distro | Install |
+|--------|---------|
+| Fedora / RHEL | `sudo dnf install lldb python3-lldb` |
+| Ubuntu / Debian | `sudo apt install lldb python3-lldb` |
+| macOS | ships with Xcode Command Line Tools (`xcode-select --install`) |
+| Windows | install LLVM from [llvm.org](https://llvm.org/) |
+
+`rsod_decode/lldb_loader.py` finds the system lldb Python module
+without needing a `--system-site-packages` venv.
 
 ---
 
@@ -226,42 +315,40 @@ behind the scenes.
 
 ---
 
-## Requirements
+## Dependencies
 
-Python 3.10+. Backend-specific:
+Python 3.11+. Pulled in automatically by `pip install -e .`:
 
-| Package | Purpose | Required |
-|---------|---------|----------|
-| `pyelftools` | ELF + DWARF baseline | yes |
-| `capstone` | x86-64 / ARM64 disassembly | yes |
-| `cxxfilt` | C++ name demangling | yes |
-| `flask` + `flask-sock` | web UI + WS terminals | for `serve` |
-| `pygdbmi` | GDB/MI cross-check backend | optional |
-| system LLDB | richer ELF + PE+PDB analysis | optional |
+| Package | Purpose | Pulled by |
+|---------|---------|-----------|
+| `pyelftools` | ELF + DWARF baseline | base |
+| `capstone` | x86-64 / ARM64 disassembly | base |
+| `cxxfilt` | C++ name demangling | base |
+| `pefile` | PE binary parsing | base |
+| `flask` + `flask-sock` + `simple-websocket` | web UI + WS terminals | base |
+| `pygdbmi` | GDB/MI cross-check backend | `[gdb]` extra |
+| `pytest` | test suite | `[dev]` extra |
+| `playwright` | browser regression tests | `[browser]` extra |
 
-System LLDB is auto-detected from `/usr/lib64/python3.*/site-packages/lldb`
-(Fedora/RHEL) or equivalent on other distros. The tool falls back
-cleanly when it's absent — pyelftools handles ELF, GDB handles
-ELF cross-check, PE+PDB sessions degrade to map-file-only analysis.
+External commands: `gdb` if you use `--backend gdb`; `git` if you use
+`--tag`/`--commit` for source context; `node` + `npm` if you build the
+React frontend yourself.
 
----
-
-## Building from source
+For the Playwright browser tests:
 
 ```bash
-# Install editable + dev deps
-pip install -e ".[gdb,dev]"
-
-# Build the React frontend
-cd frontend && npm install && npm run build && cd ..
-
-# Package as a single zipapp
-python build_pyz.py
-# → rsod.pyzw (~2.6 MB, includes Flask, capstone, frontend dist)
+pip install -e ".[browser]"
+python -m playwright install chromium
 ```
 
-Optional: `pip install -e ".[browser]" && python -m playwright install chromium`
-for the Playwright-driven browser regression tests.
+## Running the tests
+
+```bash
+pytest -q                # ~160 tests, ~30 seconds
+pytest -m parser         # parser-only (fastest subset, no Flask)
+pytest -m api            # Flask API
+pytest -m lldb           # only the LLDB-gated tests (skipped if no LLDB)
+```
 
 ---
 
