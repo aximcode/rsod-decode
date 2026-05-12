@@ -26,7 +26,7 @@ What we DO NOT bundle:
     via `lldb_loader.py`. Works fine from inside a zipapp because
     the loader searches filesystem paths, not sys.path.
   - pywebview / playwright — web/dev-only
-  - tests/, tests/fixtures/, .venv/, .git/, *.dist-info
+  - tests/, tests/fixtures/, .venv/, .git/
 """
 from __future__ import annotations
 
@@ -64,8 +64,13 @@ PIP_DEPS = (
 EXTRACT_PREFIXES = ("capstone/", "frontend/dist/")
 
 # Patterns pruned from the staging dir after pip install. `tests` in
-# transitive deps is noise; .dist-info metadata is unused at runtime.
-PRUNE_GLOBS = ("*.dist-info", "*.egg-info", "__pycache__", "*.pyc",
+# transitive deps is noise. `.dist-info` is intentionally KEPT —
+# werkzeug calls `importlib.metadata.version("werkzeug")` at runtime
+# (for the `Server: Werkzeug/X.Y.Z` HTTP header) and other packages
+# do similar lookups; without the metadata they raise
+# PackageNotFoundError on first use. Dist-info totals a few hundred
+# KB on a 2.6 MB zipapp — negligible.
+PRUNE_GLOBS = ("*.egg-info", "__pycache__", "*.pyc",
                "*.pyo", "*.pyi", "tests", "test")
 
 
