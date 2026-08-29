@@ -34,6 +34,15 @@ jobs:
       - name: Install Python deps
         run: pip install -e ".[dev]"
 
+      # Before the smoke build, because it is 17s against several minutes and
+      # a unit-level break should not wait behind a frontend bundle. Until
+      # now NOTHING ran pytest in CI: 89 tests passed locally and gated
+      # nothing, so a regression they cover merged green. Both this file and
+      # scripts/smoke-pyzw.sh already described themselves as covering what
+      # "the pytest suite can't see", which read as though the suite ran.
+      - name: Run unit tests
+        run: python -m pytest -q
+
       - name: Run smoke
         run: bash scripts/smoke-pyzw.sh
 

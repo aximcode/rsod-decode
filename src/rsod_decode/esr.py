@@ -9,9 +9,21 @@ EC_TABLE: dict[int, str] = {
     0x21: "Instruction Abort (same EL)", 0x22: "PC Alignment Fault",
     0x24: "Data Abort (lower EL)", 0x25: "Data Abort (same EL)",
     0x26: "SP Alignment Fault", 0x2C: "FP exception",
-    0x30: "SError", 0x32: "Breakpoint (lower EL)",
-    0x33: "Breakpoint (same EL)", 0x34: "Software Step (lower EL)",
-    0x35: "Software Step (same EL)", 0x3C: "BRK (AArch64)",
+    # 0x2F..0x35 in architectural order. Every name in this range used to sit
+    # on the wrong key, and NOT by a uniform offset: "SError" was on 0x30 when
+    # SError is 0x2F (one high), while the four debug-exception names were
+    # each two keys high, which left Watchpoint with no entry at all because
+    # 0x34/0x35 were holding Software Step's names. Do not try to derive a
+    # neighbouring EC by applying an off-by-N to the old table -- there wasn't
+    # one. Every AArch64 debug exception therefore decoded to a confident
+    # wrong name, which is worse than the "Unknown EC" an absent entry
+    # produces: the fallback hands the reader a number to look up, and a wrong
+    # name gets believed. Values per QEMU target/arm/syndrome.h.
+    0x2F: "SError", 0x30: "Breakpoint (lower EL)",
+    0x31: "Breakpoint (same EL)", 0x32: "Software Step (lower EL)",
+    0x33: "Software Step (same EL)", 0x34: "Watchpoint (lower EL)",
+    0x35: "Watchpoint (same EL)", 0x38: "BKPT (AArch32)",
+    0x3C: "BRK (AArch64)",
 }
 
 DFSC_TABLE: dict[int, str] = {
